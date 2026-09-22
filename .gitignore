@@ -1,0 +1,19 @@
+logs/
+monitor-status.json
+*.tmp
+__pycache__/
+*.pyc
+
+# runtime artifacts — regenerated on every run, never meant to be tracked
+history.db
+backups/
+*.log
+*.pid
+aoc_token.txt
+aoc_license.json
+aoc_webhook_settings.json
+aoc_notify_settings.json
+aoc_last_digest.txt
+aoc_autosave_id.txt
+cloudflared.exe
+monitor_err.txt
