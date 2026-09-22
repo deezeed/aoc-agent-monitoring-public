@@ -18,8 +18,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# TODO: replace with the real public repo URL once it exists (see
-# export_public_release.ps1's own output for the reminder).
 $RepoUrl = "https://github.com/deezeed/aoc-agent-monitoring-public.git"
 
 Write-Host "AOC bootstrap installer"

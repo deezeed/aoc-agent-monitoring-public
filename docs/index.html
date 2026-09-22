@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AOC — Agent Operations Center</title>
+<meta name="description" content="A local, single-file monitoring dashboard for Claude Code CLI sessions. Free tier for local use, Pro unlocks Remote Machines, tunnel, webhooks, budgets, and CSV export.">
+<style>
+  :root {
+    --bg:#060d1f; --bg2:#0a1428; --c:#00c4e8; --c-rgb:0,196,232;
+    --t:#c8e6ff; --t3:#5a8cb4; --g:#00e887; --border:rgba(255,255,255,.08);
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--t);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    min-height:100vh; line-height:1.6;
+  }
+  .wrap { max-width:880px; margin:0 auto; padding:48px 20px 80px; }
+  header { text-align:center; margin-bottom:56px; }
+  .kicker {
+    font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--c); font-weight:600; margin-bottom:10px;
+  }
+  h1 { font-size:32px; margin:0 0 12px; letter-spacing:-.01em; }
+  .sub { color:var(--t3); font-size:16px; max-width:560px; margin:0 auto; }
+  .badges { display:flex; gap:10px; justify-content:center; margin-top:20px; flex-wrap:wrap; }
+  .badge {
+    font-size:11px; font-family:ui-monospace,monospace; color:var(--t3);
+    border:1px solid var(--border); border-radius:20px; padding:4px 12px;
+  }
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:40px 0; }
+  @media (max-width:640px) { .cards { grid-template-columns:1fr; } }
+  .card {
+    background:rgba(255,255,255,.03); border:1px solid var(--border);
+    border-radius:16px; padding:28px 24px; display:flex; flex-direction:column;
+  }
+  .card.pro { border-color:rgba(var(--c-rgb),.35); background:rgba(var(--c-rgb),.04); }
+  .card h2 { font-size:15px; letter-spacing:.04em; text-transform:uppercase; margin:0 0 4px; }
+  .card .price { font-size:30px; font-weight:700; margin:8px 0 4px; }
+  .card .price small { font-size:14px; font-weight:400; color:var(--t3); }
+  .card ul { list-style:none; margin:20px 0; padding:0; flex:1; }
+  .card li {
+    font-size:13.5px; padding:7px 0 7px 24px; position:relative; color:var(--t);
+  }
+  .card li::before {
+    content:"✓"; position:absolute; left:0; color:var(--g); font-weight:700;
+  }
+  .card.pro li::before { color:var(--c); }
+  .btn {
+    display:block; text-align:center; text-decoration:none;
+    border-radius:8px; padding:12px 20px; font-size:14px; font-weight:600;
+    margin-top:8px;
+  }
+  .btn.primary { background:var(--c); color:#04121c; }
+  .btn.secondary { background:transparent; border:1px solid var(--border); color:var(--t); }
+  .btn.primary:hover { background:#1fd4f5; }
+  .btn.secondary:hover { border-color:rgba(var(--c-rgb),.4); }
+  .note { font-size:12px; color:var(--t3); text-align:center; margin-top:10px; }
+  section.info { margin:56px 0; }
+  section.info h3 {
+    font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--t3); margin-bottom:14px;
+  }
+  section.info p { font-size:14px; color:var(--t); margin:0 0 12px; }
+  code {
+    background:rgba(255,255,255,.06); border-radius:4px; padding:2px 6px;
+    font-family:ui-monospace,monospace; font-size:.9em; color:var(--c);
+  }
+  pre {
+    background:rgba(0,0,0,.35); border:1px solid var(--border); border-radius:10px;
+    padding:16px; overflow-x:auto; font-size:13px; font-family:ui-monospace,monospace;
+  }
+  footer {
+    border-top:1px solid var(--border); margin-top:64px; padding-top:24px;
+    text-align:center; font-size:12px; color:var(--t3);
+  }
+  footer a { color:var(--t3); }
+  a { color:var(--c); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="kicker">Claude Code CLI monitoring</div>
+    <h1>AOC — Agent Operations Center</h1>
+    <p class="sub">A local, single-file dashboard for Claude Code sessions and the
+      subagents they spawn. Live status, tokens, cost, files changed, history —
+      no external services required.</p>
+    <div class="badges">
+      <span class="badge">Windows</span>
+      <span class="badge">one Python file</span>
+      <span class="badge">991 tests</span>
+      <span class="badge">runs on localhost:5151</span>
+    </div>
+  </header>
+
+  <div class="cards">
+    <div class="card">
+      <h2>Free</h2>
+      <div class="price">$0</div>
+      <ul>
+        <li>Full dashboard, any number of your own machines</li>
+        <li>History, Analytics, native toasts</li>
+        <li>Embedded terminal, Force Stop</li>
+        <li>Modify and redistribute freely</li>
+      </ul>
+      <a class="btn secondary" href="https://github.com/deezeed/aoc-agent-monitoring-public">Get it on GitHub</a>
+    </div>
+    <div class="card pro">
+      <h2>Pro</h2>
+      <div class="price">$49 <small>one-time, perpetual</small></div>
+      <ul>
+        <li>Remote Machines — merge in other AOC instances</li>
+        <li>Remote-access tunnel (Cloudflare / ngrok)</li>
+        <li>Webhook delivery (Slack, Discord, generic)</li>
+        <li>Per-project monthly budgets</li>
+        <li>CSV exports</li>
+      </ul>
+      <a class="btn primary" href="mailto:marek99dolezal@gmail.com?subject=AOC%20Pro%20License&body=Hi%2C%20I%27d%20like%20to%20buy%20an%20AOC%20Pro%20license%20(%2449%2C%20one-time).%0A%0AEmail%20to%20license%20the%20key%20to%3A%0A">Get Pro — $49</a>
+      <div class="note">Email checkout for now — key delivered within 24h.</div>
+    </div>
+  </div>
+
+  <section class="info">
+    <h3>How licensing works</h3>
+    <p>One codebase, license-key-gated — there's no separate Pro build. A Pro
+      key is <code>AOC-PRO-&lt;payload&gt;.&lt;signature&gt;</code>, Ed25519-signed
+      and verified fully offline against a public key embedded in
+      <code>monitor.py</code>. Activating one never phones home. Paste it into
+      Settings → LICENSE once you have it.</p>
+  </section>
+
+  <section class="info">
+    <h3>Quick start (Free tier)</h3>
+    <pre>git clone https://github.com/deezeed/aoc-agent-monitoring-public.git
+cd aoc-agent-monitoring-public
+python setup.py</pre>
+    <p>See the <a href="https://github.com/deezeed/aoc-agent-monitoring-public#readme">README</a>
+      for full setup, architecture, and the two-tier watchdog. Full terms in
+      <a href="https://github.com/deezeed/aoc-agent-monitoring-public/blob/master/LICENSE.md">LICENSE.md</a>.</p>
+  </section>
+
+  <footer>
+    AOC — Agent Operations Center · <a href="https://github.com/deezeed/aoc-agent-monitoring-public">GitHub</a>
+  </footer>
+
+</div>
+</body>
+</html>
