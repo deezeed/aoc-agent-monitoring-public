@@ -118,6 +118,20 @@
         <li>Per-project monthly budgets</li>
         <li>CSV exports</li>
       </ul>
+      <!-- TODO: swap this mailto CTA for the real Stripe Payment Link once
+           it exists, and drop the "Email checkout" note below. The
+           fulfillment side (POST /webhooks/stripe -> issue_license() ->
+           email the key) is already built and tested in saas-backend/ --
+           see its README's "AOC Pro license sale (Stripe)" section for
+           what's still blocking it going live:
+             1. Create the $49 one-time Payment Link in the Stripe
+                Dashboard (needs a paid Railway plan first -- the trial
+                expired and the backend is currently offline).
+             2. Register the webhook endpoint against that Payment Link,
+                copy its signing secret into Railway's STRIPE_WEBHOOK_SECRET.
+             3. Set RESEND_API_KEY or SMTP_* on Railway so the key is
+                actually emailed instead of just logged.
+           Once the Payment Link exists, replace the href below with it. -->
       <a class="btn primary" href="mailto:marek99dolezal@gmail.com?subject=AOC%20Pro%20License&body=Hi%2C%20I%27d%20like%20to%20buy%20an%20AOC%20Pro%20license%20(%2449%2C%20one-time).%0A%0AEmail%20to%20license%20the%20key%20to%3A%0A">Get Pro — $49</a>
       <div class="note">Email checkout for now — key delivered within 24h.</div>
     </div>
