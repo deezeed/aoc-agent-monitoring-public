@@ -824,7 +824,15 @@ testing afterthought). Run everything with one command:
 - **Multiple `monitor.py`/`watchdog.py` instances** — Windows'
   `SO_REUSEADDR` semantics differ from POSIX and can let a second instance
   bind the same port instead of just tolerating `TIME_WAIT`. Both scripts
-  guard against this (a live `/status` check before binding, and a PID
-  lock file respectively) but if something looks inconsistent, check for
-  duplicates with `Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'"`
-  before assuming a code bug.
+  guard against this with an atomic `O_CREAT|O_EXCL` PID lock file
+  (`monitor.pid`/`watchdog.pid` next to each script) plus a
+  `_pid_exe_name`/`_is_python_process` staleness check so a crash doesn't
+  wedge every future start. `monitor.py`'s guard used to be a live
+  `/status` probe instead — it raced its own startup (a second instance
+  launching in the window before the first one finished binding would
+  also see nothing answering yet and proceed), which is what let stray
+  processes accumulate under repeated restarts; the PID file closes that
+  gap outright instead of narrowing it. If something still looks
+  inconsistent, check for duplicates with
+  `Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'"` before
+  assuming a code bug.

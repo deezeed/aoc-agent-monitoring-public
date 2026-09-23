@@ -2,7 +2,7 @@
 AOC — Agent Operations Center
 spusti: python monitor.py  ->  http://localhost:5151
 """
-import json, os, time, threading, webbrowser, subprocess, glob, sqlite3, re, calendar
+import json, os, time, threading, webbrowser, subprocess, glob, sqlite3, re, calendar, atexit
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
 
@@ -13066,6 +13066,7 @@ def _run_app_mode():
 
     def on_quit(icon, item):
         icon.stop()
+        _release_monitor_lock()  # os._exit below skips atexit -- release explicitly
         os._exit(0)
 
     def on_toggle_startup(icon, item):
@@ -13135,19 +13136,60 @@ if __name__ == "__main__":
     # separate in-memory state — observed today: 5 stray processes accumulated
     # after repeated restarts, with requests routed unpredictably between them
     # (stale session data winning a race, a tunnel-stop call landing on a
-    # process that never started the tunnel it was asked to stop). Refuse to
-    # start a second instance if one is already answering.
-    def _already_running() -> bool:
-        import urllib.request
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=1)
-            return True
-        except Exception:
-            return False
+    # process that never started the tunnel it was asked to stop).
+    #
+    # This used to be a urllib probe against /status: refuse to start if
+    # something's already answering. That check itself raced its own
+    # subject — it ran before *this* process bound its own listening
+    # socket, so a second instance starting during the several-hundred-ms
+    # (sometimes multi-second, see the /status-readiness poll below) window
+    # between "process A passed the check" and "process A is actually
+    # listening" would also see nothing answering and proceed. A PID file
+    # written with O_CREAT|O_EXCL is atomic at the OS level (the create
+    # itself fails if the file exists, no separate check-then-write gap to
+    # race), closing that window instead of narrowing it. Stale-lock
+    # detection reuses _pid_exe_name, the same technique watchdog.py's own
+    # lock file (watchdog.pid) uses, so a PID recycled by an unrelated
+    # process after a crash doesn't wedge every future start.
+    _MONITOR_PID_FILE = os.path.join(AOC_DIR, "monitor.pid")
 
-    if _already_running():
+    def _acquire_monitor_lock(max_attempts: int = 5) -> bool:
+        for _ in range(max_attempts):
+            try:
+                fd = os.open(_MONITOR_PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w") as f:
+                    f.write(str(os.getpid()))
+                return True
+            except FileExistsError:
+                try:
+                    with open(_MONITOR_PID_FILE) as f:
+                        old_pid = int(f.read().strip())
+                except Exception:
+                    old_pid = None  # unreadable/corrupt -- treat as stale below
+                if old_pid and old_pid != os.getpid() and _pid_exe_name(old_pid) in ("python.exe", "pythonw.exe"):
+                    return False  # a real instance is holding the lock
+                # Stale lock (holder gone, or its PID got recycled by something
+                # else entirely) -- clear it and retry rather than wedging
+                # every future start the way watchdog.py's own docstring warns
+                # its equivalent check could.
+                try:
+                    os.remove(_MONITOR_PID_FILE)
+                except Exception:
+                    return False
+        return False  # kept losing the race across every retry -- don't guess
+
+    def _release_monitor_lock() -> None:
+        try:
+            with open(_MONITOR_PID_FILE) as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.remove(_MONITOR_PID_FILE)
+        except Exception:
+            pass
+
+    if not _acquire_monitor_lock():
         print(f"AOC is already running on port {PORT} — not starting a second instance.")
         sys.exit(0)
+    atexit.register(_release_monitor_lock)
 
     # We're about to become the sole active instance — reap any tunnel child a
     # previous, now-dead instance left running (see _reap_stray_tunnel_process).
