@@ -457,13 +457,9 @@ def _db_save_session(status: dict, sid: str = None):
                     waiting_on_you_s += max(0, _save_now_epoch - s["waiting_on_you_since"])
             waiting_on_you_s = int(waiting_on_you_s)
 
-            total_tokens = sum(a.get("tokens_used", 0) or 0 for a in agents)
-            total_cost   = total_tokens / 1_000_000 * 9
             all_tasks    = [t for a in agents for t in (a.get("tasks") or [])]
             task_done    = sum(1 for t in all_tasks if t.get("done"))
             file_count   = len({f["path"] for a in agents for f in (a.get("files_changed") or [])})
-            done_count   = sum(1 for a in agents if a.get("status") == "done")
-            err_count    = sum(1 for a in agents if a.get("status") == "error")
 
             dur_s = 0
             if started_at:
@@ -477,15 +473,6 @@ def _db_save_session(status: dict, sid: str = None):
             snapshot = json.dumps(status, ensure_ascii=False)
 
             c = _db_conn()
-            c.execute("""
-                INSERT OR REPLACE INTO sessions
-                (id, project, date, started_at, ended_at, duration_s,
-                 agents, done, errors, tokens, cost, task_done, task_total, file_count, snapshot, cc_version,
-                 waiting_on_you_s)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (sid, project, date, started_at, ended_at, dur_s,
-                  len(agents), done_count, err_count, total_tokens, total_cost,
-                  task_done, len(all_tasks), file_count, snapshot, cc_version, waiting_on_you_s))
 
             # Auto-save re-runs every 5 min against the same sid (see docstring).
             # file_changes has no unique constraint, so a plain INSERT below would
@@ -544,6 +531,36 @@ def _db_save_session(status: dict, sid: str = None):
                         VALUES (?,?,?,?,?)
                     """, (sid, a.get("id",""), f.get("path",""), f.get("type","changed"),
                           f.get("lines", 0) or 0))
+
+            # Derived from the agents table *after* the upsert loop above, not
+            # from the in-memory `agents` list this function started with --
+            # that list only holds what _agent_retention_worker hasn't pruned
+            # yet (old done/error agents get cleared from live status every
+            # ~15min so TIMELINE/SUMMARY/etc. don't grow forever), while each
+            # row upserted into the agents table stays there for this
+            # session's lifetime (only _db_prune_old's whole-session cascade
+            # delete ever removes it). Using SUM(agents.cost) also means this
+            # total inherits the real per-model cost each row already carries
+            # (see a_cost above) instead of re-deriving one flat-rate guess
+            # from the session's total tokens regardless of model mix.
+            totals = c.execute("""
+                SELECT COUNT(*) as agents,
+                       SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done,
+                       SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as errors,
+                       SUM(tokens) as tokens, SUM(cost) as cost
+                FROM agents WHERE session_id=?
+            """, (sid,)).fetchone()
+
+            c.execute("""
+                INSERT OR REPLACE INTO sessions
+                (id, project, date, started_at, ended_at, duration_s,
+                 agents, done, errors, tokens, cost, task_done, task_total, file_count, snapshot, cc_version,
+                 waiting_on_you_s)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (sid, project, date, started_at, ended_at, dur_s,
+                  totals["agents"], totals["done"] or 0, totals["errors"] or 0,
+                  totals["tokens"] or 0, totals["cost"] or 0.0,
+                  task_done, len(all_tasks), file_count, snapshot, cc_version, waiting_on_you_s))
 
             c.commit()
             c.close()
@@ -705,33 +722,115 @@ def _db_analytics():
     with _db_lock:
         try:
             c = _db_conn()
-            total = c.execute("""
-                SELECT COUNT(*) as sessions, SUM(tokens) as tokens, SUM(cost) as cost,
-                       SUM(agents) as agents, SUM(done) as done, SUM(errors) as errors,
-                       SUM(file_count) as files
-                FROM sessions
+            # agents/done/errors/tokens/cost come from the agents table
+            # directly (COUNT(*)/SUM(...) over every row ever upserted for
+            # these sessions) rather than from sessions.agents/done/errors/
+            # tokens/cost -- those columns get written by _db_save_session
+            # from whatever's currently in the live in-memory agent list at
+            # save time, which _agent_retention_worker periodically prunes
+            # (old done/error agents cleared every ~15min so TIMELINE/
+            # SUMMARY/etc. don't grow forever). A session that's since been
+            # closed never gets re-saved to self-heal that, so trusting the
+            # sessions columns here would keep understating lifetime totals
+            # (and, for cost, ignoring each agent's own real per-model price
+            # in favor of a flat-rate guess) even after _db_save_session's
+            # own write path was fixed to stop introducing new drift.
+            total_sessions = c.execute("""
+                SELECT COUNT(*) as sessions, SUM(file_count) as files FROM sessions
             """).fetchone()
-            today = c.execute("""
-                SELECT COUNT(*) as sessions, SUM(tokens) as tokens, SUM(cost) as cost,
-                       SUM(agents) as agents, SUM(done) as done, SUM(errors) as errors,
-                       AVG(duration_s) as avg_duration_s
+            total_agents = c.execute("""
+                SELECT COUNT(*) as agents,
+                       SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done,
+                       SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as errors,
+                       SUM(tokens) as tokens, SUM(cost) as cost
+                FROM agents
+            """).fetchone()
+            total = {
+                "sessions": total_sessions["sessions"], "files": total_sessions["files"],
+                "agents": total_agents["agents"], "done": total_agents["done"],
+                "errors": total_agents["errors"], "tokens": total_agents["tokens"],
+                "cost": total_agents["cost"],
+            }
+            today_sessions = c.execute("""
+                SELECT COUNT(*) as sessions, AVG(duration_s) as avg_duration_s
                 FROM sessions WHERE date=?
             """, (today_str,)).fetchone()
-            by_day = c.execute("""
-                SELECT date, COUNT(*) as sessions, SUM(tokens) as tokens, SUM(cost) as cost,
-                       SUM(agents) as agents, SUM(errors) as errors, AVG(duration_s) as avg_duration_s,
+            today_agents = c.execute("""
+                SELECT COUNT(*) as agents,
+                       SUM(CASE WHEN a.status='done' THEN 1 ELSE 0 END) as done,
+                       SUM(CASE WHEN a.status='error' THEN 1 ELSE 0 END) as errors,
+                       SUM(a.tokens) as tokens, SUM(a.cost) as cost
+                FROM agents a JOIN sessions s ON a.session_id = s.id
+                WHERE s.date=?
+            """, (today_str,)).fetchone()
+            today = {
+                "sessions": today_sessions["sessions"], "avg_duration_s": today_sessions["avg_duration_s"],
+                "agents": today_agents["agents"], "done": today_agents["done"],
+                "errors": today_agents["errors"], "tokens": today_agents["tokens"],
+                "cost": today_agents["cost"],
+            }
+            # Same agents-table-is-authoritative fix as total/today above,
+            # applied to the day/project breakdowns -- tokens/cost/agents/
+            # done/errors are joined in from the agents table (grouped by
+            # the owning session's date/project) rather than trusted from
+            # sessions.*, which stays the source only for fields the agents
+            # table has no equivalent for (session count, task_done/
+            # task_total, waiting_on_you_s, avg_duration_s). Two queries
+            # merged in Python rather than one JOIN...GROUP BY, so a date/
+            # project with sessions but zero agents rows still shows up
+            # (an INNER JOIN would silently drop it, same bug this is fixing
+            # just relocated) with agents/tokens/cost defaulting to 0.
+            by_day_sessions = c.execute("""
+                SELECT date, COUNT(*) as sessions, AVG(duration_s) as avg_duration_s,
                        SUM(task_done) as task_done, SUM(task_total) as task_total,
                        SUM(waiting_on_you_s) as waiting_on_you_s
                 FROM sessions GROUP BY date ORDER BY date DESC LIMIT 30
             """).fetchall()
-            by_project = c.execute("""
-                SELECT project, COUNT(*) as sessions, SUM(tokens) as tokens, SUM(cost) as cost,
-                       SUM(agents) as agents, SUM(done) as done, SUM(errors) as errors,
+            by_day_agents = {r["date"]: r for r in c.execute("""
+                SELECT s.date as date, SUM(a.tokens) as tokens, SUM(a.cost) as cost,
+                       COUNT(*) as agents,
+                       SUM(CASE WHEN a.status='error' THEN 1 ELSE 0 END) as errors
+                FROM agents a JOIN sessions s ON a.session_id = s.id
+                GROUP BY s.date
+            """).fetchall()}
+            by_day = []
+            for r in by_day_sessions:
+                ag = by_day_agents.get(r["date"])
+                by_day.append({
+                    "date": r["date"], "sessions": r["sessions"],
+                    "tokens": ag["tokens"] if ag else 0, "cost": ag["cost"] if ag else 0.0,
+                    "agents": ag["agents"] if ag else 0, "errors": ag["errors"] if ag else 0,
+                    "avg_duration_s": r["avg_duration_s"],
+                    "task_done": r["task_done"], "task_total": r["task_total"],
+                    "waiting_on_you_s": r["waiting_on_you_s"],
+                })
+            by_project_sessions = c.execute("""
+                SELECT project, COUNT(*) as sessions,
                        SUM(task_done) as task_done, SUM(task_total) as task_total,
                        SUM(waiting_on_you_s) as waiting_on_you_s
-                FROM sessions WHERE project != ''
-                GROUP BY project ORDER BY SUM(cost) DESC LIMIT 20
+                FROM sessions WHERE project != '' GROUP BY project
             """).fetchall()
+            by_project_agents = {r["project"]: r for r in c.execute("""
+                SELECT s.project as project, SUM(a.tokens) as tokens, SUM(a.cost) as cost,
+                       COUNT(*) as agents,
+                       SUM(CASE WHEN a.status='done' THEN 1 ELSE 0 END) as done,
+                       SUM(CASE WHEN a.status='error' THEN 1 ELSE 0 END) as errors
+                FROM agents a JOIN sessions s ON a.session_id = s.id
+                WHERE s.project != ''
+                GROUP BY s.project
+            """).fetchall()}
+            by_project_all = []
+            for r in by_project_sessions:
+                ag = by_project_agents.get(r["project"])
+                by_project_all.append({
+                    "project": r["project"], "sessions": r["sessions"],
+                    "tokens": ag["tokens"] if ag else 0, "cost": ag["cost"] if ag else 0.0,
+                    "agents": ag["agents"] if ag else 0, "done": ag["done"] if ag else 0,
+                    "errors": ag["errors"] if ag else 0,
+                    "task_done": r["task_done"], "task_total": r["task_total"],
+                    "waiting_on_you_s": r["waiting_on_you_s"],
+                })
+            by_project = sorted(by_project_all, key=lambda x: -(x["cost"] or 0))[:20]
             # Total agents whose *start* was only ever caught by the transcript
             # fallback scanner, never by Claude Code's own PreToolUse hook --
             # quantifies how often that hook dispatch actually drops an event
@@ -757,9 +856,11 @@ def _db_analytics():
                 } for r in concurrency_rows
             }
             by_day_project = c.execute("""
-                SELECT date, project, SUM(tokens) as tokens, SUM(cost) as cost
-                FROM sessions WHERE project != ''
-                GROUP BY date, project ORDER BY date ASC
+                SELECT s.date as date, s.project as project,
+                       SUM(a.tokens) as tokens, SUM(a.cost) as cost
+                FROM agents a JOIN sessions s ON a.session_id = s.id
+                WHERE s.project != ''
+                GROUP BY s.date, s.project ORDER BY s.date ASC
             """).fetchall()
             # Cost/token breakdown by model (Sonnet vs Opus vs Haiku, etc.) --
             # only ever populated for agents saved since the `model` column
@@ -5504,6 +5605,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(0,100,160,.38); }
         <input class="search-input" id="rp-errors-search-input" type="text" placeholder="Search errors..." oninput="_setErrorSearch(this.value)">
         <button class="search-clear" id="rp-errors-search-clear" onclick="_setErrorSearch('')">✕</button>
       </div>
+      <div id="rp-errors-types" style="display:none;flex-wrap:wrap;gap:4px;padding:0 10px 6px"></div>
       <div id="rp-errors" style="flex:1;overflow-y:auto;padding:0 10px 6px;display:flex;flex-direction:column;gap:6px"></div>
     </div>
   </div>
@@ -6428,25 +6530,61 @@ async function _selectTagFilter(tag){
 let _errorsLastRender=0;
 let _errorsCache=[];
 let _errorSearchQuery='';
-function _filterErrors(errs,query){
+let _errorTypeFilter='all';
+/* Errors have no structured category in the DB (error_msg is whatever
+   string the agent/hook happened to report) -- classify by matching the
+   handful of shapes that actually recur in production (worktree/git setup
+   failures, the user declining a permission prompt, upstream network
+   timeouts, "model temporarily unavailable", and raw tracebacks), falling
+   back to 'other' rather than inventing a bucket per one-off message. */
+const _ERROR_TYPE_LABELS={worktree:'WORKTREE/GIT',rejected:'USER REJECTED',unavailable:'MODEL UNAVAILABLE',network:'NETWORK/TIMEOUT',exception:'EXCEPTION',other:'OTHER'};
+function _classifyError(msg){
+  const m=msg||'';
+  if(/worktree/i.test(m)) return 'worktree';
+  if(/doesn't want to proceed|was rejected/i.test(m)) return 'rejected';
+  if(/temporarily unavailable/i.test(m)) return 'unavailable';
+  if(/timeout|connection refused|connection dropped|econnreset|upstream/i.test(m)) return 'network';
+  if(/traceback \(most recent call last\)/i.test(m)) return 'exception';
+  return 'other';
+}
+function _filterErrors(errs,query,type){
   const q=(query||'').trim().toLowerCase();
-  if(!q) return errs;
-  return errs.filter(e=>
-    (e.error_msg||'').toLowerCase().includes(q)
-    || (e.name||'').toLowerCase().includes(q)
-    || (e.project||'').toLowerCase().includes(q)
-  );
+  return errs.filter(e=>{
+    if(type && type!=='all' && _classifyError(e.error_msg)!==type) return false;
+    if(!q) return true;
+    return (e.error_msg||'').toLowerCase().includes(q)
+      || (e.name||'').toLowerCase().includes(q)
+      || (e.project||'').toLowerCase().includes(q);
+  });
+}
+function _renderErrorTypeBar(){
+  const bar=document.getElementById('rp-errors-types');
+  if(!bar) return;
+  if(!_errorsCache.length){ bar.style.display='none'; return; }
+  const counts={};
+  _errorsCache.forEach(e=>{ const t=_classifyError(e.error_msg); counts[t]=(counts[t]||0)+1; });
+  if(_errorTypeFilter!=='all' && !counts[_errorTypeFilter]) _errorTypeFilter='all';
+  const types=Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
+  bar.style.display='flex';
+  const btn=(f,label)=>`<button class="sfbtn error ${_errorTypeFilter===f?'active':''}" style="padding:3px 8px;font-size:9px" onclick="_setErrorTypeFilter('${f}')">${label}</button>`;
+  bar.innerHTML=btn('all',`ALL ${_errorsCache.length}`)
+    +types.map(t=>btn(t,`${_ERROR_TYPE_LABELS[t]||t.toUpperCase()} ${counts[t]}`)).join('');
+}
+function _setErrorTypeFilter(type){
+  _errorTypeFilter=type;
+  _renderErrorTypeBar();
+  _renderErrorsList();
 }
 function _renderErrorsList(){
   const el=document.getElementById('rp-errors');
   if(!el) return;
-  const errs=_filterErrors(_errorsCache,_errorSearchQuery);
+  const errs=_filterErrors(_errorsCache,_errorSearchQuery,_errorTypeFilter);
   if(!_errorsCache.length){
     el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no errors recorded</div>';
     return;
   }
   if(!errs.length){
-    el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no errors match your search</div>';
+    el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no errors match your filters</div>';
     return;
   }
   el.innerHTML=errs.map(e=>`<div style="padding:8px 10px;border-radius:8px;background:rgba(255,51,85,.06);border:1px solid rgba(255,51,85,.2);border-left:3px solid var(--r);cursor:pointer" onclick="_jumpToSessionHistory('${e.session_id}')" title="Open this session in History">
@@ -6478,6 +6616,7 @@ async function _renderRpErrors(){
     _errorsCache=await fetch('/errors').then(r=>r.json());
     const etEl=document.getElementById('rpt-errors');
     if(etEl) etEl.textContent=_errorsCache.length?`ERRORS (${_errorsCache.length})`:'ERRORS';
+    _renderErrorTypeBar();
     _renderErrorsList();
   }catch(e){}
 }
