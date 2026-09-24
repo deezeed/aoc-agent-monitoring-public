@@ -6213,9 +6213,9 @@ function setSessionFilter(id){
   sessionFilter=id;
   if(lastStatus) renderAgents(lastStatus);
 }
-async function _dismissSession(id){
+async function _dismissSession(id,machineName){
   try{
-    await fetch(`/session/${encodeURIComponent(id)}`,{method:'DELETE'});
+    await fetch(_apiUrl(_machineFor(machineName),`/session/${encodeURIComponent(id)}`),{method:'DELETE'});
   }catch(e){}
   /* immediately remove from local state so card vanishes without waiting for next poll */
   if(lastStatus){
@@ -6227,12 +6227,12 @@ async function _dismissSession(id){
   }
 }
 
-/* ── stale-session sweep ── bulk-dismiss every closed local session at
-   once instead of clicking Dismiss on each card individually. Remote
-   (merged-in) sessions are excluded, same gate the manual Dismiss button
-   already uses -- their lifecycle belongs to their own machine. */
+/* ── stale-session sweep ── bulk-dismiss every closed session at once
+   (local or merged-in from a Remote Machine) instead of clicking Dismiss
+   on each card individually -- _dismissSession already routes each one
+   to its own machine. */
 function _staleSessions(sr){
-  return ((sr||lastStatus||{}).sessions_list||[]).filter(s=>s.session_active===false && s._isLocal!==false);
+  return ((sr||lastStatus||{}).sessions_list||[]).filter(s=>s.session_active===false);
 }
 function _updateSweepButton(sr){
   const btn=document.getElementById('btn-sweep-stale');
@@ -6249,19 +6249,19 @@ async function sweepStaleSessions(){
   // impossible to accidentally click through the way a styled in-page
   // modal could be, and this is a bulk, irreversible action.
   if(!confirm(`Dismiss ${stale.length} idle session${stale.length!==1?'s':''}? This can't be undone.`)) return;
-  for(const s of stale){ await _dismissSession(s.id); }
+  for(const s of stale){ await _dismissSession(s.id,s.machine); }
   _updateSweepButton(lastStatus);
   log(`Swept ${stale.length} idle session${stale.length!==1?'s':''}`,'success');
 }
 
-async function _forceStopSession(id,label){
+async function _forceStopSession(id,label,machineName){
   /* Destructive -- kills a real OS process (the user's actual claude.exe),
      not just an AOC-side card. Native confirm() is a deliberate choice over
      a custom modal: it's a blocking native browser dialog, impossible to
      accidentally click through the way a styled in-page modal could be. */
   if(!confirm(`Force stop "${label}"?\n\nThis will kill the claude.exe process for this session immediately. Any unsaved work in that terminal will be lost.`)) return;
   try{
-    const r=await fetch('/kill_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:id})});
+    const r=await fetch(_apiUrl(_machineFor(machineName),'/kill_session'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:id})});
     const j=await r.json();
     if(j.ok){
       log(`Force-stopped session: ${label}`,'success');
@@ -6967,9 +6967,9 @@ function _fmtDurShort(s, round=false){
 /* Shared cost formatter ($X.XXXX) -- independently re-declared identically
    4 times (session compare, history view, KPI-adjacent render paths). */
 function _fmtCost(c){ return c!=null?'$'+(+c).toFixed(4):'—'; }
-async function dismissAgent(id){
+async function dismissAgent(id,machineName){
   try{
-    await fetch('/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+    await fetch(_apiUrl(_machineFor(machineName),'/remove'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
   }catch(e){}
 }
 async function clearDoneAgents(){
@@ -7878,7 +7878,7 @@ function renderAgents(data){
         <div class="ar-pill ${a.status}">${stxt(a)}</div>
         <div class="ar-prog"><div class="ar-prog-fill" style="width:${pct}%;background:${col}"></div></div>
         <div class="ar-elapsed">${elapsedStr||'—'}</div>
-        <button class="ar-dismiss" onclick="dismissAgent('${a.id}')" title="Dismiss">×</button>
+        <button class="ar-dismiss" onclick="dismissAgent('${a.id}','${escHtml(a.machine||'')}')" title="Dismiss">×</button>
       </div>`;
     }).join('');
   } else {
@@ -8028,7 +8028,7 @@ function renderAgents(data){
       <button class="card-cmp-btn ${_compareIds.includes(a.id)?'selected':''}" data-id="${a.id}" onclick="toggleCompare('${a.id}',event)" title="${_compareIds.includes(a.id)?'Remove from compare':'Add to compare'}">⊞</button>
       <button class="card-pin-btn" onclick="togglePin('${a.id}',event)" title="${isPinned?'Unpin':'Pin to top'}">${isPinned?'◈':'◉'}</button>
       <button class="card-collapse-btn" onclick="toggleCollapse('${a.id}',event)" title="${isCollapsed?'Expand':'Collapse'}">▲</button>
-      ${isRemote?'':`<button class="card-dismiss" onclick="dismissAgent('${a.id}')" title="Dismiss">×</button>`}
+      <button class="card-dismiss" onclick="dismissAgent('${a.id}','${escHtml(a.machine||'')}')" title="Dismiss">×</button>
       ${dispStatus==='running'?'<div class="sweep"></div>':''}
       ${sessBadge}
       <div class="card-head">
@@ -8218,9 +8218,9 @@ function renderAgents(data){
           ${!sIsRemote?`<button onclick="event.stopPropagation();openNotesPanel('${escHtml(s.id)}')" title="${s.note?'Edit note':'Add note'}" style="background:none;border:none;color:${s.note?'var(--c)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${s.note?'var(--c)':'var(--t3)'}'">📝</button>`:''}
           <button onclick="event.stopPropagation();exportSessionDetail('${escHtml(s.id)}')" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
           <button onclick="toggleSessionCompare('${escHtml(s.id)}',event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
-          ${isActive&&s.host_pid&&!sIsRemote?`<button onclick="event.stopPropagation();_forceStopSession('${escHtml(s.id)}','${escHtml(s.project||s.cwd||'this session')}')" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(255,80,100,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(255,80,100,.7)'">⛔</button>`:''}
+          ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession('${escHtml(s.id)}','${escHtml(s.project||s.cwd||'this session')}','${escHtml(s.machine||'')}')" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(255,80,100,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(255,80,100,.7)'">⛔</button>`:''}
           ${!isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_copyResumeCmd('${escHtml(s.id)}')" title="Copy resume command to clipboard" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⟲</button>`:''}
-          ${!isActive&&!sIsRemote?` <button onclick="event.stopPropagation();_dismissSession('${escHtml(s.id)}')" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
+          ${!isActive?` <button onclick="event.stopPropagation();_dismissSession('${escHtml(s.id)}','${escHtml(s.machine||'')}')" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
         </div>
       </div>`;
     });
@@ -9416,6 +9416,24 @@ function _pollRemoteMachines(){
   });
 }
 setInterval(_pollRemoteMachines, 4000);
+
+/* ── routing a mutation (Force Stop / Dismiss) to the right machine ──
+   Every merged agent/session card carries a.machine/s.machine (the name
+   typed into Settings -> Remote Machines, or _localMachineName for this
+   machine's own -- see _mergeRemoteData above). _machineFor resolves
+   that name back to the {url,token} needed to reach it; null means
+   "local", so _apiUrl's callers don't need their own local/remote
+   branch -- a null machine just returns the plain relative path exactly
+   as every call site already did before Remote Machines existed. */
+function _machineFor(name){
+  if(!name || name===_localMachineName) return null;
+  return _remoteMachines.find(m=>m.name===name) || null;
+}
+function _apiUrl(machine, path){
+  if(!machine || !machine.url) return path;
+  const sep=path.includes('?')?'&':'?';
+  return machine.url+path+(machine.token?(sep+'token='+encodeURIComponent(machine.token)):'');
+}
 
 /* ── multi-machine merge: History/Analytics ──
    Separate from the live-dashboard merge above on purpose: History and
@@ -12213,7 +12231,7 @@ class Handler(BaseHTTPRequestHandler):
                 _handle_events_ws(self)
             else:
                 self._serve(400, "text/plain", b"WebSocket required")
-        elif self.path == "/history":
+        elif path_no_qs == "/history":
             sessions = _db_get_sessions(100)
             self._serve(200, "application/json", json.dumps(sessions, ensure_ascii=False).encode())
         elif path_no_qs == "/history/search":
@@ -12224,18 +12242,18 @@ class Handler(BaseHTTPRequestHandler):
             date_to = (qs.get("to") or [""])[0]
             sessions = _db_search_sessions(query, date_from, date_to)
             self._serve(200, "application/json", json.dumps(sessions, ensure_ascii=False).encode(), no_cache=True)
-        elif self.path == "/history/save_current":
+        elif path_no_qs == "/history/save_current":
             try:
                 current = _load_status()
                 _db_save_session(current)
                 self._serve(200, "application/json", b'{"ok":true}')
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
-        elif self.path.startswith("/history/"):
-            sid = self.path[len("/history/"):]
+        elif path_no_qs.startswith("/history/"):
+            sid = path_no_qs[len("/history/"):]
             detail = _db_get_session_detail(sid)
             self._serve(200, "application/json", json.dumps(detail, ensure_ascii=False).encode())
-        elif self.path == "/analytics":
+        elif path_no_qs == "/analytics":
             data = _db_analytics()
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
         elif path_no_qs == "/export_costs.csv":
@@ -12250,19 +12268,19 @@ class Handler(BaseHTTPRequestHandler):
             date_from, date_to = self._get_csv_date_range()
             self._serve_csv_download(_export_costs_by_subagent_type_csv(date_from, date_to),
                                       f"aoc_costs_by_agent_type_{date_from or 'all'}_{date_to or 'all'}.csv")
-        elif self.path == "/diag":
+        elif path_no_qs == "/diag":
             data = _get_diag_info()
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
-        elif self.path == "/backups":
+        elif path_no_qs == "/backups":
             self._serve(200, "application/json", json.dumps(_list_backups(), ensure_ascii=False).encode())
-        elif self.path == "/webhook_settings":
+        elif path_no_qs == "/webhook_settings":
             self._serve(200, "application/json", json.dumps(_webhook_settings, ensure_ascii=False).encode())
-        elif self.path == "/notify_settings":
+        elif path_no_qs == "/notify_settings":
             self._serve(200, "application/json", json.dumps(_notify_settings, ensure_ascii=False).encode())
-        elif self.path == "/errors":
+        elif path_no_qs == "/errors":
             data = _db_get_errors(100)
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
-        elif self.path == "/auditlog":
+        elif path_no_qs == "/auditlog":
             self._get_auditlog()
         elif self.path.startswith("/diff"):
             self._get_diff()
@@ -12281,14 +12299,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self._check_auth():
             self._serve(401, "text/plain", b"Unauthorized"); return
-        if self.path == "/auth/token":
+        # Stripped once here (mirroring do_GET's path_no_qs) rather than at
+        # each elif -- a Remote Machine call always carries `?token=...`
+        # (see README's Security model: the auth token travels as a query
+        # param, not a header, for any cross-origin request), so matching
+        # against the raw self.path used to either 404 on every remote
+        # DELETE or, worse for /session/<id>, silently glue the query
+        # string onto the extracted id and dismiss/create the wrong
+        # session entry instead of failing loudly.
+        path_no_qs = self.path.split("?")[0]
+        if path_no_qs == "/auth/token":
             _delete_auth_token()
             self._serve(200, "application/json", json.dumps(_auth_info()).encode())
-        elif self.path == "/license":
+        elif path_no_qs == "/license":
             _delete_license()
             self._serve(200, "application/json", json.dumps(_license_info()).encode())
-        elif self.path.startswith("/session/"):
-            sid = self.path[len("/session/"):]
+        elif path_no_qs.startswith("/session/"):
+            sid = path_no_qs[len("/session/"):]
             try:
                 from urllib.parse import unquote
                 sid = unquote(sid)
@@ -12307,6 +12334,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve(500, "text/plain", str(e).encode())
         else:
             self._serve(404, "text/plain", b"Not found")
+
+    def do_OPTIONS(self):
+        """CORS preflight. `_serve()` already sends
+        Access-Control-Allow-Origin on every real response, which is
+        enough for a cross-origin GET (Remote Machines' own /status poll)
+        or a bodyless POST -- browsers only send those straight through.
+        DELETE and a POST with a JSON body are not "simple requests"
+        though, so the browser sends this OPTIONS preflight first and
+        withholds do_DELETE/do_POST entirely until it sees the right
+        headers back here -- without this handler, BaseHTTPRequestHandler
+        has no do_OPTIONS and falls back to a 501, which is exactly what
+        silently made Force Stop/Dismiss no-ops against a merged-in
+        Remote Machine (see README's Remote Machines section) despite
+        those endpoints working fine called locally the whole time.
+        No auth check here: a preflight carries no body and the actual
+        token still travels as `?token=` on the real request that
+        follows, checked by that request's own do_POST/do_DELETE exactly
+        as before -- this only stops the browser from blocking that
+        request before it's ever sent."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _post_update(self, body):
         try:
@@ -12548,11 +12600,18 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(401, "text/plain", b"Unauthorized"); return
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        # Stripped once here (mirroring do_GET's path_no_qs) -- every route
+        # below used to match against the raw self.path, which worked by
+        # coincidence only because a same-origin call never carried a query
+        # string. A Remote Machine call always does (the auth token travels
+        # as `?token=...`, see README's Security model), so every one of
+        # these routes 404'd for a remote caller until this was stripped.
+        path_no_qs = self.path.split("?")[0]
 
-        if self.path == "/update":
+        if path_no_qs == "/update":
             self._post_update(body)
 
-        elif self.path == "/remove":
+        elif path_no_qs == "/remove":
             try:
                 data = json.loads(body)
                 aid = data.get("id")
@@ -12566,7 +12625,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/clear_done":
+        elif path_no_qs == "/clear_done":
             try:
                 with _status_lock:
                     status = _load_status()
@@ -12578,7 +12637,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/notes":
+        elif path_no_qs == "/notes":
             try:
                 data = json.loads(body)
                 note = str(data.get("note", ""))[:2000]
@@ -12590,7 +12649,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/session_note":
+        elif path_no_qs == "/session_note":
             # Per-session note, distinct from the single global "session_note"
             # above -- field name is "note" (not "session_note") specifically
             # to avoid confusion between the two.
@@ -12606,7 +12665,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/history_tags":
+        elif path_no_qs == "/history_tags":
             # Edits an already-saved History row directly (_db_set_session_tags),
             # not the live status dict -- see that function's own docstring
             # for why this differs from /session_note.
@@ -12619,7 +12678,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/webhook_test":
+        elif path_no_qs == "/webhook_test":
             try:
                 import urllib.request as _ur
                 data = json.loads(body)
@@ -12632,7 +12691,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(200, "application/json", json.dumps({"ok": False, "error": str(e)}).encode())
 
-        elif self.path == "/webhook_fire":
+        elif path_no_qs == "/webhook_fire":
             try:
                 data = json.loads(body)
                 url = str(data.get("url", ""))[:500]
@@ -12641,7 +12700,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/webhook_settings":
+        elif path_no_qs == "/webhook_settings":
             try:
                 data = json.loads(body)
                 url = str(data.get("url", ""))[:500]
@@ -12658,10 +12717,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/notify_settings":
+        elif path_no_qs == "/notify_settings":
             self._post_notify_settings(body)
 
-        elif self.path == "/snitch_ping_now":
+        elif path_no_qs == "/snitch_ping_now":
             try:
                 data = json.loads(body)
                 url = str(data.get("url", "") or _notify_settings.get("snitch_url", ""))[:500]
@@ -12673,7 +12732,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/restore_backup":
+        elif path_no_qs == "/restore_backup":
             try:
                 data = json.loads(body)
                 result = _restore_backup(str(data.get("filename", "")))
@@ -12682,23 +12741,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/tunnel/start":
+        elif path_no_qs == "/tunnel/start":
             self._post_tunnel_start(body)
 
-        elif self.path == "/tunnel/stop":
+        elif path_no_qs == "/tunnel/stop":
             _stop_tunnel()
             self._serve(200, "application/json", b'{"ok":true}')
 
-        elif self.path == "/tunnel/ngrok_authtoken":
+        elif path_no_qs == "/tunnel/ngrok_authtoken":
             self._post_tunnel_ngrok_authtoken(body)
 
-        elif self.path == "/reset":
+        elif path_no_qs == "/reset":
             self._post_reset()
 
-        elif self.path == "/kill_session":
+        elif path_no_qs == "/kill_session":
             self._post_kill_session(body)
 
-        elif self.path == "/auth/token":
+        elif path_no_qs == "/auth/token":
             try:
                 new_token = _secrets.token_urlsafe(24)
                 _save_auth_token(new_token)
@@ -12706,7 +12765,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._serve(500, "text/plain", str(e).encode())
 
-        elif self.path == "/license":
+        elif path_no_qs == "/license":
             try:
                 data = json.loads(body)
                 key = (data.get("key") or "").strip()

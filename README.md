@@ -458,8 +458,18 @@ instances on your LAN into this same dashboard, live view and
 History/Analytics both. Add a name, that machine's `http://ip:5151` (or
 tunnel URL), and its own auth token (it needs one generated even for pure
 LAN access — non-localhost requests are always rejected without one).
-Read-only for now: Force Stop and Dismiss only ever act on this machine's
-own sessions, never a remote one's.
+Force Stop and Dismiss both work against a merged-in remote session or
+agent too — the click routes straight to that machine's own
+`http://ip:5151` with its own token, the same way its `/status` is
+already polled. Getting there needed one small server-side addition: a
+`do_OPTIONS` handler, since a cross-origin `DELETE` or a JSON-body `POST`
+is not a browser "simple request" — it needs a CORS preflight answered
+first, which this server previously had no handler for at all (a bare
+501, silently blocking the real request from ever being sent). Notes and
+the resume-command copy button stay local-only — a resume command only
+means anything run from that machine's own shell, and a note is that
+machine's own local metadata, so hiding those for a remote card is
+correct, not a limitation.
 
 Settings → **COST** covers the cost rate, a global per-session budget
 (shows a red KPI once a live session's own cost crosses it — a
