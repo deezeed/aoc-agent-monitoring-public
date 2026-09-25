@@ -2087,6 +2087,174 @@ def _webhook_notify_worker():
 
 threading.Thread(target=_webhook_notify_worker, daemon=True).start()
 
+
+# ── Force Stop core (shared by POST /kill_session and the cloud poller) ─────
+
+_KILL_OUTCOME_RESPONSES = {
+    "killed": (200, b'{"ok":true}'),
+    "refused_no_host_pid": (400, b'{"ok":false,"error":"no host_pid recorded for this session"}'),
+    "refused_pid_mismatch": (409, b'{"ok":false,"error":"PID no longer belongs to claude.exe -- refusing to kill"}'),
+}
+
+def _kill_session_core(sid: str, remote_addr: str = "") -> str:
+    """Kill one CLI session's claude.exe and return the outcome string
+    (a key of _KILL_OUTCOME_RESPONSES, also what kill_audit.log records).
+    Extracted from POST /kill_session so the cloud command poller
+    (_cloud_command_worker) runs the exact same checks and audit trail
+    instead of a second copy that could drift."""
+    with _status_lock:
+        status = _load_status()
+        sess = status.get("sessions", {}).get(sid)
+    host_pid = sess.get("host_pid") if sess else None
+    if not host_pid:
+        _log_kill_attempt(sid, sess, host_pid, "refused_no_host_pid", remote_addr)
+        return "refused_no_host_pid"
+    # PID-reuse guard: Windows recycles PIDs, and by the time a user clicks
+    # Force Stop the original claude.exe may be long gone with that PID
+    # reassigned to something completely unrelated -- verify identity right
+    # before killing, same pattern as _reap_stray_tunnel_process's "only
+    # ever touch a PID after confirming what it actually is" rule, never a
+    # blanket kill-by-name.
+    r = _run(["tasklist", "/FI", f"PID eq {host_pid}"], timeout=5)
+    if "claude.exe" not in (r.stdout or "").lower():
+        _log_kill_attempt(sid, sess, host_pid, "refused_pid_mismatch", remote_addr)
+        return "refused_pid_mismatch"
+    _run(["taskkill", "/F", "/PID", str(host_pid)], timeout=5)
+    with _status_lock:
+        status = _load_status()
+        if sid in status.get("sessions", {}):
+            status["sessions"][sid]["session_active"] = False
+            status["sessions"][sid]["dismissed"] = True
+        _save_status(status)
+    _log_kill_attempt(sid, sess, host_pid, "killed", remote_addr)
+    return "killed"
+
+
+# ── AOC Cloud: remote Force Stop poller + offline spool drain ──────────────
+# Only does anything when this machine was set up with
+# `setup.py --cloud-url ... --cloud-key ...` (the same two files the hook
+# reads). Otherwise it's a cheap file-exists check every tick.
+#
+# Force Stop from the cloud dashboard can't reach this PC directly, so the
+# cloud queues it and this polls (saas-backend/app/services/commands.py).
+# Commands for sessions this machine doesn't know are left alone: another
+# machine on the same account may own them, and the cloud expires any
+# command nobody picks up within 5 minutes.
+#
+# The hook spools cloud updates it couldn't deliver (offline laptop, cloud
+# down) to aoc_cloud_spool.jsonl; this drains them in order. Done here and
+# not in the hook, because the hook runs as many short-lived processes that
+# would race each other, and this is the one long-running process.
+
+CLOUD_HOOKS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks")
+CLOUD_SPOOL_FILE = os.path.join(CLOUD_HOOKS_DIR, "aoc_cloud_spool.jsonl")
+_CLOUD_POLL_INTERVAL_S = 10
+
+def _read_cloud_config():
+    """Same files and rules as hooks/aoc_hook.py's _read_cloud_config."""
+    try:
+        with open(os.path.join(CLOUD_HOOKS_DIR, "aoc_cloud_url.txt"), encoding="utf-8") as f:
+            url = f.read().strip()
+        with open(os.path.join(CLOUD_HOOKS_DIR, "aoc_api_key.txt"), encoding="utf-8") as f:
+            key = f.read().strip()
+        if url and key:
+            return url.rstrip("/"), key
+    except Exception:
+        pass
+    return None, None
+
+def _cloud_request(url: str, key: str, method: str, path: str, data=None, timeout: float = 8):
+    import urllib.request as _ur
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
+    req = _ur.Request(f"{url}{path}", data=body, method=method, headers={
+        "Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {key}",
+    })
+    with _ur.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw else None
+
+def _drain_cloud_spool(url: str, key: str, spool_path: str = None) -> int:
+    """Send spooled updates oldest-first; stop at the first failure and keep
+    the rest for the next tick. The spool is first renamed to .draining
+    (atomic), so the hook can keep appending to a fresh spool meanwhile and
+    order is preserved: .draining is always fully sent before the next
+    rename. Returns how many entries were delivered."""
+    spool_path = spool_path or CLOUD_SPOOL_FILE
+    draining = spool_path + ".draining"
+    if not os.path.exists(draining):
+        if not os.path.exists(spool_path):
+            return 0
+        try:
+            os.replace(spool_path, draining)
+        except OSError:
+            return 0  # the hook has it open for an append right now; next tick
+    with open(draining, encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    sent = 0
+    for i, line in enumerate(lines):
+        try:
+            job = json.loads(line)
+        except ValueError:
+            sent += 1  # a torn/corrupt line can never succeed -- drop it
+            continue
+        try:
+            _cloud_request(url, key, "POST", job["path"], job["data"], timeout=5)
+        except Exception:
+            with open(draining, "w", encoding="utf-8") as f:
+                f.writelines(ln + "\n" for ln in lines[i:])
+            return sent
+        sent += 1
+    os.remove(draining)
+    return sent
+
+def _process_cloud_commands(url: str, key: str, unreported: dict) -> None:
+    """One poll: execute open kill commands for sessions this machine
+    knows, then report each outcome. `unreported` ({command_id: outcome})
+    survives between ticks, so a kill whose report failed is re-reported,
+    never re-executed."""
+    for cmd in _cloud_request(url, key, "GET", "/api/commands/pending") or []:
+        cid = cmd.get("id")
+        if cid in unreported or cmd.get("command") != "kill":
+            continue
+        sid = str(cmd.get("session_id", ""))
+        with _status_lock:
+            known = sid in _load_status().get("sessions", {})
+        if not known:
+            continue
+        try:
+            unreported[cid] = _kill_session_core(sid, "cloud")
+        except Exception as e:
+            _log_bg_error("_process_cloud_commands", e)
+            unreported[cid] = "error"
+    for cid, outcome in list(unreported.items()):
+        try:
+            _cloud_request(url, key, "POST", f"/api/commands/{cid}/result", {"outcome": outcome})
+            unreported.pop(cid, None)
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code in (404, 409, 422):
+                unreported.pop(cid, None)  # closed/expired on the cloud side; retrying can't help
+            else:
+                _log_bg_error("_process_cloud_commands.report", e)
+
+def _cloud_command_worker():
+    unreported = {}
+    while True:
+        time.sleep(_CLOUD_POLL_INTERVAL_S)
+        url, key = _read_cloud_config()
+        if not url:
+            continue
+        try:
+            _drain_cloud_spool(url, key)
+        except Exception as e:
+            _log_bg_error("_drain_cloud_spool", e)
+        try:
+            _process_cloud_commands(url, key, unreported)
+        except Exception as e:
+            _log_bg_error("_cloud_command_worker", e)
+
+threading.Thread(target=_cloud_command_worker, daemon=True).start()
+
 # ── Auth token ────────────────────────────────────────────────────────────────
 import secrets as _secrets, socket as _socket
 
@@ -12560,38 +12728,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body)
             sid = str(data.get("session_id", ""))
-            with _status_lock:
-                status = _load_status()
-                sess = status.get("sessions", {}).get(sid)
-            host_pid = sess.get("host_pid") if sess else None
             remote_addr = self.client_address[0] if self.client_address else ""
-            if not host_pid:
-                _log_kill_attempt(sid, sess, host_pid, "refused_no_host_pid", remote_addr)
-                self._serve(400, "application/json",
-                             b'{"ok":false,"error":"no host_pid recorded for this session"}')
-            else:
-                # PID-reuse guard: Windows recycles PIDs, and by the time a
-                # user clicks Force Stop the original claude.exe may be
-                # long gone with that PID reassigned to something
-                # completely unrelated -- verify identity right before
-                # killing, same pattern as _reap_stray_tunnel_process's
-                # "only ever touch a PID after confirming what it actually
-                # is" rule, never a blanket kill-by-name.
-                r = _run(["tasklist", "/FI", f"PID eq {host_pid}"], timeout=5)
-                if "claude.exe" not in (r.stdout or "").lower():
-                    _log_kill_attempt(sid, sess, host_pid, "refused_pid_mismatch", remote_addr)
-                    self._serve(409, "application/json",
-                                 b'{"ok":false,"error":"PID no longer belongs to claude.exe -- refusing to kill"}')
-                else:
-                    _run(["taskkill", "/F", "/PID", str(host_pid)], timeout=5)
-                    with _status_lock:
-                        status = _load_status()
-                        if sid in status.get("sessions", {}):
-                            status["sessions"][sid]["session_active"] = False
-                            status["sessions"][sid]["dismissed"] = True
-                        _save_status(status)
-                    _log_kill_attempt(sid, sess, host_pid, "killed", remote_addr)
-                    self._serve(200, "application/json", b'{"ok":true}')
+            outcome = _kill_session_core(sid, remote_addr)
+            code, payload = _KILL_OUTCOME_RESPONSES[outcome]
+            self._serve(code, "application/json", payload)
         except Exception as e:
             self._serve(500, "text/plain", str(e).encode())
 

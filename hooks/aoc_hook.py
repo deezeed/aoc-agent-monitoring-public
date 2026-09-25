@@ -216,6 +216,12 @@ def _read_aoc_token():
 # additional, independent forward, never a replacement for the local one.
 AOC_CLOUD_URL_FILE = os.path.join(_HOOKS_DIR, "aoc_cloud_url.txt")
 AOC_API_KEY_FILE = os.path.join(_HOOKS_DIR, "aoc_api_key.txt")
+# Cloud updates that couldn't be delivered wait here, one JSON job per line,
+# until monitor.py's _cloud_command_worker drains them in order (see
+# _post_cloud_with_retry). Capped so a machine that stays offline, or has
+# monitor.py stopped, can't grow it without bound.
+AOC_CLOUD_SPOOL_FILE = os.path.join(_HOOKS_DIR, "aoc_cloud_spool.jsonl")
+_CLOUD_SPOOL_MAX_BYTES = 5 * 1024 * 1024
 
 
 def _read_cloud_config():
@@ -239,9 +245,17 @@ def _post_cloud_with_retry(url: str, key: str, path: str, data: dict) -> None:
     short-backoff retries for transient failures, neither of which
     localhost calls have ever needed. Final failure is silently swallowed,
     matching post_aoc()'s own "best-effort, monitoring must never disrupt
-    the user's actual CLI session" philosophy -- there is deliberately no
-    persistent offline queue yet (a real gap for a laptop that's offline
-    for a whole session; left for a later round, see the implementation plan)."""
+    the user's actual CLI session" philosophy.
+
+    Undeliverable updates are spooled rather than lost (a laptop offline
+    for a whole session used to lose all of it), and monitor.py drains the
+    spool. Order matters because the cloud upserts field by field: an old
+    "running" replayed after a newer "done" would move the agent backwards.
+    So while anything is still spooled, a new update goes to the back of
+    the spool instead of jumping ahead of it."""
+    if _cloud_spool_pending():
+        _cloud_spool_append(path, data)
+        return
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {key}"}
     for delay in (0, 0.3, 1.0):
@@ -254,6 +268,30 @@ def _post_cloud_with_retry(url: str, key: str, path: str, data: dict) -> None:
             return
         except Exception:
             continue
+    _cloud_spool_append(path, data)
+
+
+def _cloud_spool_pending(spool_path: str = None) -> bool:
+    spool_path = spool_path or AOC_CLOUD_SPOOL_FILE
+    for p in (spool_path, spool_path + ".draining"):
+        try:
+            if os.path.getsize(p) > 0:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _cloud_spool_append(path: str, data: dict, spool_path: str = None) -> None:
+    spool_path = spool_path or AOC_CLOUD_SPOOL_FILE
+    try:
+        if os.path.exists(spool_path) and os.path.getsize(spool_path) > _CLOUD_SPOOL_MAX_BYTES:
+            return  # full -- dropping new data beats unbounded growth
+        line = json.dumps({"path": path, "data": data}, ensure_ascii=False)
+        with open(spool_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def _dispatch_cloud_post(path: str, data: dict) -> None:

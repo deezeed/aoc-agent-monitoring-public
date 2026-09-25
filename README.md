@@ -453,6 +453,18 @@ one turn after the session starts, and only ever for a session on **this**
 machine (never a merged-in remote one — see below). Every call, successful
 or refused, is appended to `logs/kill_audit.log`.
 
+**AOC Cloud (optional).** If this machine was set up with
+`setup.py --cloud-url ... --cloud-key ...`, `monitor.py` also checks the
+cloud every 10 seconds for a Force Stop requested from the cloud dashboard.
+It carries that out itself through the same claude.exe PID check and
+`kill_audit.log` entry (origin `cloud`) as a local click, then reports the
+outcome back. The cloud can't reach your PC, so it only ever asks. It only
+acts on sessions it knows, and a request left unpicked for 5 minutes
+expires rather than firing later. Cloud updates the hook can't deliver
+(offline laptop, cloud down) wait in `~/.claude/hooks/aoc_cloud_spool.jsonl`,
+capped at 5 MB, and `monitor.py` sends them in order once the cloud is
+reachable. Without a cloud setup none of this does anything.
+
 **Remote Machines** (Settings → Remote Machines) merges other AOC
 instances on your LAN into this same dashboard, live view and
 History/Analytics both. Add a name, that machine's `http://ip:5151` (or
