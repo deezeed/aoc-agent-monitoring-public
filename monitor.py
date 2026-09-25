@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+# ^ Not optional: without it Python 3.9 checks UTF-8 in 512-byte chunks when
+# running this file as a script, and a multi-byte character (the embedded
+# dashboard has many) straddling a chunk boundary on a long line fails
+# startup with a bogus "Non-UTF-8 code" SyntaxError. py_compile/import don't
+# hit that path, so only an actual `python monitor.py` shows it.
 """
 AOC — Agent Operations Center
 spusti: python monitor.py  ->  http://localhost:5151
@@ -6371,7 +6377,9 @@ function renderSessionTabBar(data, agents){
     const label=(s.display_name||s.project||cwdName||s.id.slice(-6)).slice(0,30);
     const cnt=agents.filter(a=>a.session_id===s.id).length;
     const isActive=s.session_active!==false;
-    const dimBtn=(!isActive&&s._isLocal!==false)?`<button onclick="event.stopPropagation();_dismissSession('${s.id}')" title="Dismiss closed session" style="background:none;border:1px solid rgba(255,255,255,.08);border-left:none;border-radius:0 7px 7px 0;color:var(--t3);cursor:pointer;padding:3px 6px;font-size:10px;line-height:1;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:'';
+    /* Remote sessions too, routed to their own machine -- same as the
+       session card's ✕ and the stale-session sweep (see _dismissSession). */
+    const dimBtn=!isActive?`<button onclick="event.stopPropagation();_dismissSession(${jsq(s.id)},${jsq(s.machine||'')})" title="Dismiss closed session" style="background:none;border:1px solid rgba(255,255,255,.08);border-left:none;border-radius:0 7px 7px 0;color:var(--t3);cursor:pointer;padding:3px 6px;font-size:10px;line-height:1;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:'';
     return `<span style="display:inline-flex;align-items:center;gap:0">
       <button class="stab ${sessionFilter===s.id?'active':''}" onclick="setSessionFilter('${s.id}')" title="${s.id}">${label} (${cnt})</button>${dimBtn}</span>`;
   }).join('');
@@ -7042,6 +7050,12 @@ function renderTimeline(data){
    injection in text content but a bare " still terminates a double-quoted HTML
    attribute early, letting injected text add its own event-handler attribute. */
 function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+/* A value as a JS string literal that's safe inside an HTML on*="..." attribute:
+   JSON-encode first, then HTML-escape. escHtml alone isn't enough there -- the
+   browser decodes &#39; back to ' before running the handler, so a machine or
+   project name like "Marek's laptop" ended the '...' literal early and broke
+   the button (or injected code). Use as onclick="fn(${jsq(x)})", no quotes. */
+function jsq(s){ return escHtml(JSON.stringify(String(s))); }
 /* Shared HOOK MISS badge tooltip -- 4 near-identical call sites (card,
    SUMMARY agent row, AGENTS-tab row, Compare) previously hardcoded the
    same fixed text. concurrent_sessions is exactly the metric this whole
@@ -8046,7 +8060,7 @@ function renderAgents(data){
         <div class="ar-pill ${a.status}">${stxt(a)}</div>
         <div class="ar-prog"><div class="ar-prog-fill" style="width:${pct}%;background:${col}"></div></div>
         <div class="ar-elapsed">${elapsedStr||'—'}</div>
-        <button class="ar-dismiss" onclick="dismissAgent('${a.id}','${escHtml(a.machine||'')}')" title="Dismiss">×</button>
+        <button class="ar-dismiss" onclick="dismissAgent(${jsq(a.id)},${jsq(a.machine||'')})" title="Dismiss">×</button>
       </div>`;
     }).join('');
   } else {
@@ -8196,7 +8210,7 @@ function renderAgents(data){
       <button class="card-cmp-btn ${_compareIds.includes(a.id)?'selected':''}" data-id="${a.id}" onclick="toggleCompare('${a.id}',event)" title="${_compareIds.includes(a.id)?'Remove from compare':'Add to compare'}">⊞</button>
       <button class="card-pin-btn" onclick="togglePin('${a.id}',event)" title="${isPinned?'Unpin':'Pin to top'}">${isPinned?'◈':'◉'}</button>
       <button class="card-collapse-btn" onclick="toggleCollapse('${a.id}',event)" title="${isCollapsed?'Expand':'Collapse'}">▲</button>
-      <button class="card-dismiss" onclick="dismissAgent('${a.id}','${escHtml(a.machine||'')}')" title="Dismiss">×</button>
+      <button class="card-dismiss" onclick="dismissAgent(${jsq(a.id)},${jsq(a.machine||'')})" title="Dismiss">×</button>
       ${dispStatus==='running'?'<div class="sweep"></div>':''}
       ${sessBadge}
       <div class="card-head">
@@ -8386,9 +8400,9 @@ function renderAgents(data){
           ${!sIsRemote?`<button onclick="event.stopPropagation();openNotesPanel('${escHtml(s.id)}')" title="${s.note?'Edit note':'Add note'}" style="background:none;border:none;color:${s.note?'var(--c)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${s.note?'var(--c)':'var(--t3)'}'">📝</button>`:''}
           <button onclick="event.stopPropagation();exportSessionDetail('${escHtml(s.id)}')" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
           <button onclick="toggleSessionCompare('${escHtml(s.id)}',event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
-          ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession('${escHtml(s.id)}','${escHtml(s.project||s.cwd||'this session')}','${escHtml(s.machine||'')}')" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(255,80,100,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(255,80,100,.7)'">⛔</button>`:''}
+          ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession(${jsq(s.id)},${jsq(s.project||s.cwd||'this session')},${jsq(s.machine||'')})" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(255,80,100,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(255,80,100,.7)'">⛔</button>`:''}
           ${!isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_copyResumeCmd('${escHtml(s.id)}')" title="Copy resume command to clipboard" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⟲</button>`:''}
-          ${!isActive?` <button onclick="event.stopPropagation();_dismissSession('${escHtml(s.id)}','${escHtml(s.machine||'')}')" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
+          ${!isActive?` <button onclick="event.stopPropagation();_dismissSession(${jsq(s.id)},${jsq(s.machine||'')})" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
         </div>
       </div>`;
     });
