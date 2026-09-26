@@ -12949,6 +12949,69 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+# ── /status stall diagnostics ────────────────────────────────────────────────
+# watchdog.py restarts monitor.py when two consecutive /status probes exceed
+# its 4s timeout, and that still happens a few times a day with no code change
+# and no error anywhere (pythonw.exe has no console, so nothing is printed).
+# This probes our own /status the same way watchdog does, with
+# faulthandler.dump_traceback_later armed around each probe: if the probe is
+# still pending after _STALL_THRESHOLD_S, every thread's stack is written to
+# STALL_LOG *while* the stall is in progress. faulthandler dumps from its own
+# native thread without needing the GIL, so this still works when the stall is
+# one thread hogging the GIL (a pure-Python dump would only get to run after
+# the hog had already finished and moved on).
+STALL_LOG = os.path.join(LOGS_DIR, "status_stalls.log")
+_STALL_PROBE_INTERVAL_S = 5
+_STALL_THRESHOLD_S = 2.0
+_STALL_LOG_MAX_BYTES = 1_000_000
+
+def _open_stall_log():
+    """Open STALL_LOG for appending, rotating once to .1 past the size cap."""
+    os.makedirs(os.path.dirname(STALL_LOG), exist_ok=True)
+    if os.path.exists(STALL_LOG) and os.path.getsize(STALL_LOG) > _STALL_LOG_MAX_BYTES:
+        os.replace(STALL_LOG, STALL_LOG + ".1")
+    return open(STALL_LOG, "a", encoding="utf-8")
+
+def _probe_status_once(probe, threshold_s: float, log_file):
+    """Run `probe` (a blocking /status fetch) with a faulthandler stack dump
+    to log_file armed for threshold_s. Returns the elapsed seconds if the
+    probe took at least threshold_s (the dump has then been written, followed
+    here by a summary line naming the threads), else None."""
+    import faulthandler
+    started = time.time()
+    faulthandler.dump_traceback_later(threshold_s, repeat=False, file=log_file)
+    try:
+        probe()
+    except Exception:
+        pass
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    elapsed = time.time() - started
+    if elapsed < threshold_s:
+        return None
+    # faulthandler prints thread ids only, as "0x%0*lx" padded to
+    # sizeof(unsigned long) -- 8 hex digits on Windows, 16 on 64-bit POSIX
+    import struct
+    width = struct.calcsize("L") * 2
+    names = ", ".join(f"0x{t.ident:0{width}x}={t.name}" for t in threading.enumerate())
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_file.write(f"===== {stamp} /status probe took {elapsed:.1f}s "
+                   f"(stacks above dumped at {threshold_s:.0f}s; threads: {names})\n\n")
+    log_file.flush()
+    return elapsed
+
+def _status_stall_worker():
+    import urllib.request as _ur
+    probe = lambda: _ur.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=30).read()
+    while True:
+        time.sleep(_STALL_PROBE_INTERVAL_S)
+        try:
+            with _open_stall_log() as log_file:
+                _probe_status_once(probe, _STALL_THRESHOLD_S, log_file)
+        except Exception as e:
+            _log_bg_error("_status_stall_worker", e)
+
+
 def _start_server():
     """Start the HTTP server in the current thread (blocking)."""
     class _Server(ThreadingHTTPServer):
@@ -13414,6 +13477,7 @@ if __name__ == "__main__":
     # Start HTTP server in background thread (all modes)
     srv_thread = threading.Thread(target=_start_server, daemon=True)
     srv_thread.start()
+    threading.Thread(target=_status_stall_worker, daemon=True, name="status-stall-worker").start()
 
     # Wait for server to be ready
     import urllib.request
