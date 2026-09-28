@@ -226,9 +226,13 @@ from Claude Code's hook invocation was unreliable directly.
 ### 3. Two-tier watchdog
 `watchdog.py` runs continuously via a **Windows Task Scheduler task set
 to trigger at login** (not a service) — no elevation, runs as the
-logged-in user. It polls `/status` every 30s and restarts
-`monitor.py --headless` after 2 consecutive failures, with exponential
-backoff on repeated restart failures. Task Scheduler's own
+logged-in user. It polls `/status` every 30s (10s timeout per probe) and
+restarts `monitor.py --headless` after 3 consecutive failures, with
+exponential backoff on repeated restart failures. The tolerance is
+deliberate: the slow `/status` probes seen in practice were machine-wide
+stalls (e.g. WSL/Docker network setup), where a restart only made the
+outage longer. A monitor that is actually dead refuses the connection
+instantly, so it is still restarted within ~90s. Task Scheduler's own
 "restart on failure" is also configured (3 attempts, 1 min apart) for if
 `watchdog.py`'s *process* exits — but that only fires 3 times and never
 catches a hang. `sentinel.py` is the second tier: its own periodic Task

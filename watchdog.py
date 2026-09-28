@@ -17,7 +17,14 @@ LOG_FILE       = os.path.join(AOC_DIR, "watchdog.log")
 PID_FILE       = os.path.join(AOC_DIR, "watchdog.pid")
 STATUS_URL     = "http://127.0.0.1:5151/status"
 CHECK_INTERVAL = 30    # seconds between health checks
-FAIL_THRESHOLD = 2     # consecutive failures before restart
+# Tolerant on purpose: /status normally answers in ~20-80 ms, and the slow
+# ones in status_stalls.log were machine-wide stalls (WSL/Docker network
+# setup, suspend) -- restarting monitor.py mid-stall only lengthened the
+# outage, since the fresh process couldn't even bind the port until the
+# stall cleared. A monitor that is really gone (connection refused) still
+# fails every probe instantly and gets restarted after FAIL_THRESHOLD.
+STATUS_TIMEOUT = 10    # seconds a single /status probe may take (was 4)
+FAIL_THRESHOLD = 3     # consecutive failures before restart (was 2)
 LOG_MAX_BYTES  = 200_000
 MAX_BACKOFF    = 300   # max seconds between restart attempts
 
@@ -96,7 +103,7 @@ def _log(msg: str) -> None:
 
 def _alive() -> bool:
     try:
-        urllib.request.urlopen(STATUS_URL, timeout=4)
+        urllib.request.urlopen(STATUS_URL, timeout=STATUS_TIMEOUT)
         return True
     except Exception:
         return False
