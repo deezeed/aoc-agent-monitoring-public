@@ -17,3 +17,7 @@ aoc_last_digest.txt
 aoc_autosave_id.txt
 cloudflared.exe
 monitor_err.txt
+
+# installer build output
+installer/build/
+installer/cache/

@@ -15,6 +15,11 @@ Usage:
   python setup.py --dry-run  show exactly what would change, touch nothing
                               (no file writes; only read-only "schtasks /Query"
                               calls to report whether a task already exists)
+  python setup.py --stop     stop every running AOC process from this directory
+                              (used by the installer before an upgrade)
+  python setup.py --uninstall remove AOC's hook entries, deployed hook scripts
+                              and scheduled tasks, and stop its processes;
+                              keeps the user's data in %LOCALAPPDATA%\\AOC
   python setup.py --cloud-url https://api.example.com --cloud-key aoc_live_...
                               also enable optional cloud forwarding (AOC SaaS) --
                               omit both flags to keep this machine local-only,
@@ -126,52 +131,110 @@ def deploy_cloud_config() -> None:
     print(f"[ok] wrote cloud forwarding config -> {HOOKS_DST_DIR} (url={CLOUD_URL})")
 
 
+def _hook_command(pythonw: str) -> str:
+    """Both paths quoted: an unquoted command breaks for anyone whose
+    profile path has a space in it (C:/Users/John Smith/...)."""
+    run_hook = os.path.join(HOOKS_DST_DIR, "run_hook.pyw").replace("\\", "/")
+    return f'"{pythonw.replace(chr(92), "/")}" "{run_hook}"'
+
+
+def _is_aoc_hook(h: dict) -> bool:
+    return h.get("command", "").replace("\\", "/").rstrip('"').endswith("run_hook.pyw")
+
+
+def _merge_hook_entries(settings: dict, command: str):
+    """Pure core of merge_hook_settings. Adds a missing AOC entry for each
+    HOOK_SPECS (event, matcher), and rewrites an existing AOC entry whose
+    command differs (e.g. AOC reinstalled with a different Python), leaving
+    every non-AOC hook untouched. Returns (added, updated) lists of
+    (event, matcher)."""
+    hooks = settings.setdefault("hooks", {})
+    added, updated = [], []
+    for event, matcher in HOOK_SPECS:
+        found = False
+        for entry in hooks.get(event, []):
+            if entry.get("matcher", "") != matcher:
+                continue
+            for h in entry.get("hooks", []):
+                if _is_aoc_hook(h):
+                    found = True
+                    if h.get("command") != command:
+                        h["command"] = command
+                        updated.append((event, matcher))
+        if not found:
+            hooks.setdefault(event, []).append({
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command}],
+            })
+            added.append((event, matcher))
+    return added, updated
+
+
+def _remove_hook_entries(settings: dict) -> int:
+    """Pure core of the uninstall path: drops every AOC hook command, then
+    any entry / event left with no hooks. Returns how many were removed."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return 0
+    removed = 0
+    for event in list(hooks):
+        kept_entries = []
+        for entry in hooks[event]:
+            inner = entry.get("hooks", [])
+            kept = [h for h in inner if not _is_aoc_hook(h)]
+            removed += len(inner) - len(kept)
+            if kept:
+                entry["hooks"] = kept
+                kept_entries.append(entry)
+        if kept_entries:
+            hooks[event] = kept_entries
+        else:
+            del hooks[event]
+    if not hooks:
+        del settings["hooks"]
+    return removed
+
+
+def _load_settings() -> dict:
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_settings(settings: dict) -> None:
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
+
+def _fmt_specs(specs) -> str:
+    return ", ".join(f"{e}/{m or '(no matcher)'}" for e, m in specs)
+
+
 def merge_hook_settings(pythonw: str) -> None:
     """Adds AOC's 4 hook entries to ~/.claude/settings.json without
     disturbing anything else already there (other hooks, enabledPlugins,
-    theme, etc.). Idempotent: checks for an existing run_hook.pyw command
-    under the right matcher before appending, so re-running never
-    duplicates entries."""
-    command = (pythonw.replace("\\", "/") + " " +
-               os.path.join(HOOKS_DST_DIR, "run_hook.pyw").replace("\\", "/"))
-
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-    else:
-        settings = {}
-
-    hooks = settings.setdefault("hooks", {})
-    to_add = []
-    for event, matcher in HOOK_SPECS:
-        entries = hooks.get(event, [])
-        already = any(
-            entry.get("matcher", "") == matcher and
-            any(h.get("command", "").replace("\\", "/").endswith("run_hook.pyw")
-                for h in entry.get("hooks", []))
-            for entry in entries
-        )
-        if not already:
-            to_add.append((event, matcher))
+    theme, etc.). Idempotent: re-running never duplicates entries, and
+    brings an existing entry's command up to date."""
+    settings = _load_settings()
+    added, updated = _merge_hook_entries(settings, _hook_command(pythonw))
 
     if DRY_RUN:
-        if to_add:
-            print(f"[dry-run] would add hook entries to {SETTINGS_FILE} for: " +
-                  ", ".join(f"{e}/{m or '(no matcher)'}" for e, m in to_add))
-        else:
+        if added:
+            print(f"[dry-run] would add hook entries to {SETTINGS_FILE} for: {_fmt_specs(added)}")
+        if updated:
+            print(f"[dry-run] would update the AOC hook command for: {_fmt_specs(updated)}")
+        if not added and not updated:
             print(f"[dry-run] {SETTINGS_FILE} already has all AOC hook entries, no change")
         return
 
-    for event, matcher in to_add:
-        hooks.setdefault(event, []).append({
-            "matcher": matcher,
-            "hooks": [{"type": "command", "command": command}],
-        })
-
-    if to_add:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-        print(f"[ok] added AOC hook entries to {SETTINGS_FILE}")
+    if added or updated:
+        _save_settings(settings)
+        if added:
+            print(f"[ok] added AOC hook entries to {SETTINGS_FILE}: {_fmt_specs(added)}")
+        if updated:
+            print(f"[ok] updated AOC hook command in {SETTINGS_FILE}: {_fmt_specs(updated)}")
     else:
         print(f"[ok] AOC hook entries already present in {SETTINGS_FILE}")
 
@@ -271,10 +334,82 @@ def validate() -> None:
     print(f"[{'ok' if sentinel_result.returncode == 0 else 'FAIL'}] Task Scheduler task '{SENTINEL_TASK_NAME}'")
 
 
+def wait_for_dashboard(timeout_s: float = 60.0) -> bool:
+    """watchdog.py sleeps 10 s at startup before launching monitor.py, so the
+    dashboard isn't up the moment its task starts. Waiting here lets the
+    installer open the browser on a page that actually loads."""
+    import time
+    import urllib.request
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen("http://127.0.0.1:5151/status", timeout=3)
+            print("[ok] dashboard is up at http://localhost:5151")
+            return True
+        except Exception:
+            time.sleep(1)
+    print(f"[WARN] dashboard not reachable after {timeout_s:.0f}s -- it should come up at next logon")
+    return False
+
+
+def stop_aoc_processes() -> None:
+    """Ends the scheduled tasks' current runs and kills every python
+    process running a script from this AOC_DIR (monitor, watchdog,
+    sentinel). The installer runs this before replacing files on an
+    upgrade: a running monitor keeps the bundled python DLLs locked."""
+    for task in (TASK_NAME, SENTINEL_TASK_NAME):
+        subprocess.run(["schtasks", "/End", "/TN", task], capture_output=True, text=True)
+    # Normalized match: the hook launches monitor.py with forward slashes,
+    # the scheduled tasks with backslashes, and case can differ too.
+    aoc_dir = os.path.normpath(AOC_DIR).lower().replace("'", "''")
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+          f"Where-Object {{ $_.ProcessId -ne {os.getpid()} -and $_.CommandLine -and "
+          f"$_.CommandLine.Replace('/', '\\').ToLower().Contains('{aoc_dir}\\') }} | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }")
+    result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                            capture_output=True, text=True, timeout=60,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    pids = result.stdout.split()
+    print(f"[ok] stopped {len(pids)} AOC process(es)" + (f": {', '.join(pids)}" if pids else ""))
+
+
+def uninstall() -> None:
+    """Reverses main(): hooks first (so a running Claude Code session can't
+    respawn monitor.py through ensure_monitor), then the scheduled tasks
+    (so sentinel can't revive watchdog), then the processes. Leaves the
+    user's data (%LOCALAPPDATA%\\AOC: history.db, logs, backups) alone."""
+    settings = _load_settings()
+    removed = _remove_hook_entries(settings)
+    if removed:
+        _save_settings(settings)
+    print(f"[ok] removed {removed} AOC hook entr{'y' if removed == 1 else 'ies'} from {SETTINGS_FILE}")
+
+    for name in ("aoc_hook.py", "run_hook.pyw"):
+        try:
+            os.remove(os.path.join(HOOKS_DST_DIR, name))
+            print(f"[ok] deleted {os.path.join(HOOKS_DST_DIR, name)}")
+        except FileNotFoundError:
+            pass
+
+    for task in (TASK_NAME, SENTINEL_TASK_NAME):
+        subprocess.run(["schtasks", "/End", "/TN", task], capture_output=True, text=True)
+        r = subprocess.run(["schtasks", "/Delete", "/TN", task, "/F"], capture_output=True, text=True)
+        print(f"[{'ok' if r.returncode == 0 else 'skip'}] delete task '{task}'")
+
+    stop_aoc_processes()
+
+
 def main():
     if sys.platform != "win32":
         print("AOC's hook/watchdog/notification code is Windows-only — this installer won't work elsewhere.")
         sys.exit(1)
+
+    if "--stop" in sys.argv:
+        stop_aoc_processes()
+        return
+    if "--uninstall" in sys.argv:
+        uninstall()
+        return
 
     pythonw = _find_pythonw()
     print(f"AOC dir:      {AOC_DIR}")
@@ -296,6 +431,7 @@ def main():
         return
 
     validate()
+    wait_for_dashboard()
 
     print()
     print("Done. Already-open Claude Code sessions won't pick up the new hook")

@@ -2847,15 +2847,14 @@ def _find_ngrok() -> str:
     return ""
 
 _ngrok_authtoken_cache = [False, 0.0]  # [last result, last-checked epoch]
+_ngrok_authtoken_refresh_lock = threading.Lock()  # held while a background refresh runs
 
-def _ngrok_authtoken_configured() -> bool:
-    """Cached — this backs a /status field polled every 500ms, and the real
-    check shells out to ngrok.exe; don't spawn that twice a second."""
+def _ngrok_authtoken_check_now() -> bool:
+    """Blocking: shells out to `ngrok config check` (up to 5 s) and updates
+    the cache. Never call this from the /status path -- see below."""
     ng = _find_ngrok()
     if not ng:
         return False
-    if time.time() - _ngrok_authtoken_cache[1] < 10:
-        return _ngrok_authtoken_cache[0]
     import subprocess as _sp
     try:
         flags = _sp.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -2866,6 +2865,26 @@ def _ngrok_authtoken_configured() -> bool:
     _ngrok_authtoken_cache[0] = ok
     _ngrok_authtoken_cache[1] = time.time()
     return ok
+
+def _ngrok_authtoken_refresh_bg():
+    try:
+        _ngrok_authtoken_check_now()
+    finally:
+        _ngrok_authtoken_refresh_lock.release()
+
+def _ngrok_authtoken_configured() -> bool:
+    """Non-blocking, for /status (polled every 500ms, and built while holding
+    _status_payload_cache_lock). Returns the cached result and, if it is over
+    10 s old, starts one background re-check. Doing the check inline used to
+    stall every /status caller -- watchdog included -- whenever ngrok.exe was
+    slow to start (status_stalls.log, 2026-09-26 17:34)."""
+    if not _find_ngrok():
+        return False
+    if (time.time() - _ngrok_authtoken_cache[1] >= 10
+            and _ngrok_authtoken_refresh_lock.acquire(blocking=False)):
+        threading.Thread(target=_ngrok_authtoken_refresh_bg, daemon=True,
+                         name="ngrok-authtoken-check").start()
+    return _ngrok_authtoken_cache[0]
 
 def _start_ngrok_worker():
     """Background thread: launch ngrok and poll its local API for the public URL."""
@@ -2878,7 +2897,7 @@ def _start_ngrok_worker():
         _tunnel_status[0] = "error"
         _tunnel_error_detail[0] = "ngrok.exe not found"
         return
-    if not _ngrok_authtoken_configured():
+    if not _ngrok_authtoken_check_now():
         _tunnel_status[0] = "error"
         _tunnel_error_detail[0] = "ngrok authtoken not configured"
         return
@@ -12690,7 +12709,7 @@ class Handler(BaseHTTPRequestHandler):
                 r = _sp.run([ng, "config", "add-authtoken", authtoken],
                             capture_output=True, timeout=10, creationflags=flags)
                 if r.returncode == 0:
-                    _ngrok_authtoken_cache[1] = 0.0  # force re-check on next /status poll
+                    _ngrok_authtoken_check_now()  # refresh now so the next /status poll reflects it
                     self._serve(200, "application/json", b'{"ok":true}')
                 else:
                     self._serve(200, "application/json",
@@ -12978,7 +12997,11 @@ def _probe_status_once(probe, threshold_s: float, log_file):
     probe took at least threshold_s (the dump has then been written, followed
     here by a summary line naming the threads), else None."""
     import faulthandler
-    started = time.time()
+    log_file.flush()
+    size_before = os.fstat(log_file.fileno()).st_size
+    # monotonic, not time.time(): a wall-clock adjustment mid-probe must not
+    # read as a stall
+    started = time.monotonic()
     faulthandler.dump_traceback_later(threshold_s, repeat=False, file=log_file)
     try:
         probe()
@@ -12986,17 +13009,24 @@ def _probe_status_once(probe, threshold_s: float, log_file):
         pass
     finally:
         faulthandler.cancel_dump_traceback_later()
-    elapsed = time.time() - started
+    elapsed = time.monotonic() - started
     if elapsed < threshold_s:
         return None
+    # faulthandler's timer is a native wait that doesn't count time the
+    # machine spent suspended, so a "stall" can cross the threshold here with
+    # no dump written (seen 2026-09-28 14:38) -- say so instead of leaving a
+    # summary line that points at stacks that aren't there
+    dumped = os.fstat(log_file.fileno()).st_size > size_before
     # faulthandler prints thread ids only, as "0x%0*lx" padded to
     # sizeof(unsigned long) -- 8 hex digits on Windows, 16 on 64-bit POSIX
     import struct
     width = struct.calcsize("L") * 2
     names = ", ".join(f"0x{t.ident:0{width}x}={t.name}" for t in threading.enumerate())
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    where = (f"stacks above dumped at {threshold_s:.0f}s" if dumped else
+             "NO stack dump fired -- the process was likely suspended or starved, not stuck")
     log_file.write(f"===== {stamp} /status probe took {elapsed:.1f}s "
-                   f"(stacks above dumped at {threshold_s:.0f}s; threads: {names})\n\n")
+                   f"({where}; threads: {names})\n\n")
     log_file.flush()
     return elapsed
 

@@ -82,6 +82,31 @@ try:
         time.sleep(0.4)
     c.check("no late dump after a fast probe", read_log() == "")
 
+    # 5b. elapsed crosses the threshold but the dump timer never fired (what
+    #     a suspend looks like): the summary must say no stacks were dumped
+    open(STALL_LOG, "w").close()
+    class JumpyClock:
+        _reads = iter([0.0, 10.0])
+        def monotonic(self):
+            return next(self._reads)
+        def __getattr__(self, name):
+            return getattr(time, name)
+    jumpy = exec_functions(
+        ["_probe_status_once"],
+        {"os": os, "time": JumpyClock(), "threading": threading, "datetime": datetime})
+    with ns["_open_stall_log"]() as f:
+        r = jumpy["_probe_status_once"](lambda: None, 5.0, f)
+    log = read_log()
+    c.check("no-dump stall still reported", r == 10.0 and "/status probe took 10.0s" in log)
+    c.check("no-dump stall says no stacks fired", "NO stack dump fired" in log and "stacks above" not in log)
+
+    # 5c. the real-dump summary still points at the stacks
+    open(STALL_LOG, "w").close()
+    with ns["_open_stall_log"]() as f:
+        ns["_probe_status_once"](slow_status_probe, 0.2, f)
+    log = read_log()
+    c.check("real dump summary says 'stacks above'", "stacks above dumped" in log and "NO stack dump" not in log)
+
     # 6. rotation past the size cap
     with open(STALL_LOG, "w") as f:
         f.write("x" * 50)
