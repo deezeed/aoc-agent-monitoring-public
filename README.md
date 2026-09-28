@@ -263,6 +263,25 @@ for any reason, it falls back to borrowing `powershell.exe`'s own
 already-registered AUMID rather than going silent — you'll just get a
 generically-branded toast instead of a broken one.
 
+### 6. Windows installer and updates
+`AOC-Setup-<version>.exe` installs per-user into
+`%LOCALAPPDATA%\Programs\AOC` with its own bundled Python (no admin, no
+system Python needed) and runs the same `setup.py` wiring as above.
+
+How you find out about updates depends on how AOC was installed:
+- **git checkout**: every 15 min AOC runs `git fetch` and shows an
+  **UPDATE AVAILABLE** badge when you're behind `origin/master`. Run
+  `git pull` to update.
+- **installer**: the installer writes its version to a `VERSION` file.
+  Every 6 h AOC checks this repo's latest GitHub release and shows an
+  **UPDATE x.y.z** badge (plus a one-time toast) when a newer one exists.
+  Click the badge to download the new installer, then run it over the
+  existing install. Your data in `%LOCALAPPDATA%\AOC` is kept.
+
+Releases are published from CI-built installers (maintainers only):
+`powershell -File installer/publish_release.ps1` (dry run by default, add
+`-Publish` to create the release).
+
 ## Data locations
 
 Two different directories, for a reason:

@@ -3018,11 +3018,82 @@ _self_update_status = {"stale": False, "behind_by": 0, "checked_at": 0}
 _self_update_lock = _threading.Lock()
 _self_update_notified = [False]
 
+# An installer build (installer/build.ps1) has no .git to fetch, so it can't
+# use the git check below. build.ps1 writes its version to VERSION instead,
+# and those installs check the public repo's latest GitHub release.
+AOC_VERSION_FILE = os.path.join(AOC_DIR, "VERSION")
+AOC_RELEASES_API = "https://api.github.com/repos/deezeed/aoc-agent-monitoring-public/releases/latest"
+_RELEASE_CHECK_INTERVAL_S = 6 * 3600  # unauthenticated GitHub API: 60 req/h per IP
+
+def _read_installed_version(path) -> str:
+    """The installer build's version ("1.0.123"), or "" for a git checkout."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+def _parse_version(s):
+    """"v1.0.123" / "1.0.123" -> (1, 0, 123); None if not dotted integers."""
+    parts = str(s or "").strip().lstrip("vV").split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+def _release_update_status(installed: str, release: dict, now: float) -> dict:
+    """Pure: turn a GitHub releases/latest response into _self_update_status.
+    Only an https download URL on github.com is ever handed to the UI."""
+    latest = str(release.get("tag_name") or "").strip()
+    cur_v, new_v = _parse_version(installed), _parse_version(latest)
+    url = ""
+    for a in release.get("assets") or []:
+        u = str(a.get("browser_download_url") or "")
+        if u.lower().endswith(".exe"):
+            url = u
+            break
+    url = url or str(release.get("html_url") or "")
+    if not url.startswith("https://github.com/"):
+        url = "https://github.com/deezeed/aoc-agent-monitoring-public/releases/latest"
+    stale = bool(cur_v and new_v and new_v > cur_v)
+    return {"stale": stale, "behind_by": 0, "checked_at": now, "mode": "release",
+            "installed": installed, "latest": latest.lstrip("vV"), "url": url}
+
+def _check_release_once(installed: str) -> dict:
+    import urllib.request as _ur
+    req = _ur.Request(AOC_RELEASES_API, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"AOC/{installed}"})
+    with _ur.urlopen(req, timeout=15) as r:
+        release = json.loads(r.read().decode("utf-8"))
+    return _release_update_status(installed, release, time.time())
+
+def _release_update_worker(installed: str):
+    while True:
+        try:
+            status = _check_release_once(installed)
+            with _self_update_lock:
+                _self_update_status.clear()
+                _self_update_status.update(status)
+            if status["stale"] and not _self_update_notified[0]:
+                _self_update_notified[0] = True
+                try:
+                    _show_native_toast("AOC", f"AOC {status['latest']} is available (you have {installed}).")
+                except Exception:
+                    pass
+        except Exception as e:
+            # offline, rate-limited, or no release published yet (404)
+            _log_bg_error("_release_update_worker", e)
+        time.sleep(_RELEASE_CHECK_INTERVAL_S)
+
 def _selfupdate_worker():
     """Background thread: check every 15 min whether this machine's AOC
     checkout is behind origin/master, so a stale copy doesn't silently keep
     running old code across multiple machines. Read-only (fetch + rev-parse
-    only, never pulls/merges) -- purely informational."""
+    only, never pulls/merges) -- purely informational. Installer builds
+    (VERSION file present) check GitHub releases instead."""
+    installed = _read_installed_version(AOC_VERSION_FILE)
+    if installed:
+        _release_update_worker(installed)
+        return
     import time as _t
     while True:
         try:
@@ -11638,6 +11709,18 @@ function _selfUpdateUpdateUI(su){
      but never read here -- the self-update worker only checks every 15min,
      so knowing how fresh this specific reading is matters. */
   const checkedAgo=_fmtEpochAgo(su.checked_at);
+  const lbl=document.getElementById('selfupdate-badge-lbl');
+  if(su.mode==='release'){
+    /* installer build: no git to pull -- link the new installer instead */
+    if(lbl) lbl.textContent='UPDATE '+su.latest;
+    badge.style.cursor='pointer';
+    badge.onclick=()=>window.open(su.url,'_blank','noopener');
+    badge.title='AOC '+su.latest+' is available (you have '+su.installed+') — click to download the installer'+(checkedAgo?' (checked '+checkedAgo+')':'');
+    return;
+  }
+  if(lbl) lbl.textContent='UPDATE AVAILABLE';
+  badge.style.cursor='default';
+  badge.onclick=null;
   badge.title=su.behind_by+' commit'+(su.behind_by!==1?'s':'')+' behind origin/master — run git pull'+(checkedAgo?' (checked '+checkedAgo+')':'');
 }
 /* pure so it's directly testable -- see tests/js/fmt_epoch_ago.test.js.
