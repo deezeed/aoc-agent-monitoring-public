@@ -47,6 +47,34 @@ def _get_arg_value(flag: str):
     return None
 
 
+_BOOL_FLAGS = {"--dry-run", "--stop", "--uninstall"}
+_VALUE_FLAGS = {"--cloud-url", "--cloud-key"}
+
+
+def _check_args(argv):
+    """Validate argv[1:] before anything is touched. Returns (action, message):
+    ("run", "") to proceed, ("help", "") for -h/--help, or ("error", why).
+    Unknown flags used to be silently ignored, so a typo -- or a reasonable
+    guess like --help -- ran the full, state-changing setup."""
+    args = list(argv[1:])
+    if any(a in ("-h", "--help", "/?") for a in args):
+        return "help", ""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in _BOOL_FLAGS:
+            i += 1
+        elif a in _VALUE_FLAGS:
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                return "error", f"{a} needs a value"
+            i += 2
+        else:
+            return "error", f"unknown argument: {a}"
+    if ("--cloud-url" in args) != ("--cloud-key" in args):
+        return "error", "--cloud-url and --cloud-key must be given together"
+    return "run", ""
+
+
 CLOUD_URL = _get_arg_value("--cloud-url")
 CLOUD_KEY = _get_arg_value("--cloud-key")
 
@@ -400,6 +428,15 @@ def uninstall() -> None:
 
 
 def main():
+    action, why = _check_args(sys.argv)
+    if action == "help":
+        print(__doc__.strip())
+        return
+    if action == "error":
+        print(f"setup.py: {why}. Nothing was changed.", file=sys.stderr)
+        print("Run `python setup.py --help` for usage.", file=sys.stderr)
+        sys.exit(2)
+
     if sys.platform != "win32":
         print("AOC's hook/watchdog/notification code is Windows-only — this installer won't work elsewhere.")
         sys.exit(1)

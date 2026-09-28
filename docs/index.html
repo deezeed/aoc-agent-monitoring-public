@@ -106,7 +106,9 @@
         <li>Embedded terminal, Force Stop</li>
         <li>Modify and redistribute freely</li>
       </ul>
-      <a class="btn secondary" href="https://github.com/deezeed/aoc-agent-monitoring-public">Get it on GitHub</a>
+      <a class="btn primary" href="https://github.com/deezeed/aoc-agent-monitoring-public/releases/latest">Download for Windows</a>
+      <a class="btn secondary" href="https://github.com/deezeed/aoc-agent-monitoring-public">Source on GitHub</a>
+      <div class="note">Windows 10/11 installer, no admin rights, Python bundled.</div>
     </div>
     <div class="card pro">
       <h2>Pro</h2>
@@ -119,19 +121,13 @@
         <li>CSV exports</li>
       </ul>
       <!-- TODO: swap this mailto CTA for the real Stripe Payment Link once
-           it exists, and drop the "Email checkout" note below. The
-           fulfillment side (POST /webhooks/stripe -> issue_license() ->
-           email the key) is already built and tested in saas-backend/ --
-           see its README's "AOC Pro license sale (Stripe)" section for
-           what's still blocking it going live:
-             1. Create the $49 one-time Payment Link in the Stripe
-                Dashboard (needs a paid Railway plan first -- the trial
-                expired and the backend is currently offline).
-             2. Register the webhook endpoint against that Payment Link,
-                copy its signing secret into Railway's STRIPE_WEBHOOK_SECRET.
-             3. Set RESEND_API_KEY or SMTP_* on Railway so the key is
-                actually emailed instead of just logged.
-           Once the Payment Link exists, replace the href below with it. -->
+           it exists, and drop the "Email checkout" note below. Fulfillment
+           (Stripe webhook -> signed key -> emailed via Resend) is built and
+           tested as a Vercel function in license-fulfillment/ -- no Railway
+           needed. Its README's deploy steps list what's still missing: the
+           license signing key, a Stripe account + $49 Payment Link, and a
+           Resend account. Once the Payment Link exists, put it in the href
+           below. -->
       <a class="btn primary" href="mailto:marek99dolezal@gmail.com?subject=AOC%20Pro%20License&body=Hi%2C%20I%27d%20like%20to%20buy%20an%20AOC%20Pro%20license%20(%2449%2C%20one-time).%0A%0AEmail%20to%20license%20the%20key%20to%3A%0A">Get Pro — $49</a>
       <div class="note">Email checkout for now — key delivered within 24h.</div>
     </div>
@@ -148,6 +144,13 @@
 
   <section class="info">
     <h3>Quick start (Free tier)</h3>
+    <p><strong>Installer:</strong> download <code>AOC-Setup-&lt;version&gt;.exe</code> from the
+      <a href="https://github.com/deezeed/aoc-agent-monitoring-public/releases/latest">latest release</a>
+      and run it. It installs per-user (no admin), bundles its own Python, wires up the
+      Claude Code hook and opens the dashboard. The installer isn't code-signed yet, so
+      Windows SmartScreen may warn: choose <em>More info → Run anyway</em>. When a new
+      version is out, the dashboard shows an <em>UPDATE</em> badge that links to it.</p>
+    <p><strong>From source</strong> (needs Python 3.9+; updates via <code>git pull</code>):</p>
     <pre>git clone https://github.com/deezeed/aoc-agent-monitoring-public.git
 cd aoc-agent-monitoring-public
 python setup.py</pre>
