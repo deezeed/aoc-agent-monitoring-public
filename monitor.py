@@ -6471,7 +6471,7 @@ function renderSessionTabBar(data, agents){
        session card's ✕ and the stale-session sweep (see _dismissSession). */
     const dimBtn=!isActive?`<button onclick="event.stopPropagation();_dismissSession(${jsq(s.id)},${jsq(s.machine||'')})" title="Dismiss closed session" style="background:none;border:1px solid rgba(255,255,255,.08);border-left:none;border-radius:0 7px 7px 0;color:var(--t3);cursor:pointer;padding:3px 6px;font-size:10px;line-height:1;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:'';
     return `<span style="display:inline-flex;align-items:center;gap:0">
-      <button class="stab ${sessionFilter===s.id?'active':''}" onclick="setSessionFilter('${s.id}')" title="${s.id}">${label} (${cnt})</button>${dimBtn}</span>`;
+      <button class="stab ${sessionFilter===s.id?'active':''}" onclick="setSessionFilter(${jsq(s.id)})" title="${s.id}">${label} (${cnt})</button>${dimBtn}</span>`;
   }).join('');
   bar.innerHTML=allBtn+sessBtns;
 }
@@ -6753,7 +6753,7 @@ function _renderRpFiles(data){
     el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no file changes</div>';
     return;
   }
-  el.innerHTML=files.map(f=>`<div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff('${escHtml(f.path.replace(/'/g,"\\'"))}');event.stopPropagation()" style="cursor:pointer;border-radius:6px;padding:5px 8px">
+  el.innerHTML=files.map(f=>`<div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff(${jsq(f.path)});event.stopPropagation()" style="cursor:pointer;border-radius:6px;padding:5px 8px">
     <span class="fe-badge">${f.type==='new'?'NEW':'MOD'}</span>
     <span class="fe-name" style="font-size:11px">${escHtml(f.path.split('/').pop())}</span>
     ${f.lines?`<span class="fe-lines">${f.lines}L</span>`:''}
@@ -6853,7 +6853,7 @@ function _renderErrorsList(){
     el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no errors match your filters</div>';
     return;
   }
-  el.innerHTML=errs.map(e=>`<div style="padding:8px 10px;border-radius:8px;background:rgba(255,51,85,.06);border:1px solid rgba(255,51,85,.2);border-left:3px solid var(--r);cursor:pointer" onclick="_jumpToSessionHistory('${e.session_id}')" title="Open this session in History">
+  el.innerHTML=errs.map(e=>`<div style="padding:8px 10px;border-radius:8px;background:rgba(255,51,85,.06);border:1px solid rgba(255,51,85,.2);border-left:3px solid var(--r);cursor:pointer" onclick="_jumpToSessionHistory(${jsq(e.session_id)})" title="Open this session in History">
       <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px;font-size:9px;font-family:var(--font2);letter-spacing:.06em;color:var(--t3)">
         <span style="display:flex;align-items:center;gap:6px;min-width:0">
           <span style="color:var(--r);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(e.name||e.agent_id||'agent')}</span>
@@ -7118,7 +7118,7 @@ function renderTimeline(data){
       /* center fraction of this agent's bar in the original range (for click-to-focus) */
       const barMid=sT+(eT-sT)/2;
       const frac=Math.max(0,Math.min(1,(barMid-minT)/originalRange));
-      const clickAgent=`_tlClickAgent('${a.id}',${frac.toFixed(4)})`;
+      const clickAgent=`_tlClickAgent(${jsq(a.id)},${frac.toFixed(4)})`;
       const inlineTicksInTrack=ticks.map(t=>`<div style="position:absolute;left:${((t-dispMin)/dispRange*100).toFixed(2)}%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.04);pointer-events:none"></div>`).join('');
       return `<div class="tl-row">
         <div class="tl-name clickable" style="color:${col}" title="${escHtml(a.description||a.name)}" onclick="${clickAgent}">${escHtml(a.name.slice(0,22))}</div>
@@ -7615,7 +7615,7 @@ function renderSummary(data){
     }).join('')}</div>`:''}
     ${allFiles.length?`<div style="font-family:var(--font2);font-size:10px;color:var(--t3);letter-spacing:.08em;padding:6px 0 2px">FILES CHANGED (${allFiles.length})</div>
     <div style="display:flex;flex-direction:column;gap:3px">${allFiles.map(f=>`
-      <div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff('${escHtml(f.path.replace(/'/g,"\\\'"))}')" style="cursor:pointer">
+      <div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff(${jsq(f.path)})" style="cursor:pointer">
         <span class="fe-badge">${f.type==='new'?'NEW':'MOD'}</span>
         <span class="fe-name" title="${escHtml(f.path)}">${escHtml(f.path)}</span>
         <span style="font-size:9px;color:var(--t3);font-family:var(--font2);flex-shrink:0">${escHtml(f.agent)}</span>
@@ -7892,8 +7892,7 @@ function renderGraph(data){
     const dash=isDep?'':'8 4';
     const marker=e.iDepsJ?'url(#arr-dep)':'';
     const markerS=e.jDepsI?'url(#arr-dep)':'';
-    const safeA=escHtml(agents[e.a].id), safeB=escHtml(agents[e.b].id);
-    return `<g onclick="_graphEdgeClick('${safeA}','${safeB}')" style="cursor:pointer">
+    return `<g onclick="_graphEdgeClick(${jsq(agents[e.a].id)},${jsq(agents[e.b].id)})" style="cursor:pointer">
   <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="transparent" stroke-width="14"/>
   <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${stroke}" stroke-width="${sw}" ${dash?`stroke-dasharray="${dash}"`:''}${marker?` marker-end="${marker}"`:''}${markerS?` marker-start="${markerS}"`:''}/>
   ${e.files.length?`<text x="${mx}" y="${my}" text-anchor="middle" font-size="8" fill="${tc.edgeText}" font-family="Consolas,monospace">${e.files.length} shared</text>`:''}
@@ -7915,8 +7914,7 @@ function renderGraph(data){
       return `${(x+r*Math.cos(ag)).toFixed(0)},${(y+r*Math.sin(ag)).toFixed(0)}`;
     }).join(' ');
     const arcR=r+8, arcC=(2*Math.PI*arcR).toFixed(1), arcD=(pct/100*2*Math.PI*arcR).toFixed(1);
-    const sid=escHtml(a.id);
-    return `<g onclick="openAgentDetail('${sid}',null)" onmouseover="_graphNodeHover(event,'${sid}')" onmouseout="_graphNodeOut()" style="cursor:pointer${isActive?';filter:drop-shadow(0 0 10px '+rgba+')':''}">
+    return `<g onclick="openAgentDetail(${jsq(a.id)},null)" onmouseover="_graphNodeHover(event,${jsq(a.id)})" onmouseout="_graphNodeOut()" style="cursor:pointer${isActive?';filter:drop-shadow(0 0 10px '+rgba+')':''}">
   ${a.status==='running'?`<circle cx="${x}" cy="${y}" r="${arcR+6}" fill="none" stroke="${rgba}" stroke-width="1" opacity=".25" style="animation:pulse 2s infinite"/>`:''}
   <polygon points="${pts}" fill="${isActive?rgba.replace(',1)',',.18)').replace('.85)',',.18)'):tc.nodeFill}" stroke="${rgba}" stroke-width="${isActive?2.8:1.8}"/>
   <circle cx="${x}" cy="${y}" r="${arcR}" fill="none" stroke="${tc.nodeStroke}" stroke-width="2.5"/>
@@ -8261,7 +8259,7 @@ function renderAgents(data){
            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
              <div style="font-size:10px;font-family:var(--font2);color:var(--r);letter-spacing:.08em;flex:1">ERROR</div>
              <button onclick="copyText(this,this.closest('[data-err]').dataset.err)" style="font-size:10px;padding:1px 8px;border-radius:4px;border:1px solid rgba(255,51,85,.3);background:rgba(255,51,85,.08);color:rgba(255,120,140,.8);cursor:pointer;font-family:var(--font)">copy</button>
-             <button onclick="_copyErrorContext('${a.id}')" title="Copy project + task + error + log tail as one paste-ready block" style="font-size:10px;padding:1px 8px;border-radius:4px;border:1px solid rgba(255,51,85,.3);background:rgba(255,51,85,.08);color:rgba(255,120,140,.8);cursor:pointer;font-family:var(--font)">copy context</button>
+             <button onclick="_copyErrorContext(${jsq(a.id)})" title="Copy project + task + error + log tail as one paste-ready block" style="font-size:10px;padding:1px 8px;border-radius:4px;border:1px solid rgba(255,51,85,.3);background:rgba(255,51,85,.08);color:rgba(255,120,140,.8);cursor:pointer;font-family:var(--font)">copy context</button>
            </div>
            <div style="font-size:11px;color:rgba(255,120,140,.85);font-family:var(--font2);line-height:1.5;word-break:break-all">${safeErr}</div>
          </div>` : '';
@@ -8269,7 +8267,7 @@ function renderAgents(data){
     /* file changes */
     const filesHtml = (a.files_changed||[]).length
       ? `<div style="display:flex;flex-direction:column;gap:2px;margin-top:6px;">${
-          (a.files_changed||[]).map(f=>`<div class="fe ${f.type||'changed'}" onclick="showDiff('${escHtml(f.path.replace(/'/g,"\\'"))}')" style="cursor:pointer;" title="Click to see diff">
+          (a.files_changed||[]).map(f=>`<div class="fe ${f.type||'changed'}" onclick="showDiff(${jsq(f.path)})" style="cursor:pointer;" title="Click to see diff">
             <span class="fe-badge">${(f.type||'MOD').toUpperCase().slice(0,3)}</span>
             <span class="fe-name">${escHtml(f.path.split('/').pop())}</span>
             ${f.lines?`<span class="fe-lines">${f.lines}L</span>`:''}
@@ -8278,7 +8276,7 @@ function renderAgents(data){
 
     const agentLogs = (a.log||[]);
     const logHtml = agentLogs.length
-      ? `<div class="log-toggle" id="lt-${a.id}" onclick="toggleAgentLog('${a.id}')">
+      ? `<div class="log-toggle" id="lt-${a.id}" onclick="toggleAgentLog(${jsq(a.id)})">
            <svg viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
            LOGS <span style="margin-left:3px;opacity:.6">(${agentLogs.length})</span>
          </div>
@@ -8296,10 +8294,10 @@ function renderAgents(data){
     const isNewCard=_newThisRender.has(a.id);
     const domId=a._domId||a.id;  // machine-namespaced when merged from multiple AOC instances, else just a.id
     const isRemote=a._isLocal===false;
-    return `<div id="card-${domId}" class="card ${dispStatus}${isFading?' agent-fading':''}${isCollapsed?' collapsed':''}${isPinned?' pinned':''}${isNewCard?' card-enter':''}" style="${isFading?`opacity:${fadeOpacity.toFixed(3)};`:''}" onclick="${isCollapsed?`toggleCollapse('${a.id}',event)`:''}">
-      <button class="card-cmp-btn ${_compareIds.includes(a.id)?'selected':''}" data-id="${a.id}" onclick="toggleCompare('${a.id}',event)" title="${_compareIds.includes(a.id)?'Remove from compare':'Add to compare'}">⊞</button>
-      <button class="card-pin-btn" onclick="togglePin('${a.id}',event)" title="${isPinned?'Unpin':'Pin to top'}">${isPinned?'◈':'◉'}</button>
-      <button class="card-collapse-btn" onclick="toggleCollapse('${a.id}',event)" title="${isCollapsed?'Expand':'Collapse'}">▲</button>
+    return `<div id="card-${domId}" class="card ${dispStatus}${isFading?' agent-fading':''}${isCollapsed?' collapsed':''}${isPinned?' pinned':''}${isNewCard?' card-enter':''}" style="${isFading?`opacity:${fadeOpacity.toFixed(3)};`:''}" onclick="${isCollapsed?`toggleCollapse(${jsq(a.id)},event)`:''}">
+      <button class="card-cmp-btn ${_compareIds.includes(a.id)?'selected':''}" data-id="${a.id}" onclick="toggleCompare(${jsq(a.id)},event)" title="${_compareIds.includes(a.id)?'Remove from compare':'Add to compare'}">⊞</button>
+      <button class="card-pin-btn" onclick="togglePin(${jsq(a.id)},event)" title="${isPinned?'Unpin':'Pin to top'}">${isPinned?'◈':'◉'}</button>
+      <button class="card-collapse-btn" onclick="toggleCollapse(${jsq(a.id)},event)" title="${isCollapsed?'Expand':'Collapse'}">▲</button>
       <button class="card-dismiss" onclick="dismissAgent(${jsq(a.id)},${jsq(a.machine||'')})" title="Dismiss">×</button>
       ${dispStatus==='running'?'<div class="sweep"></div>':''}
       ${sessBadge}
@@ -8313,7 +8311,7 @@ function renderAgents(data){
         ${isRemote?`<span class="hookmiss-badge" style="border-color:var(--c);color:var(--c);background:rgba(var(--c-rgb),.08)" title="From remote machine">⌘ ${escHtml(a.machine)}</span>`:''}
         ${a.detected_via==='transcript'?`<span class="hookmiss-badge" title="${escHtml(_hookMissTitle(a))}">⚠ HOOK MISS</span>`:''}
         ${a.tokens_used?`<span class="cost-badge" data-cost="${a.tokens_used}" id="cb-${domId}">$${_agentCost(a).toFixed(3)}</span>`:''}
-        ${isCollapsed?`<span style="font-size:10px;font-family:var(--font2);color:var(--t3);margin-left:6px">${elapsedStr||''}</span>`:`<button class="card-info-btn" onclick="openAgentDetail('${a.id}',event)" title="Agent detail drill-down [click]">⊕ INFO</button>`}
+        ${isCollapsed?`<span style="font-size:10px;font-family:var(--font2);color:var(--t3);margin-left:6px">${elapsedStr||''}</span>`:`<button class="card-info-btn" onclick="openAgentDetail(${jsq(a.id)},event)" title="Agent detail drill-down [click]">⊕ INFO</button>`}
       </div>
       <div class="card-body">
       ${(()=>{ const stuckSecs=_stuckSecs(a); return stuckSecs>300?`<div class="stuck-badge">⚠ STUCK — no progress for ${stuckSecs<3600?Math.floor(stuckSecs/60)+'m':Math.floor(stuckSecs/3600)+'h'}</div>`:''; })()}
@@ -8487,11 +8485,11 @@ function renderAgents(data){
             ${activitySparkline}
           </div>
           <div class="status-pill ${isActive?(waitingOnYou?'waiting':'running'):''}" ${waitingOnYou?'title="Claude finished its last turn and is waiting for your next message"':''}><span class="${isActive?'sdot':''}"></span>${isActive?(waitingOnYou?'WAITING'+waitingDurStr:'ACTIVE'):'CLOSED'}</div>
-          ${!sIsRemote?`<button onclick="event.stopPropagation();openNotesPanel('${escHtml(s.id)}')" title="${s.note?'Edit note':'Add note'}" style="background:none;border:none;color:${s.note?'var(--c)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${s.note?'var(--c)':'var(--t3)'}'">📝</button>`:''}
-          <button onclick="event.stopPropagation();exportSessionDetail('${escHtml(s.id)}')" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
-          <button onclick="toggleSessionCompare('${escHtml(s.id)}',event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
+          ${!sIsRemote?`<button onclick="event.stopPropagation();openNotesPanel(${jsq(s.id)})" title="${s.note?'Edit note':'Add note'}" style="background:none;border:none;color:${s.note?'var(--c)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${s.note?'var(--c)':'var(--t3)'}'">📝</button>`:''}
+          <button onclick="event.stopPropagation();exportSessionDetail(${jsq(s.id)})" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
+          <button onclick="toggleSessionCompare(${jsq(s.id)},event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
           ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession(${jsq(s.id)},${jsq(s.project||s.cwd||'this session')},${jsq(s.machine||'')})" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(255,80,100,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(255,80,100,.7)'">⛔</button>`:''}
-          ${!isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_copyResumeCmd('${escHtml(s.id)}')" title="Copy resume command to clipboard" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⟲</button>`:''}
+          ${!isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_copyResumeCmd(${jsq(s.id)})" title="Copy resume command to clipboard" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⟲</button>`:''}
           ${!isActive?` <button onclick="event.stopPropagation();_dismissSession(${jsq(s.id)},${jsq(s.machine||'')})" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
         </div>
       </div>`;
@@ -8657,7 +8655,7 @@ async function renderAuditLog(){
         fcEl.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:11px;text-align:center;padding:50px 0;letter-spacing:.08em">// no file changes this session</div>';
       } else {
         fcEl.innerHTML=_auFiles.map(f=>`
-          <div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff('${escHtml(f.path.replace(/'/g,"\\'"))}');event.stopPropagation()" style="cursor:pointer;padding:10px 12px;border-radius:8px">
+          <div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff(${jsq(f.path)});event.stopPropagation()" style="cursor:pointer;padding:10px 12px;border-radius:8px">
             <span class="fe-badge">${f.type==='new'?'NEW':'MOD'}</span>
             <span class="fe-name" style="flex:1;font-size:12px">${escHtml(f.path)}</span>
             ${f.lines?`<span class="fe-lines">${f.lines}L</span>`:''}
@@ -8992,7 +8990,7 @@ async function renderHistory(){
         ${byProj.length?`
         <div class="hist-section">COST BY PROJECT <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(click a project for its own trend)</span></div>
         <div class="hist-bar-wrap">${byProj.map(r=>`
-          <div class="hist-bar-row" onclick="_selectProjectTrend('${(r.project||'').replace(/'/g,"\\'")}')" style="cursor:pointer;${_selectedProjectTrend===r.project?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
+          <div class="hist-bar-row" onclick="_selectProjectTrend(${jsq(r.project||'')})" style="cursor:pointer;${_selectedProjectTrend===r.project?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
             <span class="hist-bar-lbl" style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(r.project||'')}">${escHtml(r.project||'—')}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.cost||0)/maxProjCost*100).toFixed(1)}%;background:rgba(0,232,135,.65)"></div></div>
             <span class="hist-bar-val">${fmtCost(r.cost)}</span>
@@ -9004,7 +9002,7 @@ async function renderHistory(){
         ${byModel.length?`
         <div class="hist-section">COST BY MODEL <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(click a model for its own trend)</span></div>
         <div class="hist-bar-wrap">${byModel.map(r=>`
-          <div class="hist-bar-row" onclick="_selectModelTrend('${(r.model||'').replace(/'/g,"\\'")}')" style="cursor:pointer;${_selectedModelTrend===r.model?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
+          <div class="hist-bar-row" onclick="_selectModelTrend(${jsq(r.model||'')})" style="cursor:pointer;${_selectedModelTrend===r.model?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
             <span class="hist-bar-lbl" style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(r.model||'')}">${escHtml(r.model||'—')}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.cost||0)/maxModelCost*100).toFixed(1)}%;background:rgba(0,232,135,.65)"></div></div>
             <span class="hist-bar-val">${fmtCost(r.cost)}</span>
@@ -9016,7 +9014,7 @@ async function renderHistory(){
         ${bySubagentType.length?`
         <div class="hist-section">COST BY AGENT TYPE <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(click a type for its own trend)</span></div>
         <div class="hist-bar-wrap">${bySubagentType.map(r=>`
-          <div class="hist-bar-row" onclick="_selectSubagentTypeTrend('${(r.subagent_type||'').replace(/'/g,"\\'")}')" style="cursor:pointer;${_selectedSubagentTypeTrend===r.subagent_type?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
+          <div class="hist-bar-row" onclick="_selectSubagentTypeTrend(${jsq(r.subagent_type||'')})" style="cursor:pointer;${_selectedSubagentTypeTrend===r.subagent_type?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
             <span class="hist-bar-lbl" style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(r.subagent_type||'')}">${escHtml(r.subagent_type||'—')}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.cost||0)/maxSubagentTypeCost*100).toFixed(1)}%;background:rgba(0,232,135,.65)"></div></div>
             <span class="hist-bar-val">${fmtCost(r.cost)}</span>
@@ -9037,12 +9035,12 @@ async function renderHistory(){
         ${fileHotspots.length?`
         <div class="hist-section">TOP FILES <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(click a file for its trend, ⇄ for its diff)</span></div>
         <div class="hist-bar-wrap">${fileHotspots.map(r=>`
-          <div class="hist-bar-row" onclick="_selectFileTrend('${(r.path||'').replace(/'/g,"\\'")}')" style="cursor:pointer;${_selectedFileTrend===r.path?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
+          <div class="hist-bar-row" onclick="_selectFileTrend(${jsq(r.path||'')})" style="cursor:pointer;${_selectedFileTrend===r.path?'background:rgba(var(--c-rgb),.08);border-radius:6px':''}">
             <span class="hist-bar-lbl" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left" title="${escHtml(r.path||'')}">${escHtml(r.path||'—')}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.changes||0)/maxFileChanges*100).toFixed(1)}%;background:rgba(0,232,135,.65)"></div></div>
             <span class="hist-bar-val">${r.changes} change${r.changes!==1?'s':''}</span>
             <span style="font-family:var(--font2);font-size:9px;color:var(--t3);min-width:88px;text-align:right" title="${r.sessions} distinct session${r.sessions!==1?'s':''}">${r.sessions}sess · ${r.total_lines||0}L</span>
-            <span onclick="showDiff('${(r.path||'').replace(/'/g,"\\'")}');event.stopPropagation()" title="View diff" style="cursor:pointer;padding:0 2px;opacity:.6">⇄</span>
+            <span onclick="showDiff(${jsq(r.path||'')});event.stopPropagation()" title="View diff" style="cursor:pointer;padding:0 2px;opacity:.6">⇄</span>
           </div>`).join('')}</div>
         ${_selectedFileTrend&&byDayFileHotspots.some(r=>r.path===_selectedFileTrend)?`
         <div class="trend-wrap" id="trend-selected-file"></div>`:''}`:''}
@@ -9058,7 +9056,7 @@ async function renderHistory(){
         ${tagCloud.length?`
         <div class="hist-section">TAGS <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(click a tag to filter Sessions by it)</span></div>
         <div class="hist-bar-wrap">${tagCloud.map(r=>`
-          <div class="hist-bar-row" onclick="_selectTagFilter('${(r.tag||'').replace(/'/g,"\\'")}')" style="cursor:pointer">
+          <div class="hist-bar-row" onclick="_selectTagFilter(${jsq(r.tag||'')})" style="cursor:pointer">
             <span class="hist-bar-lbl" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(r.tag||'')}">${escHtml(r.tag||'')}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.count||0)/maxTagCount*100).toFixed(1)}%;background:rgba(0,232,135,.65)"></div></div>
             <span class="hist-bar-val">${r.count} session${r.count!==1?'s':''}</span>
@@ -9067,7 +9065,7 @@ async function renderHistory(){
         <div class="hist-section">SLOWEST AGENTS <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(click to open its session)</span></div>
         <div class="hist-bar-wrap">${slowestAgents.map(r=>`
           <div class="hist-bar-row" ${r._isLocal!==false
-            ?`onclick="_jumpToSessionHistory('${(r.session_id||'').replace(/'/g,"\\'")}')" style="cursor:pointer"`
+            ?`onclick="_jumpToSessionHistory(${jsq(r.session_id||'')})" style="cursor:pointer"`
             :`style="cursor:default"`}>
             <span class="hist-bar-lbl" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(r.name||r.agent_id||'')}">${escHtml(r.name||r.agent_id||'—')}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.duration_s||0)/maxAgentDuration*100).toFixed(1)}%;background:${r.status==='error'?'rgba(255,51,85,.6)':'rgba(0,232,135,.65)'}"></div></div>
@@ -9078,7 +9076,7 @@ async function renderHistory(){
         <div class="hist-section">COMMON ERRORS <span style="font-weight:400;color:var(--t3);font-size:8px;letter-spacing:0;text-transform:none">(exact-text matches; click to open the most recent occurrence)</span></div>
         <div class="hist-bar-wrap">${commonErrors.map(r=>`
           <div class="hist-bar-row" ${r.last_session_id
-            ?`onclick="_jumpToSessionHistory('${(r.last_session_id||'').replace(/'/g,"\\'")}')" style="cursor:pointer"`
+            ?`onclick="_jumpToSessionHistory(${jsq(r.last_session_id||'')})" style="cursor:pointer"`
             :`style="cursor:default"`}>
             <span class="hist-bar-lbl" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(r.error_msg||'')}">${escHtml((r.error_msg||'').slice(0,80))}</span>
             <div class="hist-bar-track"><div class="hist-bar-fill" style="width:${((r.occurrences||0)/maxErrorOccurrences*100).toFixed(1)}%;background:rgba(255,51,85,.55)"></div></div>
@@ -9296,14 +9294,14 @@ async function _renderHistSessionsBody(){
       const isRemote=s._isLocal===false;
       const rm=isRemote?(_remoteMachines.find(m=>m.name===s.machine)||{}):null;
       const onclick=isRemote
-        ?`showHistoryDetail('${s.id}','${escHtml(rm.url||'')}','${escHtml(rm.token||'')}')`
-        :`showHistoryDetail('${s.id}')`;
+        ?`showHistoryDetail(${jsq(s.id)},${jsq(rm.url||'')},${jsq(rm.token||'')})`
+        :`showHistoryDetail(${jsq(s.id)})`;
       const projectAvg=isRemote?0:(projectAvgCosts[s.project]||0);
       const isOutlier=_isCostSpike(s.cost||0,projectAvg);
       return `
       <div class="hist-row" onclick="${onclick}">
         <span class="hr-date">${s.started_at||'—'} – ${s.ended_at||'—'}</span>
-        <span class="hr-project">${escHtml(s.project||'(no project)')}${isRemote?` <span style="color:var(--c);opacity:.7">⌘ ${escHtml(s.machine)}</span>`:''}${(s.tags||[]).map(t=>`<button class="le-tag" style="margin-left:6px" onclick="event.stopPropagation();setHistSearch('${escHtml(t).replace(/'/g,"\\'")}')" title="Filter History by this tag">${escHtml(t)}</button>`).join('')}</span>
+        <span class="hr-project">${escHtml(s.project||'(no project)')}${isRemote?` <span style="color:var(--c);opacity:.7">⌘ ${escHtml(s.machine)}</span>`:''}${(s.tags||[]).map(t=>`<button class="le-tag" style="margin-left:6px" onclick="event.stopPropagation();setHistSearch(${jsq(t)})" title="Filter History by this tag">${escHtml(t)}</button>`).join('')}</span>
         <span class="hr-chips">
           <span class="hist-chip ok">${s.done||0}✓ ${s.agents||0}ag</span>
           ${s.task_total>0?`<span class="hist-chip cost">${s.task_done||0}/${s.task_total}t</span>`:''}
@@ -9348,7 +9346,7 @@ async function renderDiag(){
         <span style="flex:1;color:${b.corrupt?'var(--r)':'var(--t2)'}">${escHtml(b.filename)}${b.corrupt?' ⚠ CORRUPT':''}</span>
         <span style="color:var(--t3)">${fmtBytes(b.size_bytes)}</span>
         <span style="color:var(--t3)">${fmtDate(b.mtime)}</span>
-        ${b.corrupt?'':`<button class="adp-btn" onclick="_restoreBackup('${escHtml(b.filename)}')" style="font-size:9px;padding:2px 10px;color:var(--r)">RESTORE</button>`}
+        ${b.corrupt?'':`<button class="adp-btn" onclick="_restoreBackup(${jsq(b.filename)})" style="font-size:9px;padding:2px 10px;color:var(--r)">RESTORE</button>`}
       </div>`).join('');
     el.innerHTML=`
       <div style="font-size:10px;font-family:var(--font2);color:var(--t3);margin-bottom:2px">
@@ -9419,9 +9417,9 @@ async function showHistoryDetail(sid,baseUrl,token){
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px">
         ${tags.map(t=>isRemote
           ?`<span class="le-tag" title="${escHtml(t)}">${escHtml(t)}</span>`
-          :`<button class="le-tag" onclick="_historyTagRemove('${sid}','${escHtml(t).replace(/'/g,"\\'")}')" aria-label="Remove tag ${escHtml(t)}" title="Click to remove">${escHtml(t)} ✕</button>`
+          :`<button class="le-tag" onclick="_historyTagRemove(${jsq(sid)},${jsq(t)})" aria-label="Remove tag ${escHtml(t)}" title="Click to remove">${escHtml(t)} ✕</button>`
         ).join('')}
-        ${isRemote?'':`<input type="text" id="hist-tag-input" placeholder="+ tag" maxlength="30" style="font-family:var(--font2);font-size:9px;padding:2px 8px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);width:70px" onkeydown="if(event.key==='Enter'&&this.value.trim()){_historyTagAdd('${sid}',this.value.trim());this.value='';}">`}
+        ${isRemote?'':`<input type="text" id="hist-tag-input" placeholder="+ tag" maxlength="30" style="font-family:var(--font2);font-size:9px;padding:2px 8px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);width:70px" onkeydown="if(event.key==='Enter'&&this.value.trim()){_historyTagAdd(${jsq(sid)},this.value.trim());this.value='';}">`}
       </div>
       ${agents.length?`
       <div class="hist-section">AGENTS (${agents.length})</div>
@@ -10572,12 +10570,12 @@ function _renderAdp(){
   // spawned this one. Clickable straight to the parent's own detail
   // panel, same pattern as the rest of this header's badges.
   const parentAgent=_resolveParentAgent(a);
-  const parentStr=parentAgent?`<span style="font-size:9px;color:var(--t3);font-family:var(--font2);cursor:pointer" onclick="openAgentDetail('${escHtml(parentAgent.id)}',null)" title="Spawned by this agent — click to open">↳ ${escHtml(parentAgent.name)}</span>`:'';
+  const parentStr=parentAgent?`<span style="font-size:9px;color:var(--t3);font-family:var(--font2);cursor:pointer" onclick="openAgentDetail(${jsq(parentAgent.id)},null)" title="Spawned by this agent — click to open">↳ ${escHtml(parentAgent.name)}</span>`:'';
   // Reverse direction of the same thread -- TREE already draws a childCount
   // badge (${childCount}↓) on a parent node, but nothing told you that from
   // an orchestrator agent's own detail panel.
   const childAgents=_resolveChildAgents(a);
-  const childStr=childAgents.length?`<span style="font-size:9px;color:var(--t3);font-family:var(--font2);cursor:pointer" onclick="openAgentDetail('${escHtml(childAgents[0].id)}',null)" title="${escHtml(childAgents.map(c=>c.name).join(', '))}">spawned ${childAgents.length} subagent${childAgents.length!==1?'s':''} →</span>`:'';
+  const childStr=childAgents.length?`<span style="font-size:9px;color:var(--t3);font-family:var(--font2);cursor:pointer" onclick="openAgentDetail(${jsq(childAgents[0].id)},null)" title="${escHtml(childAgents.map(c=>c.name).join(', '))}">spawned ${childAgents.length} subagent${childAgents.length!==1?'s':''} →</span>`:'';
   // Same _stuckSecs() signal the card already showed (>300s since this
   // running agent's last task completion) -- the detail panel, the surface
   // you'd actually click into to investigate why an agent looks frozen,
@@ -10663,7 +10661,7 @@ function _renderAdpBody(){
       return;
     }
     bodyEl.innerHTML=`<div class="adp-sec">FILES CHANGED — ${files.length}</div>`+
-      files.map(f=>`<div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff('${escHtml(f.path.replace(/'/g,"\\'"))}');closeAgentDetail()" style="cursor:pointer" title="Click for diff — closes panel">
+      files.map(f=>`<div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff(${jsq(f.path)});closeAgentDetail()" style="cursor:pointer" title="Click for diff — closes panel">
         <span class="fe-badge">${f.type==='new'?'NEW':'MOD'}</span>
         <span class="fe-name" title="${escHtml(f.path)}">${escHtml(f.path)}</span>
         ${f.lines?`<span class="fe-lines">${f.lines}L</span>`:''}
@@ -10965,7 +10963,7 @@ function renderHeatmap(data){
       return `<div class="heat-cell" style="background:${bg};${statusBorder||doneBorder}" title="${escHtml(tipContent)}"></div>`;
     }).join('');
     return `<div class="heat-row">
-      <div class="heat-label" style="color:${col}" onclick="openAgentDetail('${escHtml(row.a.id)}',null)" title="${escHtml(row.a.name)}">${escHtml(row.a.name.length>18?row.a.name.slice(0,17)+'…':row.a.name)}</div>
+      <div class="heat-label" style="color:${col}" onclick="openAgentDetail(${jsq(row.a.id)},null)" title="${escHtml(row.a.name)}">${escHtml(row.a.name.length>18?row.a.name.slice(0,17)+'…':row.a.name)}</div>
       <div class="heat-cells">${cellsHtml}</div>
     </div>`;
   }).join('');
@@ -11073,8 +11071,7 @@ function renderTree(data){
     const arcC = (2*Math.PI*arcR).toFixed(1);
     const arcD = (pct/100*2*Math.PI*arcR).toFixed(1);
     const childCount = (childMap[a.id]||[]).length;
-    const sid = escHtml(a.id);
-    return `<g onclick="openAgentDetail('${sid}',null)" onmouseover="_treeNodeHover(event,'${sid}')" onmouseout="_graphNodeOut()" style="cursor:pointer${isActive?`;filter:drop-shadow(0 0 8px ${rgba})`:''}">
+    return `<g onclick="openAgentDetail(${jsq(a.id)},null)" onmouseover="_treeNodeHover(event,${jsq(a.id)})" onmouseout="_graphNodeOut()" style="cursor:pointer${isActive?`;filter:drop-shadow(0 0 8px ${rgba})`:''}">
   ${a.status==='running'?`<circle cx="${px}" cy="${py}" r="${arcR+5}" fill="none" stroke="${rgba}" stroke-width="1" opacity=".2" style="animation:pulse 2s infinite"/>`:``}
   <polygon points="${pts}" fill="${isActive?rgba.replace('.85)',',.15)').replace(',1)',',.15)'):tc.nodeFill}" stroke="${rgba}" stroke-width="${isActive?2.5:1.6}"/>
   <circle cx="${px}" cy="${py}" r="${arcR}" fill="none" stroke="${tc.nodeStroke}" stroke-width="2"/>
