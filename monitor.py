@@ -4567,61 +4567,68 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#04060e">
+<meta name="theme-color" content="#16201e">
 <link rel="apple-touch-icon" href="/icon.svg">
 <title>AOC — Agent Operations Center</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&family=Red+Hat+Mono:wght@400;500;700&display=swap');
 
+/* Strip-board identity (shared with the cloud dashboard,
+   saas-backend/app/static/dashboard.html): a controller's console in dark
+   slate-green, subagents as paper flight strips whose holder band carries
+   the status (colour + glyph + word). Text tokens are all >= 4.5:1 on the
+   console; --paper-ink/-ink-2 >= 4.5:1 on paper. */
 :root {
-  --bg:    #060d1f;
-  --c:     #00c4e8;
-  --c2:    #0090b8;
+  --bg:    #1b2624;
+  --console: #1b2624;
+  --bay:   #22302d;
+  --bay-edge: #34463f;
+  --groove: #16201e;
+  --paper: #ece2c0;
+  --paper-edge: #cdbf94;
+  --paper-rule: #c9bb8e;
+  --paper-ink: #1f2420;
+  --paper-ink-2: #5d5843;
+  --band-run:  #2f6fb3;
+  --band-done: #2e8a57;
+  --band-err:  #c8402f;
+  --band-wait: #c9892a;
+  --c:     #5b9be0;
+  --c2:    #2f6fb3;
   /* Bare "R,G,B" triplets (no alpha) so rgba(var(--c-rgb),X) can express
      translucent accent tints at any alpha -- var(--c) alone is a solid
      color and can't be plugged into rgba(). Kept in sync with --c/--c2
      by _applyAccent() whenever the user picks a different swatch. */
-  --c-rgb:  0,196,232;
-  --c2-rgb: 0,144,184;
-  --c3:    rgba(0,72,104,.6);
-  --g:     #00e887;
-  --r:     #ff3355;
-  --o:     #ff8c00;
-  --t:     rgba(200,230,255,.88);
-  --t2:    rgba(140,190,230,.7);
-  --t3:    rgba(110,160,195,.78);  /* was .55 alpha at rgb(90,140,180) = 2.4:1 contrast, failed WCAG AA; this is ~4.6:1 */
-  --border: rgba(255,255,255,.08);
-  --glass: rgba(10,25,50,.55);
-  --specular: rgba(255,255,255,.2);
-  --font:  'Inter', system-ui, sans-serif;
-  --font2: Consolas, 'Cascadia Code', 'Courier New', monospace;
-  --radius: 18px;
+  --c-rgb:  91,155,224;
+  --c2-rgb: 47,111,179;
+  --c3:    rgba(47,111,179,.35);
+  --g:     #4cc285;
+  --r:     #ef6a57;
+  --o:     #e0a13a;
+  --t:     #dde6e0;
+  --t2:    #a3b3ab;
+  --t3:    #8a9c94;
+  --border: rgba(236,226,192,.1);
+  --glass: rgba(34,48,45,.72);
+  --specular: rgba(236,226,192,.12);
+  --font:  'Atkinson Hyperlegible', system-ui, sans-serif;
+  --font2: 'Red Hat Mono', Consolas, 'Cascadia Code', monospace;
+  --font3: 'Barlow Condensed', 'Arial Narrow', sans-serif;
+  --radius: 8px;
 }
 
 * { margin:0; padding:0; box-sizing:border-box; }
 html, body { height:100%; overflow:hidden; }
 body {
-  background:
-    radial-gradient(ellipse 80% 60% at 15% 10%, rgba(0,120,200,.09) 0%, transparent 55%),
-    radial-gradient(ellipse 60% 70% at 85% 90%, rgba(0,80,160,.07) 0%, transparent 55%),
-    radial-gradient(ellipse 40% 40% at 50% 50%, rgba(0,60,120,.05) 0%, transparent 70%),
-    #060d1f;
+  background: var(--console);
   color: var(--t);
   font-family: var(--font);
   font-size: 14px;
   line-height: 1.55;
 }
 
-/* subtle noise texture */
-body::before {
-  content:'';
-  position:fixed; inset:0; z-index:0; pointer-events:none;
-  background-image:
-    linear-gradient(rgba(var(--c-rgb),.015) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(var(--c-rgb),.015) 1px, transparent 1px);
-  background-size: 64px 64px;
-  opacity: .6;
-}
+/* console paint: no texture, the strips carry the texture */
+body::before { content:none; }
 
 .root {
   position: relative; z-index:1;
@@ -4637,24 +4644,19 @@ body::before {
 /* ── TOP BAR — Liquid Glass ── */
 .topbar {
   grid-column: 1/-1;
-  background: rgba(6,14,30,.65);
-  backdrop-filter: blur(32px) saturate(180%) brightness(1.02);
-  -webkit-backdrop-filter: blur(32px) saturate(180%) brightness(1.02);
-  border-bottom: 1px solid rgba(255,255,255,.07);
+  background: var(--groove);
+  border-bottom: 1px solid var(--bay-edge);
   display: flex; align-items: center; padding: 0 20px; gap: 16px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.1), 0 4px 32px rgba(0,0,0,.5);
 }
 
 .logo-wrap { display:flex; align-items:center; gap:10px; margin-right:6px; }
-.logo-mark { width:52px; height:52px; flex-shrink:0; filter:drop-shadow(0 0 12px rgba(var(--c-rgb),.45)); }
+.logo-mark { width:52px; height:52px; flex-shrink:0; }
 
 .logo-text .t1 {
-  font-family: 'Orbitron', var(--font2); font-size:15px; font-weight:900;
-  letter-spacing:.28em; color:var(--c);
-  text-shadow: 0 0 20px rgba(var(--c-rgb),.7);
-  animation: flicker 8s infinite;
+  font-family: var(--font3); font-size:21px; font-weight:700; line-height:1;
+  letter-spacing:.04em; color:var(--t);
 }
-.logo-text .t2 { font-size:10px; color:var(--t3); letter-spacing:.13em; margin-top:2px; }
+.logo-text .t2 { font-size:10px; color:var(--t3); letter-spacing:.13em; margin-top:2px; white-space:nowrap; }
 
 @keyframes flicker { 0%,94%,100%{opacity:1} 96%{opacity:.55} }
 
@@ -4681,7 +4683,7 @@ body::before {
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
 .clock { text-align:right; }
-.clock-time { font-family:'Orbitron', var(--font2); font-size:15px; color:var(--c); letter-spacing:.08em; }
+.clock-time { font-family:var(--font2); font-size:15px; font-weight:500; color:var(--t); letter-spacing:.04em; font-variant-numeric:tabular-nums; }
 .clock-date { font-size:11px; color:var(--t3); letter-spacing:.06em; margin-top:1px; }
 
 .btn-reset {
@@ -4721,7 +4723,7 @@ body::before {
 .btn-mute.muted { border-color:rgba(255,51,85,.3); background:rgba(255,51,85,.07); color:var(--r); }
 
 /* ── MAIN ── */
-.main { padding:16px; overflow-y:auto; display:flex; flex-direction:column; gap:0; background:transparent; }
+.main { padding:16px; overflow-y:auto; display:flex; flex-direction:column; gap:0; background:transparent; min-width:0; }
 #cards-area { display:flex; flex-direction:column; gap:12px; }
 #timeline-area { display:none; flex-direction:column; gap:8px; }
 
@@ -4753,6 +4755,83 @@ body::before {
 /* ── AGENT GRID ── */
 .agents { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
 .agents.list-mode { display:flex; flex-direction:column; gap:4px; }
+
+/* ── Flight strips (agents view, card mode) ─────────────────────────────── */
+#agents:not(.list-mode) { grid-template-columns:1fr; gap:6px; }
+.sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+.strip-card { --band: var(--band-run); display:grid; grid-template-columns:34px 1fr; border-radius:3px; box-shadow:0 1px 0 rgba(0,0,0,.45); }
+.strip-card.st-done    { --band: var(--band-done); }
+.strip-card.st-error   { --band: var(--band-err); }
+.strip-card.st-waiting { --band: var(--band-wait); }
+.strip-card.pinned { box-shadow:0 0 0 2px var(--o), 0 1px 0 rgba(0,0,0,.45); }
+.sc-band { background:var(--band); color:#fff; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; padding:8px 0; border-radius:3px 0 0 3px; }
+.sc-glyph { font-size:12px; line-height:1; }
+.sc-word { writing-mode:vertical-rl; transform:rotate(180deg); font:700 12px var(--font3); letter-spacing:.16em; text-transform:uppercase; }
+.sc-paper { background:var(--paper); color:var(--paper-ink); border-radius:0 3px 3px 0; box-shadow:inset 0 0 0 1px var(--paper-edge); min-width:0; }
+.sc-face { display:grid; grid-template-columns:minmax(180px,2.2fr) minmax(160px,1.7fr) 78px 78px 88px auto; }
+.sc-cell { padding:7px 11px 8px; border-left:1px solid var(--paper-rule); min-width:0; }
+.sc-cell:first-child { border-left:0; }
+.sc-k { display:block; font:600 11px var(--font3); letter-spacing:.14em; text-transform:uppercase; color:var(--paper-ink-2); }
+.sc-v { display:block; font:500 15px/1.3 var(--font2); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.sc-v .cost-badge { all:unset; font:inherit; }
+.sc-v .cost-badge.flash { animation:restamp .7s ease-out; }
+.sc-callsign { font:700 20px/1.05 var(--font3); letter-spacing:.03em; text-transform:uppercase; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sc-pin { color:#9a6a12; margin-right:6px; }
+.sc-sub { font:400 12px var(--font2); color:var(--paper-ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px; }
+.sc-flags { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+.sc-flags:empty { display:none; }
+.sc-flag { font:600 11px var(--font3); letter-spacing:.1em; text-transform:uppercase; padding:1px 6px; border:1px solid var(--paper-ink-2); border-radius:2px; color:var(--paper-ink); }
+.sc-flag.warn { border-color:#9a6a12; color:#7a5209; background:rgba(201,137,42,.14); }
+.sc-ticks { display:flex; gap:3px; margin:4px 0 3px; flex-wrap:wrap; align-items:center; }
+.sc-ticks b { width:11px; height:11px; border:1.5px solid var(--paper-ink); border-radius:1px; }
+.sc-ticks b.on { background:var(--paper-ink); }
+.sc-ticks i { font:500 11px var(--font2); font-style:normal; color:var(--paper-ink-2); margin-left:2px; }
+.sc-prog { position:relative; height:2px; background:var(--paper-rule); margin:2px 0 4px; }
+.sc-prog .prog-fill { position:static; display:block; height:100%; border-radius:0; box-shadow:none; background:var(--paper-ink); transition:width .6s ease; }
+.sc-cur { display:block; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sc-cur.err { color:#9b2a1c; font-weight:700; }
+.sc-tools { display:flex; align-items:flex-start; gap:2px; padding:6px 8px; border-left:1px solid var(--paper-rule); }
+.sc-tool { background:none; border:1px solid transparent; color:var(--paper-ink-2); border-radius:3px; min-width:26px; height:24px; padding:0 5px; font:700 12px var(--font3); letter-spacing:.08em; cursor:pointer; }
+.sc-tool:hover { border-color:var(--paper-ink-2); color:var(--paper-ink); }
+.sc-tool.selected { background:var(--paper-ink); color:var(--paper); }
+.sc-tool:focus-visible, .strip-card button:focus-visible { outline:2px solid var(--o); outline-offset:1px; }
+.sc-back { border-top:1px dashed var(--paper-rule); background:#f4edd4; padding:10px 14px 12px; display:grid; gap:8px; font-size:13px; border-radius:0 0 3px 0; }
+.sc-desc { color:var(--paper-ink); }
+.sc-back .tasks { display:flex; flex-direction:column; gap:2px; }
+.sc-back .task { border:0; background:none; color:var(--paper-ink); padding:1px 0; }
+.sc-back .task.d { color:var(--paper-ink-2); background:none; }
+.sc-back .task-chk { color:var(--paper-ink); }
+.sc-back .task.p, .sc-back .task.p .task-lbl, .sc-back .task .task-lbl { color:var(--paper-ink); opacity:1; }
+.sc-back .task.d .task-lbl { color:var(--paper-ink-2); }
+.sc-back .fe-name, .sc-back .fe-lines { color:var(--paper-ink) !important; }
+.strip-card .sc-back .task, .strip-card .sc-back .task.d, .strip-card .sc-back .task.p { background:none !important; border:0 !important; }
+.strip-card .sc-v .cost-badge { color:inherit !important; background:none !important; border:0 !important; text-shadow:none !important; }
+.sc-back .fe { border-left-color:var(--paper-ink-2); color:var(--paper-ink); }
+.sc-back .fe:hover { background:rgba(31,36,32,.06); }
+.sc-back .fe-badge { color:var(--paper-ink) !important; border-color:var(--paper-ink-2) !important; }
+.sc-back .log-toggle { color:var(--paper-ink-2); border-top-color:var(--paper-rule); }
+.sc-back .log-panel { background:rgba(31,36,32,.05); border-color:var(--paper-rule); }
+.sc-back .log-entry { color:var(--paper-ink-2); border-bottom-color:rgba(31,36,32,.06); }
+.sc-back [data-err] { background:rgba(200,64,47,.08) !important; border-color:rgba(200,64,47,.35) !important; }
+.sc-back [data-err] div { color:#9b2a1c !important; }
+.sc-back [data-err] button { color:#9b2a1c !important; background:transparent !important; border-color:rgba(155,42,28,.4) !important; }
+.sc-back > div[style*="font-family:var(--font2)"] { color:var(--paper-ink-2) !important; }
+.strip-card.collapsed { cursor:pointer; }
+.strip-enter { animation:slot-in .34s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes slot-in { from { opacity:0; transform:translateX(-28px); } to { opacity:1; transform:none; } }
+@keyframes restamp { 0% { filter:brightness(1.9); } 100% { filter:none; } }
+#agents.density-compact .sc-cell { padding:4px 9px 5px; }
+#agents.density-compact .sc-callsign { font-size:17px; }
+#agents.density-comfortable .sc-cell { padding:10px 13px 11px; }
+@media (max-width: 900px) {
+  .sc-face { grid-template-columns:1fr 1fr 1fr; }
+  .sc-call, .sc-tasks { grid-column:1 / -1; border-left:0; }
+  .sc-tasks { border-top:1px solid var(--paper-rule); }
+  .sc-num { border-top:1px solid var(--paper-rule); }
+  .sc-num:nth-of-type(3) { border-left:0; }
+  .sc-tools { grid-column:1 / -1; border-left:0; border-top:1px solid var(--paper-rule); justify-content:flex-end; }
+}
+@media (prefers-reduced-motion: reduce) { .strip-enter, .sc-v .cost-badge.flash { animation:none; } }
 .agent-row { display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:8px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.07); transition:background .2s; cursor:default; }
 .agent-row:hover { background:rgba(255,255,255,.06); }
 .agent-row.running { border-left:2px solid var(--c); }
@@ -4787,26 +4866,14 @@ body::before {
 .search-clear { position:absolute; right:10px; top:50%; transform:translateY(-50%); background:none; border:none; cursor:pointer; color:var(--t3); font-size:14px; line-height:1; padding:0; display:none; }
 .search-clear.show { display:block; }
 
-/* ── LIQUID GLASS CARD ── */
+/* ── BAY CARD (session cards in the CLI view, ghosts) ── */
 .card {
-  background: linear-gradient(
-    145deg,
-    rgba(255,255,255,.07) 0%,
-    rgba(10,26,58,.62) 35%,
-    rgba(6,18,42,.68) 100%
-  );
-  backdrop-filter: blur(24px) saturate(160%) brightness(1.05);
-  -webkit-backdrop-filter: blur(24px) saturate(160%) brightness(1.05);
-  border: 1px solid rgba(255,255,255,.1);
-  border-top: 1px solid rgba(255,255,255,.22);
+  background: var(--bay);
+  border: 1px solid var(--bay-edge);
   border-radius: var(--radius);
   position: relative; overflow:hidden;
   padding:16px;
-  box-shadow:
-    0 8px 32px rgba(0,0,0,.45),
-    0 2px 8px rgba(0,0,0,.25),
-    inset 0 1px 0 rgba(255,255,255,.13),
-    inset 0 -1px 0 rgba(0,0,0,.12);
+  box-shadow: 0 1px 0 rgba(0,0,0,.35);
   transition: border-color .3s, box-shadow .3s, transform .15s;
 }
 /* Card density (Settings > Appearance) hangs off the stable #agents container,
@@ -4815,7 +4882,8 @@ body::before {
    moments after it was applied. #agents itself is only ever created once. */
 #agents.density-compact .card { padding:10px 12px; }
 #agents.density-comfortable .card { padding:20px 18px; }
-/* specular top highlight */
+/* specular top highlight: off in the strip-board identity */
+.card::before, .card::after { content:none !important; }
 .card::before {
   content:'';
   position:absolute; top:0; left:0; right:0; height:1px;
@@ -4834,38 +4902,11 @@ body::before {
   0%,100% { box-shadow: 0 8px 40px rgba(0,0,0,.45), 0 0 20px rgba(var(--c-rgb),.06), inset 0 1px 0 rgba(0,220,255,.22), inset 0 -1px 0 rgba(0,0,0,.12); }
   50%      { box-shadow: 0 8px 48px rgba(0,0,0,.5),  0 0 48px rgba(var(--c-rgb),.2),  inset 0 1px 0 rgba(0,220,255,.36), inset 0 -1px 0 rgba(0,0,0,.12); }
 }
-.card.running {
-  border-color: rgba(var(--c-rgb),.32);
-  border-top-color: rgba(0,220,255,.5);
-  animation: cardPulse 2.5s ease-in-out infinite;
-}
-.card.done {
-  border-color: rgba(0,232,135,.25);
-  border-top-color: rgba(0,255,150,.38);
-  box-shadow:
-    0 8px 32px rgba(0,0,0,.4),
-    0 0 24px rgba(0,232,135,.05),
-    inset 0 1px 0 rgba(0,232,135,.2),
-    inset 0 -1px 0 rgba(0,0,0,.1);
-}
-.card.error {
-  border-color: rgba(255,51,85,.3);
-  border-top-color: rgba(255,80,110,.42);
-  box-shadow:
-    0 8px 32px rgba(0,0,0,.4),
-    0 0 24px rgba(255,51,85,.06),
-    inset 0 1px 0 rgba(255,100,120,.16),
-    inset 0 -1px 0 rgba(0,0,0,.1);
-}
-.card.waiting {
-  border-color: rgba(255,140,0,.26);
-  border-top-color: rgba(255,160,30,.38);
-  box-shadow:
-    0 8px 32px rgba(0,0,0,.4),
-    0 0 24px rgba(255,140,0,.05),
-    inset 0 1px 0 rgba(255,160,30,.14),
-    inset 0 -1px 0 rgba(0,0,0,.1);
-}
+/* status on a bay: a coloured left rail, no glow (the strip-board identity keeps the console calm) */
+.card.running { border-left: 3px solid var(--band-run); }
+.card.done    { border-left: 3px solid var(--band-done); }
+.card.error   { border-left: 3px solid var(--band-err); }
+.card.waiting { border-left: 3px solid var(--band-wait); }
 
 /* sweep on running */
 .sweep {
@@ -5602,16 +5643,17 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(0,100,160,.38); }
 @media (max-width: 768px) {
   /* Layout: collapse to single column */
   .root {
-    grid-template-columns: 1fr !important;
+    grid-template-columns: minmax(0,1fr) !important;
     grid-template-rows: 48px 1fr;
   }
-  .root.panel-collapsed { grid-template-columns: 1fr !important; }
+  .root.panel-collapsed { grid-template-columns: minmax(0,1fr) !important; }
+  .topbar { min-width: 0; overflow: hidden; }
 
   /* Right panel: hidden by default, shows as full-screen overlay when toggled */
   .right {
     display: none;
     position: fixed; inset: 0; z-index: 250;
-    background: rgba(4,10,22,.98);
+    background: var(--console);
     flex-direction: column;
     padding-bottom: 54px; /* space for mobile nav */
   }
@@ -5623,7 +5665,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(0,100,160,.38); }
   .topbar { padding: 0 10px; gap: 6px; height: 48px; }
   .logo-mark { width: 32px; height: 32px; }
   .logo-text .t2 { display: none; }
-  .logo-text .t1 { font-size: 10px; letter-spacing: .14em; }
+  .logo-text .t1 { font-size: 17px; letter-spacing: .04em; }
   .logo-wrap { margin-right: 2px; gap: 6px; }
   .divider { display: none; }
   .top-stat { padding: 0 6px; }
@@ -6143,7 +6185,8 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(0,100,160,.38); }
         <div class="settings-row" style="gap:8px;flex-wrap:wrap">
           <label class="settings-lbl">Accent color</label>
           <div style="display:flex;gap:6px">
-            <button class="accent-swatch" data-accent="cyan"   style="--sc:rgba(var(--c-rgb),1)"   onclick="setAccent('cyan')"></button>
+            <button class="accent-swatch" data-accent="signal" style="--sc:rgba(91,155,224,1)"  onclick="setAccent('signal')" title="Signal blue (default)"></button>
+            <button class="accent-swatch" data-accent="cyan"   style="--sc:rgba(0,196,232,1)"   onclick="setAccent('cyan')"></button>
             <button class="accent-swatch" data-accent="purple" style="--sc:rgba(140,80,255,1)"  onclick="setAccent('purple')"></button>
             <button class="accent-swatch" data-accent="green"  style="--sc:rgba(0,220,120,1)"   onclick="setAccent('green')"></button>
             <button class="accent-swatch" data-accent="orange" style="--sc:rgba(255,140,40,1)"  onclick="setAccent('orange')"></button>
@@ -8361,49 +8404,60 @@ function renderAgents(data){
     const isNewCard=_newThisRender.has(a.id);
     const domId=a._domId||a.id;  // machine-namespaced when merged from multiple AOC instances, else just a.id
     const isRemote=a._isLocal===false;
-    return `<div id="card-${domId}" class="card ${dispStatus}${isFading?' agent-fading':''}${isCollapsed?' collapsed':''}${isPinned?' pinned':''}${isNewCard?' card-enter':''}" style="${isFading?`opacity:${fadeOpacity.toFixed(3)};`:''}" onclick="${isCollapsed?`toggleCollapse(${jsq(a.id)},event)`:''}">
-      <button class="card-cmp-btn ${_compareIds.includes(a.id)?'selected':''}" data-id="${a.id}" onclick="toggleCompare(${jsq(a.id)},event)" title="${_compareIds.includes(a.id)?'Remove from compare':'Add to compare'}">⊞</button>
-      <button class="card-pin-btn" onclick="togglePin(${jsq(a.id)},event)" title="${isPinned?'Unpin':'Pin to top'}">${isPinned?'◈':'◉'}</button>
-      <button class="card-collapse-btn" onclick="toggleCollapse(${jsq(a.id)},event)" title="${isCollapsed?'Expand':'Collapse'}">▲</button>
-      <button class="card-dismiss" onclick="dismissAgent(${jsq(a.id)},${jsq(a.machine||'')})" title="Dismiss">×</button>
-      ${dispStatus==='running'?'<div class="sweep"></div>':''}
-      ${sessBadge}
-      <div class="card-head">
-        <div class="unit-badge">${_deriveUnit(a)}</div>
-        <div class="card-meta">
-          <div class="card-name">${escHtml(a.name)}</div>
-          <div class="card-desc">${isCollapsed?'':escHtml(a.description||'')}</div>
+    /* Flight strip (same identity as the cloud board): the holder band
+       carries status as colour + glyph + word; the paper face carries the
+       callsign and the figures a controller scans; the back (hidden when
+       collapsed) keeps every drill-down the old card had. Ids/classes other
+       code relies on stay: card-<domId>, cb-<domId> (.cost-badge flash),
+       .prog-fill (FLIP ease), lt-/lp- (logs), .card-cmp-btn. */
+    const _band={running:['▶','Running'],waiting:['■','Waiting'],done:['✓','Done'],error:['✕','Failed']}[dispStatus]||['•',String(dispStatus||'')];
+    const _cur=(a.tasks||[]).find(t=>!t.done);
+    const _curTxt=a.status==='error'?(a.error_message||'Failed'):(tt===0?'No task list':_cur?(_cur.label||''):'All tasks done');
+    const _ticks=(a.tasks||[]).slice(0,14).map(t=>`<b class="${t.done?'on':''}"></b>`).join('')+(tt>14?`<i>+${tt-14}</i>`:'');
+    const _sub=[_deriveUnit(a), a.subagent_type, a.model?String(a.model).replace(/^claude-/,'').replace(/-(\d+)-(\d+)$/,'-$1.$2'):null, sessProj?('// '+sessProj):null].filter(Boolean).map(escHtml).join(' · ');
+    const _tokFmt=n=>{ n=Number(n)||0; return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e5?0:1)+'k':String(n); };
+    const _stuck=_stuckSecs(a);
+    return `<article id="card-${domId}" class="strip-card st-${dispStatus}${isFading?' agent-fading':''}${isCollapsed?' collapsed':''}${isPinned?' pinned':''}${isNewCard?' strip-enter':''}" style="${isFading?`opacity:${fadeOpacity.toFixed(3)};`:''}" onclick="${isCollapsed?`toggleCollapse(${jsq(a.id)},event)`:''}">
+      <div class="sc-band" aria-hidden="true"><span class="sc-glyph">${_band[0]}</span><span class="sc-word">${escHtml(_band[1])}</span></div>
+      <div class="sc-paper">
+        <div class="sc-face">
+          <div class="sc-cell sc-call">
+            <div class="sc-callsign" title="${escHtml(a.description||a.name)}">${isPinned?'<span class="sc-pin" title="Pinned">◈</span>':''}${escHtml(a.name)}</div>
+            <div class="sc-sub">${_sub}</div>
+            <div class="sc-flags">
+              <span class="sr-only">${escHtml(stLabel)}</span>
+              ${isRemote?`<span class="sc-flag" title="From remote machine">⌘ ${escHtml(a.machine)}</span>`:''}
+              ${a.detected_via==='transcript'?`<span class="sc-flag warn" title="${escHtml(_hookMissTitle(a))}">⚠ hook miss</span>`:''}
+              ${_stuck>300?`<span class="sc-flag warn">⚠ stuck ${_stuck<3600?Math.floor(_stuck/60)+'m':Math.floor(_stuck/3600)+'h'}</span>`:''}
+            </div>
+          </div>
+          <div class="sc-cell sc-tasks">
+            <span class="sc-k">Tasks ${tt?`${dt}/${tt}`:''}</span>
+            ${tt?`<span class="sc-ticks">${_ticks}</span>`:''}
+            <div class="sc-prog"><div class="prog-fill" style="width:${pct}%"></div></div>
+            <span class="sc-cur${a.status==='error'?' err':''}">${escHtml(_curTxt)}</span>
+          </div>
+          <div class="sc-cell sc-num"><span class="sc-k">Time</span><span class="sc-v">${elapsedStr||'—'}</span></div>
+          <div class="sc-cell sc-num"><span class="sc-k">Tokens</span><span class="sc-v">${a.tokens_used?_tokFmt(a.tokens_used):'—'}</span></div>
+          <div class="sc-cell sc-num"><span class="sc-k">Cost</span><span class="sc-v">${a.tokens_used?`<span class="cost-badge" data-cost="${a.tokens_used}" id="cb-${domId}">$${_agentCost(a).toFixed(3)}</span>`:'—'}</span></div>
+          <div class="sc-tools">
+            <button class="sc-tool" onclick="openAgentDetail(${jsq(a.id)},event)" title="Agent detail drill-down">INFO</button>
+            <button class="sc-tool card-cmp-btn ${_compareIds.includes(a.id)?'selected':''}" data-id="${a.id}" onclick="toggleCompare(${jsq(a.id)},event)" title="${_compareIds.includes(a.id)?'Remove from compare':'Add to compare'}">⊞</button>
+            <button class="sc-tool" onclick="togglePin(${jsq(a.id)},event)" title="${isPinned?'Unpin':'Pin to top'}">${isPinned?'◈':'◉'}</button>
+            <button class="sc-tool" onclick="toggleCollapse(${jsq(a.id)},event)" title="${isCollapsed?'Show details':'Hide details'}" aria-expanded="${!isCollapsed}">${isCollapsed?'▼':'▲'}</button>
+            <button class="sc-tool" onclick="dismissAgent(${jsq(a.id)},${jsq(a.machine||'')})" title="Dismiss">×</button>
+          </div>
         </div>
-        <div class="status-pill ${dispStatus}"><span class="sdot"></span>${stLabel}</div>
-        ${isRemote?`<span class="hookmiss-badge" style="border-color:var(--c);color:var(--c);background:rgba(var(--c-rgb),.08)" title="From remote machine">⌘ ${escHtml(a.machine)}</span>`:''}
-        ${a.detected_via==='transcript'?`<span class="hookmiss-badge" title="${escHtml(_hookMissTitle(a))}">⚠ HOOK MISS</span>`:''}
-        ${a.tokens_used?`<span class="cost-badge" data-cost="${a.tokens_used}" id="cb-${domId}">$${_agentCost(a).toFixed(3)}</span>`:''}
-        ${isCollapsed?`<span style="font-size:10px;font-family:var(--font2);color:var(--t3);margin-left:6px">${elapsedStr||''}</span>`:`<button class="card-info-btn" onclick="openAgentDetail(${jsq(a.id)},event)" title="Agent detail drill-down [click]">⊕ INFO</button>`}
+        ${isCollapsed?'':`<div class="sc-back">
+          ${a.description&&a.description!==a.name?`<div class="sc-desc">${escHtml(a.description)}</div>`:''}
+          ${tt?`<div class="tasks">${tasks}</div>`:''}
+          ${errorHtml}
+          ${velocityHtml}
+          ${filesHtml}
+          ${logHtml}
+        </div>`}
       </div>
-      <div class="card-body">
-      ${(()=>{ const stuckSecs=_stuckSecs(a); return stuckSecs>300?`<div class="stuck-badge">⚠ STUCK — no progress for ${stuckSecs<3600?Math.floor(stuckSecs/60)+'m':Math.floor(stuckSecs/3600)+'h'}</div>`:''; })()}
-      <div class="tasks">${tasks}</div>
-      ${errorHtml}
-      ${tokensHtml}
-      ${velocityHtml}
-      <div class="prog-row">
-        <div class="arc-wrap">
-          <svg width="40" height="40" viewBox="0 0 40 40" style="transform:rotate(-90deg)">
-            <circle cx="20" cy="20" r="16" fill="none" stroke="rgba(255,255,255,.05)" stroke-width="2.5"/>
-            <circle cx="20" cy="20" r="16" fill="none" stroke="${col}" stroke-width="2.5"
-              stroke-dasharray="${d} ${c}" stroke-linecap="round"
-              style="transition:stroke-dasharray .6s ease;filter:drop-shadow(0 0 4px ${col})"/>
-          </svg>
-          <div class="arc-pct">${pct}%</div>
-        </div>
-        <div class="prog-info">
-          <div class="prog-track"><div class="prog-fill" style="width:${pct}%"></div></div>
-          <div class="prog-lbl"><span>${dt} / ${tt} tasks</span><span style="font-family:var(--font2);color:${a.status==='running'?'var(--c)':a.status==='done'?'var(--g)':'var(--t3)'}">${elapsedStr||a.status.toUpperCase()}</span>${(a.files_changed||[]).length?`<span onclick="setView('files');event.stopPropagation()" style="font-family:var(--font2);font-size:10px;color:var(--t3);cursor:pointer;padding:1px 6px;border-radius:4px;border:1px solid rgba(255,255,255,.08);transition:color .2s" title="View file changes" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">✎ ${(a.files_changed||[]).length}</span>`:''}</div>
-        </div>
-      </div>
-      ${logHtml}
-      </div>
-    </div>`;
+    </article>`;
   }).join('');
 
   /* FLIP-patch: snap each surviving card's bar/arc back to its pre-rebuild
@@ -11235,6 +11289,7 @@ function clearNotes(){
 
 /* ── settings ── */
 const _ACCENT_VARS = {
+  signal: { c:'91,155,224', c2:'47,111,179' },
   cyan:   { c:'0,196,232', c2:'0,150,200' },
   purple: { c:'140,80,255', c2:'100,60,220' },
   green:  { c:'0,220,120', c2:'0,170,90' },
@@ -11345,7 +11400,7 @@ async function _testRemoteMachine(i){
   }
 }
 
-let _accentName = localStorage.getItem('aoc_accent') || 'cyan';
+let _accentName = localStorage.getItem('aoc_accent') || 'signal';
 let _density = localStorage.getItem('aoc_density') || 'normal';
 
 function _applyAccent(name){
