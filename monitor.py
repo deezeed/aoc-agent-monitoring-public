@@ -1406,10 +1406,32 @@ def _backup_history_db():
     except Exception as e:
         _log_bg_error("_backup_history_db", e)
 
+# Heavy, non-urgent DB work (full backup, _db_analytics) waits this long after
+# monitor.py starts: the first ~3 min after a boot/restart the machine is
+# already saturated and /status took 1-15 s (status_stalls.log 2026-09-30).
+_STARTUP_GRACE_S = 180
+_BACKUP_INTERVAL_S = 3600
+
+def _first_backup_delay(now: float, today_backup_mtime) -> float:
+    """Seconds _backup_worker waits before its first backup: at least the
+    startup grace, and if today's snapshot is already fresh (a restart
+    within the hour), the rest of its interval -- restarts used to re-copy
+    the whole DB every time."""
+    delay = _STARTUP_GRACE_S
+    if today_backup_mtime is not None:
+        delay = max(delay, _BACKUP_INTERVAL_S - (now - today_backup_mtime))
+    return min(delay, _BACKUP_INTERVAL_S)
+
 def _backup_worker():
+    today_path = os.path.join(AOC_DIR, "backups", f"history_{datetime.now().strftime('%Y-%m-%d')}.db")
+    try:
+        mtime = os.path.getmtime(today_path)
+    except OSError:
+        mtime = None
+    time.sleep(_first_backup_delay(time.time(), mtime))
     while True:
         _backup_history_db()
-        time.sleep(3600)  # hourly; dated filename means only today's snapshot actually changes
+        time.sleep(_BACKUP_INTERVAL_S)  # hourly; dated filename means only today's snapshot actually changes
 
 threading.Thread(target=_backup_worker, daemon=True).start()
 
@@ -1847,7 +1869,9 @@ def _webhook_notify_worker():
     _waiting_notified = set()
     _cost_spike_notified = set()
     _project_avg_cost_cache = {}
-    _project_avg_cost_cache_at = 0.0
+    # first _db_analytics() refresh (below, every 300 s) lands once the
+    # startup grace is over, not on the very first tick
+    _project_avg_cost_cache_at = time.time() - 300 + _STARTUP_GRACE_S
     _budget_cost_cache = {}
     _budget_cost_cache_at = 0.0
     _budget_notified = set()  # projects already alerted this calendar month
