@@ -2594,14 +2594,27 @@ def _watchdog_pid_alive() -> bool:
 _WATCHDOG_LOG = os.path.join(AOC_DIR, "watchdog.log")
 _SENTINEL_LOG = os.path.join(AOC_DIR, "sentinel.log")
 
+_TAIL_READ_BYTES = 64 * 1024
+
 def _tail_log_lines(path: str, n: int = 20) -> list:
-    """Return the last `n` non-empty, stripped lines of a log file. Simple
-    readlines()-based tail -- watchdog.py/sentinel.py cap these logs at
-    200KB (LOG_MAX_BYTES in each script) so reading the whole file is
-    cheap; no need for a seek-from-end approach."""
+    """Return the last `n` non-empty, stripped lines of a log file. Reads
+    only the last _TAIL_READ_BYTES: watchdog.py/sentinel.py cap their logs
+    at 200KB, but reading all of that on every /status build added up, and
+    on a dev checkout those logs sit in a OneDrive-synced folder where a
+    full read can block for tens of seconds (status_stalls.log, 09-28/09-30)."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = [l.strip() for l in f if l.strip()]
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - _TAIL_READ_BYTES)
+            f.seek(start)
+            data = f.read()
+        if start > 0:
+            # drop the (probably partial) first line
+            nl = data.find(b"\n")
+            data = data[nl + 1:] if nl >= 0 else b""
+        text = data.decode("utf-8", errors="replace")
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
         return lines[-n:]
     except Exception:
         return []
@@ -2714,6 +2727,36 @@ def _build_infra_health() -> dict:
         "kill_audit_7d": kill_events,
         "alert_audit_7d": alert_events,
     }
+
+_infra_health_cache = [None, 0.0]  # [last payload, built-at epoch]
+_infra_health_refresh_lock = threading.Lock()  # held while a background refresh runs
+
+def _infra_health_refresh_bg():
+    try:
+        _infra_health_cache[0] = _build_infra_health()
+        _infra_health_cache[1] = time.time()
+    except Exception:
+        pass
+    finally:
+        _infra_health_refresh_lock.release()
+
+def _infra_health_snapshot():
+    """Non-blocking, for /status -- same pattern as
+    _ngrok_authtoken_configured. _build_infra_health reads log/pid files next
+    to monitor.py; built inline while holding _status_payload_cache_lock, one
+    slow read (OneDrive sync) stalled every /status caller for up to 45 s and
+    got monitor.py restarted by the watchdog (status_stalls.log 2026-09-28
+    16:09). Returns the cached payload (None until the first refresh lands --
+    the dashboard skips a missing infra_health) with a live uptime, and
+    starts one background refresh when it's over 10 s old."""
+    if (time.time() - _infra_health_cache[1] >= 10
+            and _infra_health_refresh_lock.acquire(blocking=False)):
+        threading.Thread(target=_infra_health_refresh_bg, daemon=True,
+                         name="infra-health-refresh").start()
+    cached = _infra_health_cache[0]
+    if cached is None:
+        return None
+    return {**cached, "monitor_uptime_s": time.time() - _PROCESS_START}
 
 def _session_really_active(sess: dict, now_epoch: float, heartbeat_cutoff_s: int = 300) -> bool:
     """A session counts as active if either its heartbeat is recent, OR its
@@ -12296,7 +12339,7 @@ def _build_status_payload_uncached() -> dict:
     }
     with _self_update_lock:
         data["self_update"] = dict(_self_update_status)
-    data["infra_health"] = _build_infra_health()
+    data["infra_health"] = _infra_health_snapshot()
     return data
 
 

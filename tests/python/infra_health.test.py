@@ -21,6 +21,7 @@ ns = exec_functions(
         # module-level globals it reads/writes need seeding the same way
         # DB_FILE/_db_lock are seeded for the DB-backed tests elsewhere.
         "_tail_json_log_cache": {}, "_tail_json_log_cache_lock": threading.Lock(),
+        "_TAIL_READ_BYTES": 64 * 1024,
     },
 )
 _tail_log_lines = ns["_tail_log_lines"]
@@ -54,6 +55,27 @@ try:
     with open(blank_path, "w", encoding="utf-8") as f:
         f.write("\n\n[2026-07-19 10:00:00] real line\n\n")
     c.check("blank lines are skipped", _tail_log_lines(blank_path, 10) == ["[2026-07-19 10:00:00] real line"])
+
+    # only the last _TAIL_READ_BYTES are read -- a file well past that
+    # still yields whole, correct trailing lines (no partial first line)
+    big_path = os.path.join(tmpdir, "big.log")
+    with open(big_path, "w", encoding="utf-8", newline="\n") as f:
+        for i in range(5000):
+            f.write(f"[2026-07-19 10:00:00] Monitor není odpovídá {i:05d}\n")
+    c.check("big file is past the read window", os.path.getsize(big_path) > 2 * ns["_TAIL_READ_BYTES"])
+    big_tail = _tail_log_lines(big_path, 50)
+    c.check("big file: exactly n lines", len(big_tail) == 50)
+    c.check("big file: last line correct", big_tail[-1].endswith("04999"))
+    c.check("big file: first of tail correct", big_tail[0].endswith("04950"))
+    all_tail = _tail_log_lines(big_path, 100000)
+    c.check("big file: window never starts mid-line",
+            all(l.startswith("[2026-07-19") for l in all_tail))
+    c.check("big file: non-ASCII decoded", "není" in big_tail[-1])
+
+    crlf_path = os.path.join(tmpdir, "crlf.log")
+    with open(crlf_path, "wb") as f:
+        f.write(b"[2026-07-19 10:00:00] a\r\n[2026-07-19 10:01:00] b\r\n")
+    c.check("CRLF line endings stripped", _tail_log_lines(crlf_path, 5) == ["[2026-07-19 10:00:00] a", "[2026-07-19 10:01:00] b"])
 
     # ── _parse_log_line_ts ──
     ts = _parse_log_line_ts("[2026-07-19 10:15:30] Monitor restarted (PID 1234)")
