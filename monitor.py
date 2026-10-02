@@ -11116,12 +11116,15 @@ function _layoutTree(agents, childMap, roots, depth){
   const LEVEL_W = 200;
   const NODE_R = 28;
   const pos = {};
-  const yCounters = {};
+  // One row counter for every leaf, whatever its depth. A per-depth counter
+  // let a parent (centred on its children) land on the same row as a
+  // shallower leaf placed earlier, drawing the two nodes on top of each other.
+  let nextY = 0;
   function assignPos(id, d){
     const children = childMap[id]||[];
     if(!children.length){
-      const y = (yCounters[d]||0);
-      yCounters[d] = y + NODE_H;
+      const y = nextY;
+      nextY += NODE_H;
       pos[id] = {x: d*LEVEL_W + NODE_R + 20, y: y + NODE_R + 10};
       return;
     }
@@ -11196,7 +11199,11 @@ function renderTree(data){
   // flat view is the correct, expected state whenever no subagent in the
   // session spawned another subagent itself, not a broken one.
   const hint = !hasHierarchy ? `<text x="${(W/2).toFixed(0)}" y="${H+20}" text-anchor="middle" font-family="Consolas,monospace" font-size="8" fill="${tc.legendHint}" letter-spacing=".08em">no nested subagent delegation in this session</text>` : '';
-  el.innerHTML = `<div style="overflow:auto;width:100%"><svg viewBox="0 0 ${Math.max(W,400)} ${Math.max(H,200)+30}" style="min-width:${Math.max(W,400)}px;background:${tc.panelBg};border-radius:14px;border:1px solid ${tc.panelBorder}">${edgeSvg}${nodeSvg}${hint}</svg></div>`;
+  // Explicit width/height = drawn at 1:1. With only a viewBox the SVG
+  // stretched to the panel width, so a small tree (W~400) blew up 2-3x into
+  // giant hex nodes; a large one now scrolls instead of shrinking.
+  const vw = Math.max(W,400), vh = Math.max(H,200)+30;
+  el.innerHTML = `<div style="overflow:auto;width:100%"><svg width="${vw}" height="${vh}" viewBox="0 0 ${vw} ${vh}" style="display:block;margin:0 auto;background:${tc.panelBg};border-radius:14px;border:1px solid ${tc.panelBorder}">${edgeSvg}${nodeSvg}${hint}</svg></div>`;
 }
 
 function _treeNodeHover(event, agentId){
