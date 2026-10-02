@@ -4757,7 +4757,30 @@ body::before { content:none; }
 .agents.list-mode { display:flex; flex-direction:column; gap:4px; }
 
 /* ── Flight strips (agents view, card mode) ─────────────────────────────── */
-#agents:not(.list-mode) { grid-template-columns:1fr; gap:6px; }
+#agents:not(.list-mode) { grid-template-columns:1fr; gap:14px; }
+/* Session bays: one per CLI session, strips slot into its groove. */
+.sbay { background:var(--bay); border:1px solid var(--bay-edge); border-radius:6px; overflow:hidden; min-width:0; }
+.sbay.waiting { border-color:rgba(224,161,58,.7); box-shadow:0 0 0 1px rgba(224,161,58,.25); }
+.sbay-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px 16px; align-items:center; padding:9px 14px 8px; }
+.sbay-title { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; min-width:0; }
+.sbay-title h2 { font:600 22px/1.05 var(--font3); letter-spacing:.02em; margin:0; color:var(--t); overflow-wrap:anywhere; }
+.sbay.closed .sbay-title h2 { color:var(--t2); }
+.sbay-meta { font:400 12px var(--font2); color:var(--t2); display:flex; gap:12px; flex-wrap:wrap; }
+.sbay-right { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.sbay-counts { display:flex; gap:10px; font:500 12px var(--font2); }
+.sbay-counts b { font-weight:500; }
+.bc-run { color:var(--c); } .bc-err { color:var(--r); } .bc-done { color:var(--g); }
+.bay-state { font:600 12px var(--font3); letter-spacing:.14em; text-transform:uppercase; padding:2px 8px; border-radius:3px; border:1px solid var(--bay-edge); color:var(--t2); white-space:nowrap; }
+.bay-state.active { color:var(--t); }
+.bay-state.waiting { color:var(--console); background:var(--o); border-color:var(--o); }
+.bay-btn { background:none; border:1px solid var(--bay-edge); color:var(--t2); border-radius:3px; min-width:28px; height:24px; padding:0 7px; font:600 12px var(--font3); letter-spacing:.08em; text-transform:uppercase; cursor:pointer; }
+.bay-btn:hover { color:var(--t); border-color:var(--t3); }
+.bay-btn:focus-visible { outline:2px solid var(--o); outline-offset:1px; }
+.sbay-slots { background:var(--groove); border-top:1px solid var(--bay-edge); padding:8px 10px 10px; display:flex; flex-direction:column; gap:6px; }
+@media (max-width: 900px) {
+  .sbay-head { grid-template-columns:1fr; }
+  .sbay-right { justify-content:flex-start; }
+}
 .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
 .strip-card { --band: var(--band-run); display:grid; grid-template-columns:34px 1fr; border-radius:3px; box-shadow:0 1px 0 rgba(0,0,0,.45); }
 .strip-card.st-done    { --band: var(--band-done); }
@@ -8111,6 +8134,67 @@ function _graphEdgeClick(idA, idB){
 
 
 /* ── render agents ── */
+/* Group already-sorted agents into session bays, in order of first
+   appearance. Key is machine + session_id: two machines can't share a
+   session id in practice, but merged remote data must never fold into a
+   local bay. Agents with no session_id share one "unattached" bay. */
+function _groupIntoBays(agents, sessionsList){
+  const bays=[], byKey=new Map();
+  agents.forEach(a=>{
+    const key=(a.machine||'')+'|'+(a.session_id||'');
+    let bay=byKey.get(key);
+    if(!bay){
+      const s=a.session_id ? (sessionsList||[]).find(s=>s.id===a.session_id&&(s.machine||'')===(a.machine||'')) : null;
+      bay={key, session:s||null, sessionId:a.session_id||null, machine:a.machine||'', isRemote:a._isLocal===false, project:a.session_project||'', agents:[]};
+      byKey.set(key,bay); bays.push(bay);
+    }
+    bay.agents.push(a);
+  });
+  return bays;
+}
+
+const _collapsedBays=new Set();
+function toggleBay(key){
+  _collapsedBays.has(key)?_collapsedBays.delete(key):_collapsedBays.add(key);
+  if(lastStatus) renderAgents(lastStatus);
+}
+
+function _sessionBayHtml(bay, stripsHtml){
+  const s=bay.session||{};
+  const cwdBase=s.cwd?(s.cwd.replace(/\\/g,'/').split('/').filter(Boolean).pop()||''):'';
+  const title=s.display_name||s.project||bay.project||cwdBase||(bay.sessionId?'CLI session':'Unattached agents');
+  const active=bay.session ? s.session_active!==false : null;
+  const waiting=active&&!!s.waiting_on_you;
+  const state=active===null?''
+    : waiting?`<span class="bay-state waiting">Waiting on you${(s.waiting_secs||0)>=60?' · '+_fmtDurationDHM(s.waiting_secs):''}</span>`
+    : active?'<span class="bay-state active">Working</span>'
+    : '<span class="bay-state">Closed</span>';
+  const tok=(s.input_tokens||0)+(s.output_tokens||0);
+  const fmtTok=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e5?0:1)+'k':String(n);
+  const model=s.model?String(s.model).replace(/^claude-/,'').replace(/-(\d+)-(\d+)$/,' $1.$2'):'';
+  const meta=[
+    bay.isRemote&&bay.machine?'⌘ '+bay.machine:null,
+    model||null,
+    s.git_branch&&s.git_branch!=='HEAD'?'⎇ '+s.git_branch:null,
+    s.msg_count?s.msg_count+' msg':null,
+    tok?fmtTok(tok)+' tok':null,
+    s.estimated_cost?'$'+Number(s.estimated_cost).toFixed(2):null,
+  ].filter(Boolean).map(x=>`<span>${escHtml(x)}</span>`).join('');
+  const n={run:0,err:0,done:0};
+  bay.agents.forEach(a=>{ if(a.status==='error') n.err++; else if(a.status==='done') n.done++; else n.run++; });
+  const counts=[n.run?`<b class="bc-run">${n.run} active</b>`:'', n.err?`<b class="bc-err">${n.err} failed</b>`:'', n.done?`<b class="bc-done">${n.done} done</b>`:''].filter(Boolean).join('');
+  const collapsed=_collapsedBays.has(bay.key);
+  const dismiss=active===false?`<button class="bay-btn" onclick="_dismissSession(${jsq(bay.sessionId)},${jsq(bay.machine)})" title="Dismiss closed session">Dismiss</button>`:'';
+  return `<section class="sbay${waiting?' waiting':''}${active===false?' closed':''}${collapsed?' collapsed':''}" data-bay="${escHtml(bay.key)}">
+    <header class="sbay-head">
+      <div class="sbay-title"><h2 title="${escHtml(s.cwd||title)}">${escHtml(title)}</h2><span class="sbay-meta">${meta}</span></div>
+      <div class="sbay-right"><span class="sbay-counts">${counts}</span>${state}${dismiss}
+        <button class="bay-btn" onclick="toggleBay(${jsq(bay.key)})" aria-expanded="${!collapsed}" title="${collapsed?'Show':'Hide'} this session's agents">${collapsed?'▼':'▲'}</button></div>
+    </header>
+    ${collapsed?'':`<div class="sbay-slots">${stripsHtml}</div>`}
+  </section>`;
+}
+
 function renderAgents(data){
   const mainArea=document.getElementById('main-area');
   let running=0, done=0, errors=0, totalT=0, doneT=0;
@@ -8282,7 +8366,7 @@ function renderAgents(data){
     };
   });
 
-  agentsEl.innerHTML=visibleAgents.map(a=>{
+  const _stripHtml=visibleAgents.map(a=>{
     const dt=(a.tasks||[]).filter(t=>t.done).length;
     const tt=(a.tasks||[]).length;
     const pct=tt>0?Math.round(dt/tt*100):0;
@@ -8399,7 +8483,8 @@ function renderAgents(data){
     const _cur=(a.tasks||[]).find(t=>!t.done);
     const _curTxt=a.status==='error'?(a.error_message||'Failed'):(tt===0?'No task list':_cur?(_cur.label||''):'All tasks done');
     const _ticks=(a.tasks||[]).slice(0,14).map(t=>`<b class="${t.done?'on':''}"></b>`).join('')+(tt>14?`<i>+${tt-14}</i>`:'');
-    const _sub=[_deriveUnit(a), a.subagent_type, a.model?String(a.model).replace(/^claude-/,'').replace(/-(\d+)-(\d+)$/,'-$1.$2'):null, sessProj?('// '+sessProj):null].filter(Boolean).map(escHtml).join(' · ');
+    /* No "// project" here: the session bay around the strip already names it. */
+    const _sub=[_deriveUnit(a), a.subagent_type, a.model?String(a.model).replace(/^claude-/,'').replace(/-(\d+)-(\d+)$/,'-$1.$2'):null].filter(Boolean).map(escHtml).join(' · ');
     const _tokFmt=n=>{ n=Number(n)||0; return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e5?0:1)+'k':String(n); };
     const _stuck=_stuckSecs(a);
     return `<article id="card-${domId}" class="strip-card st-${dispStatus}${isFading?' agent-fading':''}${isCollapsed?' collapsed':''}${isPinned?' pinned':''}${isNewCard?' strip-enter':''}" style="${isFading?`opacity:${fadeOpacity.toFixed(3)};`:''}" onclick="${isCollapsed?`toggleCollapse(${jsq(a.id)},event)`:''}">
@@ -8443,7 +8528,15 @@ function renderAgents(data){
         </div>`}
       </div>
     </article>`;
-  }).join('');
+  });
+
+  /* Session bays (same identity as the cloud board): every CLI session is a
+     bay holding its own strips. Bays keep visibleAgents' order -- a bay
+     sits where its highest-priority strip would have, so pinned/running
+     work still comes first. */
+  const _htmlById=new Map(visibleAgents.map((a,i)=>[a,_stripHtml[i]]));
+  agentsEl.innerHTML=_groupIntoBays(visibleAgents, data.sessions_list||[])
+    .map(bay=>_sessionBayHtml(bay, bay.agents.map(a=>_htmlById.get(a)).join(''))).join('');
 
   /* FLIP-patch: snap each surviving card's bar/arc back to its pre-rebuild
      value, force a reflow, then let the next frame ease to the real target —
