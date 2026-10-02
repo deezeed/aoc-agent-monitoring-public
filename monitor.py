@@ -6435,6 +6435,7 @@ let _soundPanelOpen = false;
 let _theme = (typeof matchMedia!=='undefined' && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
 let _collapsedIds = new Set();
 let _pinnedIds = new Set();
+let _collapsedBays = new Set();  // session bay keys (machine|session_id), saved in aoc_prefs
 let _prevTokens = {};
 let _notifHistory = [];
 let _notifUnread = 0;
@@ -7028,7 +7029,7 @@ function _mnavToggleLogs(force){
   if(btn) btn.classList.toggle('active', _mnavLogsOpen);
 }
 function _savePrefs(){
-  try{ localStorage.setItem('aoc_prefs',JSON.stringify({view:currentView,list:listMode,sf:statusFilter,muted:_soundMuted,theme:_theme,collapsed:[..._collapsedIds],pinned:[..._pinnedIds],panelCollapsed:_panelCollapsed})); }catch(e){}
+  try{ localStorage.setItem('aoc_prefs',JSON.stringify({view:currentView,list:listMode,sf:statusFilter,muted:_soundMuted,theme:_theme,collapsed:[..._collapsedIds],pinned:[..._pinnedIds],bays:[..._collapsedBays],panelCollapsed:_panelCollapsed})); }catch(e){}
 }
 function _loadPrefs(){
   try{
@@ -7038,14 +7039,18 @@ function _loadPrefs(){
     // view at all and leave the main area blank for returning users.
     let v=p.view;
     if(v==='cards') v=(p.cardsTab==='cli')?'cli':'agents';
-    if(v) { currentView=v; setView(v); }
     if(p.list)  listMode=p.list;
     if(p.sf && p.sf!=='all') statusFilter=p.sf;
     if(p.muted) { _soundMuted=true; _applyMuteUI(); }
     if(p.theme) { _theme=p.theme; _applyTheme(); }
     if(Array.isArray(p.collapsed)) _collapsedIds=new Set(p.collapsed);
     if(Array.isArray(p.pinned)) _pinnedIds=new Set(p.pinned);
+    if(Array.isArray(p.bays)) _collapsedBays=new Set(p.bays.filter(k=>typeof k==='string'));
     if(p.panelCollapsed){ _panelCollapsed=true; document.querySelector('.root').classList.add('panel-collapsed'); const btn=document.getElementById('panel-toggle-btn'); if(btn) btn.textContent='▶'; }
+    // Last: setView() calls _savePrefs(), so running it before the state
+    // above was restored wrote them back empty -- pinned/collapsed/panel state
+    // survived one reload and was gone on the next.
+    if(v) { currentView=v; setView(v); }
   }catch(e){}
 }
 function togglePin(id, event){
@@ -8153,9 +8158,15 @@ function _groupIntoBays(agents, sessionsList){
   return bays;
 }
 
-const _collapsedBays=new Set();
 function toggleBay(key){
-  _collapsedBays.has(key)?_collapsedBays.delete(key):_collapsedBays.add(key);
+  if(_collapsedBays.has(key)) _collapsedBays.delete(key);
+  else {
+    _collapsedBays.add(key);
+    // Keys of long-gone sessions are never cleaned up otherwise; a Set keeps
+    // insertion order, so drop the oldest beyond 50.
+    while(_collapsedBays.size>50) _collapsedBays.delete(_collapsedBays.values().next().value);
+  }
+  _savePrefs();
   if(lastStatus) renderAgents(lastStatus);
 }
 
