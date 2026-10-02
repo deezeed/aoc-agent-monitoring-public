@@ -24,7 +24,7 @@ conn.executescript("""
         agents INTEGER DEFAULT 0, done INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
         tokens INTEGER DEFAULT 0, cost REAL DEFAULT 0,
         task_done INTEGER DEFAULT 0, task_total INTEGER DEFAULT 0,
-        file_count INTEGER DEFAULT 0, snapshot TEXT, cc_version TEXT, waiting_on_you_s INTEGER DEFAULT 0, tags TEXT DEFAULT ''
+        file_count INTEGER DEFAULT 0, snapshot TEXT, cc_version TEXT, waiting_on_you_s INTEGER DEFAULT 0, tags TEXT DEFAULT '', title TEXT
     );
     CREATE TABLE agents (
         rowid_ INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, agent_id TEXT,

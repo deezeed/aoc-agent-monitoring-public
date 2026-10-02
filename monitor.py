@@ -162,6 +162,84 @@ def _iso_utc_to_local_hms(iso_ts: str) -> str:
     except Exception:
         return _now_ts()
 
+def _transcript_session_times(first_ts: str, last_ts: str):
+    """(date, started_at, ended_at, duration_s) for a History row, from a
+    transcript's first/last UTC ISO timestamps, in local wall-clock time like
+    every other row. The scanner used to slice the raw UTC string instead, so
+    plain CLI sessions (no subagents, never saved by _db_save_session) showed
+    a start time hours off, a date that could be the wrong day, and no end
+    or duration at all. Unparseable input gives empty strings / 0 so the
+    caller can keep whatever the row already had."""
+    def _epoch(iso):
+        try:
+            dt = datetime.strptime(str(iso).split(".")[0].rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+            return calendar.timegm(dt.timetuple())
+        except Exception:
+            return None
+    e1, e2 = _epoch(first_ts), _epoch(last_ts)
+    if e1 is None:
+        return "", "", "", 0
+    date = time.strftime("%Y-%m-%d", time.localtime(e1))
+    started = time.strftime("%H:%M:%S", time.localtime(e1))
+    if e2 is None or e2 < e1:
+        return date, started, "", 0
+    return date, started, time.strftime("%H:%M:%S", time.localtime(e2)), int(e2 - e1)
+
+def _db_upsert_transcript_session(c, sid, project, first_ts, last_ts,
+                                  tokens=None, cost=None, cc_version="", title=""):
+    """Create/refresh a History row from a CLI session's transcript. tokens/
+    cost None = keep the row's (the startup backfill only repairs times and
+    title). Never blanks a value it can't derive; duration only grows, so a
+    longer span already recorded by _db_save_session isn't shortened; tags
+    and a user-edited project are never touched.
+
+    The start never moves later: a transcript can be rewritten (compaction,
+    resume) so its first line may postdate the real start the row already
+    holds -- the earlier of the two wins and the duration counts from it.
+    Rows the old scanner wrote (recognisable by ended_at IS NULL: it never
+    set one) hold that start as raw UTC, so it's read back as UTC."""
+    prev = c.execute("SELECT date, started_at, ended_at, duration_s FROM sessions WHERE id=?", (sid,)).fetchone()
+    if prev and prev[0] and prev[1]:
+        try:
+            st = time.strptime(f"{prev[0]} {prev[1]}", "%Y-%m-%d %H:%M:%S")
+            prev_epoch = calendar.timegm(st) if prev[2] is None else time.mktime(st)
+            prev_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(prev_epoch))
+            first_ts = min(first_ts, prev_iso) if _transcript_session_times(first_ts, "")[0] else prev_iso
+        except (ValueError, OverflowError):
+            pass
+    # The end never moves earlier either: after a restart the scanner can
+    # briefly hold an older last_ts than the one already stored. The stored
+    # span is start + duration_s (ended_at alone has no date to compare).
+    if prev and (prev[3] or 0) > 0:
+        _, _, _, dur0 = _transcript_session_times(first_ts, last_ts)
+        if prev[3] > dur0:
+            try:
+                e_start = calendar.timegm(time.strptime(str(first_ts).split(".")[0].rstrip("Z"), "%Y-%m-%dT%H:%M:%S"))
+                last_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e_start + prev[3]))
+            except (ValueError, OverflowError):
+                pass
+    date, started, ended, dur = _transcript_session_times(first_ts, last_ts)
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+    c.execute("""
+        INSERT INTO sessions (id, project, date, started_at, ended_at, duration_s,
+                              tokens, cost, cc_version, title)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tokens     = COALESCE(?, tokens),
+            cost       = COALESCE(?, cost),
+            project    = CASE WHEN project = '' OR project IS NULL
+                              THEN excluded.project ELSE project END,
+            date       = CASE WHEN ? = '' THEN date ELSE excluded.date END,
+            started_at = CASE WHEN excluded.started_at = '' THEN started_at ELSE excluded.started_at END,
+            ended_at   = CASE WHEN COALESCE(excluded.ended_at, '') = '' THEN ended_at ELSE excluded.ended_at END,
+            duration_s = MAX(COALESCE(duration_s, 0), excluded.duration_s),
+            cc_version = COALESCE(NULLIF(excluded.cc_version, ''), cc_version),
+            title      = COALESCE(NULLIF(excluded.title, ''), title)
+    """, (sid, project or "", date, started, ended or None, dur,
+          tokens or 0, cost or 0.0, cc_version or "", title or "",
+          tokens, cost, started))
+
 def _load_json_file(path, default=None):
     """Shared open+json.load+except-return-default boilerplate -- this
     exact 4-line shape was independently repeated 5 times (known-CC-versions,
@@ -349,6 +427,13 @@ def _init_db():
         # activity.
         try:
             c.execute("ALTER TABLE sessions ADD COLUMN tags TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        # The session's own name (user-set display name or Claude's
+        # ai-title), so History can say "Phantom AI" instead of the cwd
+        # folder every session started from the home directory shares.
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
         except sqlite3.OperationalError:
             pass
         c.commit()
@@ -558,11 +643,22 @@ def _db_save_session(status: dict, sid: str = None):
             """, (sid,)).fetchone()
 
             c.execute("""
-                INSERT OR REPLACE INTO sessions
+                INSERT INTO sessions
                 (id, project, date, started_at, ended_at, duration_s,
                  agents, done, errors, tokens, cost, task_done, task_total, file_count, snapshot, cc_version,
                  waiting_on_you_s)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                -- Upsert, not INSERT OR REPLACE: REPLACE deletes the row
+                -- first, so every auto-save of a live session wiped the
+                -- tags (and title) a user had already put on it.
+                ON CONFLICT(id) DO UPDATE SET
+                    project=excluded.project, date=excluded.date, started_at=excluded.started_at,
+                    ended_at=excluded.ended_at, duration_s=excluded.duration_s,
+                    agents=excluded.agents, done=excluded.done, errors=excluded.errors,
+                    tokens=excluded.tokens, cost=excluded.cost, task_done=excluded.task_done,
+                    task_total=excluded.task_total, file_count=excluded.file_count,
+                    snapshot=excluded.snapshot, cc_version=excluded.cc_version,
+                    waiting_on_you_s=excluded.waiting_on_you_s
             """, (sid, project, date, started_at, ended_at, dur_s,
                   totals["agents"], totals["done"] or 0, totals["errors"] or 0,
                   totals["tokens"] or 0, totals["cost"] or 0.0,
@@ -634,7 +730,7 @@ def _db_get_sessions(limit=100):
             c = _db_conn()
             rows = c.execute("""
                 SELECT id, project, date, started_at, ended_at, duration_s,
-                       agents, done, errors, tokens, cost, task_done, task_total, file_count, cc_version, tags
+                       agents, done, errors, tokens, cost, task_done, task_total, file_count, cc_version, tags, title
                 FROM sessions ORDER BY rowid DESC LIMIT ?
             """, (limit,)).fetchall()
             c.close()
@@ -659,13 +755,13 @@ def _db_search_sessions(query: str = "", date_from: str = "", date_to: str = "",
             like = f"%{query}%"
             rows = c.execute("""
                 SELECT id, project, date, started_at, ended_at, duration_s,
-                       agents, done, errors, tokens, cost, task_done, task_total, file_count, cc_version, tags
+                       agents, done, errors, tokens, cost, task_done, task_total, file_count, cc_version, tags, title
                 FROM sessions
-                WHERE (? = '' OR project LIKE ? OR id LIKE ? OR tags LIKE ?)
+                WHERE (? = '' OR project LIKE ? OR id LIKE ? OR tags LIKE ? OR title LIKE ?)
                   AND (? = '' OR date >= ?)
                   AND (? = '' OR date <= ?)
                 ORDER BY rowid DESC LIMIT ?
-            """, (query, like, like, like, date_from, date_from, date_to, date_to, limit)).fetchall()
+            """, (query, like, like, like, like, date_from, date_from, date_to, date_to, limit)).fetchall()
             c.close()
             out = [dict(r) for r in rows]
             for r in out:
@@ -4045,28 +4141,22 @@ def _transcript_scanner_worker():
                     total_tokens = stats.get("input_tokens", 0) + stats.get("output_tokens", 0)
                     estimated_cost = stats.get("estimated_cost", 0.0)
                     if total_tokens > 0 or estimated_cost > 0:
-                        first_ts = stats.get("first_ts", "")
-                        date_str = first_ts[:10] if len(first_ts) >= 10 else datetime.now().strftime("%Y-%m-%d")
-                        started_str = first_ts[11:19] if len(first_ts) >= 19 else ""
                         # Prefer in-memory project (set by hook) over decoded path (may fail for long paths)
                         db_project = sess.get("project", "") or project_name or ""
                         try:
                             with _db_lock:
                                 c = _db_conn()
-                                c.execute("""
-                                    INSERT INTO sessions (id, project, date, started_at, tokens, cost)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                    ON CONFLICT(id) DO UPDATE SET
-                                        tokens = excluded.tokens,
-                                        cost   = excluded.cost,
-                                        project = CASE WHEN project = '' OR project IS NULL
-                                                       THEN excluded.project ELSE project END
-                                """, (session_id, db_project, date_str, started_str,
-                                      total_tokens, estimated_cost))
+                                _db_upsert_transcript_session(
+                                    c, session_id, db_project,
+                                    sess.get("first_ts") or stats.get("first_ts", ""),
+                                    sess.get("last_ts") or stats.get("last_ts", ""),
+                                    total_tokens, estimated_cost,
+                                    sess.get("cc_version") or stats.get("cc_version") or "",
+                                    sess.get("display_name") or ai_title or "")
                                 c.commit()
                                 c.close()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _log_bg_error("_transcript_scanner_worker/db", e)
 
         except Exception as e:
             _log_bg_error("_transcript_scanner_worker", e)
@@ -4075,6 +4165,75 @@ def _transcript_scanner_worker():
 
 
 _threading.Thread(target=_transcript_scanner_worker, daemon=True).start()
+
+
+_TS_RE = re.compile(r'"timestamp"\s*:\s*"([0-9T:.\-]+Z?)"')
+
+def _transcript_span(path: str):
+    """(first_ts, last_ts, ai_title) of a whole transcript, streamed line by
+    line -- a regex for the timestamp, full JSON only for ai-title lines, so
+    multi-MB transcripts stay cheap. The LAST ai-title wins: Claude Code
+    re-titles a session as it goes."""
+    first = last = title = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = _TS_RE.search(line)
+                if m:
+                    if not first:
+                        first = m.group(1)
+                    last = m.group(1)
+                if '"ai-title"' in line:
+                    try:
+                        title = json.loads(line).get("aiTitle", "") or title
+                    except Exception:
+                        pass
+    except OSError:
+        pass
+    return first, last, _fix_mojibake(title) if title else ""
+
+def _db_backfill_transcript_sessions(projects_base=None):
+    """One pass at startup over History rows written before the scanner
+    recorded end time / duration / title (and while it stored UTC start
+    times): re-derive them from each session's transcript if it still
+    exists. A repaired row gets a non-NULL title ('' when the transcript has
+    none), so it isn't re-read on the next start. Returns rows repaired."""
+    projects_base = projects_base or os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    try:
+        with _db_lock:
+            c = _db_conn()
+            ids = [r[0] for r in c.execute(
+                "SELECT id FROM sessions WHERE ended_at IS NULL OR title IS NULL").fetchall()]
+            c.close()
+        if not ids or not os.path.isdir(projects_base):
+            return 0
+        wanted = set(ids)
+        paths = {}
+        for proj in os.listdir(projects_base):
+            d = os.path.join(projects_base, proj)
+            if not os.path.isdir(d):
+                continue
+            for fname in os.listdir(d):
+                if fname.endswith(".jsonl") and fname[:-6] in wanted:
+                    paths[fname[:-6]] = os.path.join(d, fname)
+        fixed = 0
+        for sid, path in paths.items():
+            first, last, title = _transcript_span(path)
+            if not first:
+                continue
+            with _db_lock:
+                c = _db_conn()
+                _db_upsert_transcript_session(c, sid, "", first, last, title=title)
+                c.execute("UPDATE sessions SET title = COALESCE(title, '') WHERE id = ?", (sid,))
+                c.commit()
+                c.close()
+            fixed += 1
+        return fixed
+    except Exception as e:
+        _log_bg_error("_db_backfill_transcript_sessions", e)
+        return 0
+
+_threading.Thread(target=_db_backfill_transcript_sessions, daemon=True).start()
 
 
 # ── Audit Log ─────────────────────────────────────────────────────────────────
@@ -5159,6 +5318,7 @@ button.le-tag { cursor:pointer; }
 .hist-row:hover { background:rgba(var(--c-rgb),.06);border-color:rgba(var(--c-rgb),.2); }
 .hist-row .hr-date { font-family:var(--font2);font-size:10px;color:var(--t3);min-width:82px;flex-shrink:0; }
 .hist-row .hr-project { font-size:12px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.hist-row .hr-proj2 { font:400 11px var(--font2);color:var(--t3);margin-left:4px; }
 .hist-row .hr-chips { display:flex;gap:5px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end; }
 .hist-chip { font-family:var(--font2);font-size:9px;padding:1px 7px;border-radius:4px;border:1px solid;letter-spacing:.05em; }
 .hist-chip.ok   { border-color:rgba(76,194,133,.3);color:rgba(76,194,133,.85);background:rgba(76,194,133,.06); }
@@ -9097,7 +9257,7 @@ async function renderHistory(){
         <div class="adp-tab ${_histTab==='sessions'?'active':''}" onclick="_histTab='sessions';renderHistory()">SESSIONS</div>
         <div class="adp-tab ${_histTab==='analytics'?'active':''}" onclick="_histTab='analytics';renderHistory()">ANALYTICS</div>
       </div>
-      ${_histTab==='sessions'?`<input type="text" id="hist-search-input" placeholder="Filter by project, id, or tag..." value="${escHtml(_histSearchQuery)}" oninput="setHistSearch(this.value)" style="font-family:var(--font2);font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:10px;width:150px">
+      ${_histTab==='sessions'?`<input type="text" id="hist-search-input" placeholder="Filter by name, project, id, or tag..." value="${escHtml(_histSearchQuery)}" oninput="setHistSearch(this.value)" style="font-family:var(--font2);font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:10px;width:150px">
       <input type="date" id="hist-search-from" value="${escHtml(_histSearchFrom)}" oninput="setHistDateFrom(this.value)" title="From date" style="font-family:var(--font2);font-size:11px;padding:4px 8px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:6px">
       <input type="date" id="hist-search-to" value="${escHtml(_histSearchTo)}" oninput="setHistDateTo(this.value)" title="To date" style="font-family:var(--font2);font-size:11px;padding:4px 8px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:6px">`:''}
       ${_histTab==='analytics'?(()=>{
@@ -9511,9 +9671,9 @@ async function _renderHistSessionsBody(){
       return `
       <div class="hist-row" onclick="${onclick}">
         <span class="hr-date">${s.started_at||'—'} – ${s.ended_at||'—'}</span>
-        <span class="hr-project">${escHtml(s.project||'(no project)')}${isRemote?` <span style="color:var(--c);opacity:.7">⌘ ${escHtml(s.machine)}</span>`:''}${(s.tags||[]).map(t=>`<button class="le-tag" style="margin-left:6px" onclick="event.stopPropagation();setHistSearch(${jsq(t)})" title="Filter History by this tag">${escHtml(t)}</button>`).join('')}</span>
+        <span class="hr-project">${s.title?`${escHtml(s.title)}${s.project?` <span class="hr-proj2">// ${escHtml(s.project)}</span>`:''}`:escHtml(s.project||'(no project)')}${isRemote?` <span style="color:var(--c);opacity:.7">⌘ ${escHtml(s.machine)}</span>`:''}${(s.tags||[]).map(t=>`<button class="le-tag" style="margin-left:6px" onclick="event.stopPropagation();setHistSearch(${jsq(t)})" title="Filter History by this tag">${escHtml(t)}</button>`).join('')}</span>
         <span class="hr-chips">
-          <span class="hist-chip ok">${s.done||0}✓ ${s.agents||0}ag</span>
+          ${s.agents>0?`<span class="hist-chip ok">${s.done||0}✓ ${s.agents}ag</span>`:''}
           ${s.task_total>0?`<span class="hist-chip cost">${s.task_done||0}/${s.task_total}t</span>`:''}
           ${s.errors>0?`<span class="hist-chip err">${s.errors}✗</span>`:''}
           ${isOutlier?`<span class="hookmiss-badge" title="${fmtCost(s.cost)} vs. this project's own ${fmtCost(projectAvg)} average session cost">⚡ OUTLIER</span>`:''}

@@ -27,7 +27,7 @@ try:
             agents INTEGER DEFAULT 0, done INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
             tokens INTEGER DEFAULT 0, cost REAL DEFAULT 0,
             task_done INTEGER DEFAULT 0, task_total INTEGER DEFAULT 0,
-            file_count INTEGER DEFAULT 0, snapshot TEXT, cc_version TEXT, tags TEXT DEFAULT ''
+            file_count INTEGER DEFAULT 0, snapshot TEXT, cc_version TEXT, tags TEXT DEFAULT '', title TEXT
         )
     """)
     # 250 rows spread across 3 projects and a range of dates, so we can
@@ -37,9 +37,10 @@ try:
         proj = ["AOC", "PHANTOM AI", "AOC Monitor"][i % 3]
         date = f"2026-01-{(i % 28) + 1:02d}"
         rows.append((f"sess-{i}", proj, "", date, "10:00:00", "10:30:00", 1800,
-                      1, 1, 0, 1000, 0.5, 1, 1, 0, None, None, ""))
+                      1, 1, 0, 1000, 0.5, 1, 1, 0, None, None, "",
+                      "Stripe webhook retries" if i == 7 else None))
     conn.executemany(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
     )
     conn.commit()
     conn.close()
@@ -47,6 +48,11 @@ try:
     # 1. no filters at all -> capped only by the `limit` param, not stuck at 100
     all_results = _db_search_sessions(limit=250)
     c.check("no filters, limit=250 -> all 250 rows reachable (beyond the old 100-row cap)", len(all_results) == 250)
+
+    # 1b. session title (ai-title / display name) is searchable too
+    by_title = _db_search_sessions(query="webhook retr")
+    c.check("session title substring match finds exactly that session",
+            [r["id"] for r in by_title] == ["sess-7"] and by_title[0]["title"] == "Stripe webhook retries")
 
     # 2. project name substring match
     aoc_only = _db_search_sessions(query="AOC")
