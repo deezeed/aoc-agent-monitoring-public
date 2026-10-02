@@ -2645,17 +2645,13 @@ def _reap_stray_tunnel_process():
         _log_bg_error("_reap_stray_tunnel_process", e)
     _clear_tunnel_pid()
 
-def _pid_exe_name(pid) -> str:
-    """Return the lowercase exe filename for a live PID via a
-    CreateToolhelp32Snapshot walk (fast, subprocess-free) -- mirrors
-    aoc_hook.py's own ancestor-walk technique rather than shelling out to
-    tasklist, since this needs to run on every /status computation.
-    Confirmed ~7ms/call for the full ancestor-walk version of this same
-    snapshot technique; a single-PID lookup is at least as fast. Shared by
-    every PID-liveness check in this file so the ctypes structure
-    definition isn't duplicated per caller."""
-    if not pid:
-        return ""
+def _snapshot_processes():
+    """[(pid, lowercase exe name)] for every running process, from one
+    CreateToolhelp32Snapshot walk (fast, subprocess-free -- the technique
+    aoc_hook.py's own ancestor walk uses; ~7ms). None if the snapshot
+    itself fails, so callers can tell "no such process" from "couldn't
+    look". Shared by every process check in this file so the ctypes
+    structure definition isn't duplicated per caller."""
     import ctypes
     from ctypes import wintypes
 
@@ -2678,20 +2674,31 @@ def _pid_exe_name(pid) -> str:
         kernel32 = ctypes.windll.kernel32
         snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if not snapshot or snapshot == -1:
-            return ""
+            return None
+        out = []
         try:
             entry = PROCESSENTRY32()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
             if kernel32.Process32First(snapshot, ctypes.byref(entry)):
                 while True:
-                    if entry.th32ProcessID == pid:
-                        return entry.szExeFile.decode("mbcs", "ignore").lower()
+                    out.append((entry.th32ProcessID, entry.szExeFile.decode("mbcs", "ignore").lower()))
                     if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
                         break
         finally:
             kernel32.CloseHandle(snapshot)
+        return out
     except Exception:
-        pass
+        return None
+
+def _pid_exe_name(pid) -> str:
+    """Return the lowercase exe filename for a live PID ("" if gone) --
+    see _snapshot_processes. Runs on every /status computation, hence no
+    tasklist."""
+    if not pid:
+        return ""
+    for p, exe in _snapshot_processes() or ():
+        if p == pid:
+            return exe
     return ""
 
 def _is_claude_pid_alive(pid) -> bool:
@@ -3470,7 +3477,8 @@ _threading.Thread(target=_digest_worker, daemon=True).start()
 _claude_proc_count = [0]  # cached count of running claude.exe processes
 
 def _claude_proc_worker():
-    """Background thread: count running claude.exe processes every 2 seconds.
+    """Background thread: count running claude.exe processes every 2 seconds
+    (via _snapshot_processes; tasklist only as a fallback).
     Was 10s, which — stacked with the /events WS heartbeat — meant a closed CLI
     could take up to ~12s to disappear from the dashboard's total-CLI count.
     Also wakes any connected /events WebSocket immediately when the count
@@ -3479,11 +3487,19 @@ def _claude_proc_worker():
     _cflags = _sp.CREATE_NO_WINDOW if os.name == "nt" else 0
     while True:
         try:
-            r = _sp.run(
-                ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=5, creationflags=_cflags
-            )
-            new_count = r.stdout.count("claude.exe")
+            # In-process snapshot first: spawning tasklist every 2s (~43k
+            # processes a day) regularly blew its 5s timeout under load,
+            # freezing the CLI count. tasklist stays as the fallback for a
+            # failed snapshot only.
+            procs = _snapshot_processes()
+            if procs is not None:
+                new_count = sum(1 for _, exe in procs if exe == "claude.exe")
+            else:
+                r = _sp.run(
+                    ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=5, creationflags=_cflags
+                )
+                new_count = r.stdout.count("claude.exe")
             if new_count != _claude_proc_count[0]:
                 _claude_proc_count[0] = new_count
                 with _status_cond:
@@ -12644,7 +12660,7 @@ def _build_status_payload_uncached() -> dict:
         for k, v in sessions_from_dict.items()
     ]
     # sessions_count: floor at the real claude.exe process count (background
-    # scanner, _claude_proc_worker, polls tasklist every 2s). Hook-tracked
+    # scanner, _claude_proc_worker, counts claude.exe processes every 2s). Hook-tracked
     # sessions can under-count — a CLI sitting idle with no fresh heartbeat,
     # or one whose entry got dismissed/stale — so trusting the dict alone
     # made AOC report fewer CLIs than are actually running.
