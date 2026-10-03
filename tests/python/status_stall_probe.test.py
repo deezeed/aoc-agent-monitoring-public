@@ -66,8 +66,23 @@ try:
     # 3. the dump fires even while another thread holds the GIL: the probe
     #    waits on a thread running a long C-level call that never releases it
     open(STALL_LOG, "w").close()
+    # Catastrophic backtracking holds the GIL, and each extra "a" doubles the
+    # time -- but the base speed differs a lot between machines and Python
+    # versions (a fixed 24 took ~2s locally and <0.5s on the CI runner), so
+    # calibrate: grow n until one match takes >=0.4s, then use n+2 (~4x).
+    # Measured in this thread's CPU time, not wall time: on a loaded machine
+    # wall time is inflated by preemption, which picked too small an n.
+    # Wall time is never less than CPU time, so the hog lasts >=1.6s anyway.
+    n = 16
+    while True:
+        t0 = time.thread_time()
+        re.match(r"(a+)+$", "a" * n + "b")
+        if time.thread_time() - t0 >= 0.4:
+            break
+        n += 1
+    HOG_N = n + 2
     def gil_hog():
-        re.match(r"(a+)+$", "a" * 24 + "b")  # catastrophic backtracking (~2s), holds the GIL
+        re.match(r"(a+)+$", "a" * HOG_N + "b")  # >=1.6s on any machine, holds the GIL
     def probe_behind_hog():
         t = threading.Thread(target=gil_hog, name="gil-hog")
         t.start()
@@ -75,8 +90,8 @@ try:
     with ns["_open_stall_log"]() as f:
         # 0.5s, not 0.2s: on a loaded machine the hog thread may not even be
         # running yet at 0.2s (still in thread start-up), and the dump would
-        # miss it. The hog runs ~2s unloaded (each extra "a" doubles it), so
-        # the dump still lands well inside it.
+        # miss it. The calibrated hog runs >=1.6s, so the dump still lands
+        # well inside it.
         r = ns["_probe_status_once"](probe_behind_hog, 0.5, f)
     log = read_log()
     c.check("GIL hog long enough to cross the threshold", r is not None)
