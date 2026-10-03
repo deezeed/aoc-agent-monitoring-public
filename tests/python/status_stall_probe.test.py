@@ -138,6 +138,21 @@ try:
     log = read_log()
     c.check("real dump summary says 'stacks above'", "stacks above dumped" in log and "NO stack dump" not in log)
 
+    # 5d. a thread that was start()ed but isn't running yet is listed by
+    #     threading.enumerate() with ident None -- that used to raise while
+    #     formatting the summary, losing it mid-stall (seen live 2026-10-03)
+    open(STALL_LOG, "w").close()
+    limbo = threading.Thread(target=lambda: None, name="still-starting")
+    threading._limbo[limbo] = limbo  # exactly the state between start() and run
+    try:
+        with ns["_open_stall_log"]() as f:
+            r = ns["_probe_status_once"](slow_status_probe, 0.2, f)
+    finally:
+        threading._limbo.pop(limbo, None)
+    log = read_log()
+    c.check("summary still written with a not-yet-running thread", r is not None and f"/status probe took {r:.1f}s" in log)
+    c.check("that thread is named as starting", "(starting)=still-starting" in log)
+
     # 6. rotation past the size cap
     with open(STALL_LOG, "w") as f:
         f.write("x" * 50)

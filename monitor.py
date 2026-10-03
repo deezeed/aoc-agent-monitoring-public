@@ -3485,6 +3485,12 @@ def _claude_proc_worker():
     actually changes, instead of waiting for the next heartbeat tick."""
     import subprocess as _sp, time as _t
     _cflags = _sp.CREATE_NO_WINDOW if os.name == "nt" else 0
+    # This thread starts ~900 lines before _status_cond/_status_version are
+    # defined. With tasklist the first count took long enough that they always
+    # existed by then; the ~30ms snapshot gets there first and the change
+    # notification raised NameError on every start.
+    while "_status_cond" not in globals() or "_status_version" not in globals():
+        _t.sleep(0.05)
     while True:
         try:
             # In-process snapshot first: spawning tasklist every 2s (~43k
@@ -4414,11 +4420,27 @@ def _status_cache_is_fresh(cached_version, cached_built_at, current_version, now
 def _load_status():
     return _load_json_file(STATUS_FILE, default={"session_active": False, "agents": []})
 
+def _replace_with_retry(src, dst, attempts=20, delay_s=0.05):
+    """os.replace that rides out a brief lock on dst. On Windows replacing a
+    file another handle has open fails with WinError 5 -- and the status file
+    is read constantly (every /status rebuild opens it), so a hook /update or
+    scanner write regularly collided with a reader and was simply lost
+    (logged live as "[WinError 5] Access is denied: ...monitor-status.json.tmp").
+    Retries for up to ~1s, then raises like os.replace would."""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay_s)
+
 def _save_status(data):
     tmp = STATUS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATUS_FILE)
+    _replace_with_retry(tmp, STATUS_FILE)
     with _status_cond:
         _status_version[0] += 1
         _status_cond.notify_all()
@@ -13495,7 +13517,11 @@ def _probe_status_once(probe, threshold_s: float, log_file):
     # sizeof(unsigned long) -- 8 hex digits on Windows, 16 on 64-bit POSIX
     import struct
     width = struct.calcsize("L") * 2
-    names = ", ".join(f"0x{t.ident:0{width}x}={t.name}" for t in threading.enumerate())
+    # A thread that has been start()ed but isn't running yet is listed with
+    # ident None -- formatting that as hex raised, and the summary line was
+    # lost exactly when threads were being spawned mid-stall.
+    names = ", ".join(f"0x{t.ident:0{width}x}={t.name}" if t.ident is not None else f"(starting)={t.name}"
+                      for t in threading.enumerate())
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     where = (f"stacks above dumped at {threshold_s:.0f}s" if dumped else
              "NO stack dump fired -- the process was likely suspended or starved, not stuck")
