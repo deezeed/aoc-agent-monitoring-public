@@ -56,7 +56,7 @@ class _FixedTime:
 
 
 def make_ns(fixed_now):
-    ns = exec_functions(["_db_conn", "_correct_hms_diff", "_db_save_session", "_MAX_PLAUSIBLE_DURATION_S"], {
+    ns = exec_functions(["_db_conn", "_correct_hms_diff", "_db_save_session", "_MAX_PLAUSIBLE_DURATION_S", "_pack_snapshot"], {
         "sqlite3": sqlite3, "os": os, "json": json, "datetime": datetime, "time": _FixedTime(fixed_now),
         "DB_FILE": DB_FILE, "_db_lock": threading.Lock(),
         "_now_ts": lambda: "10:00:00",

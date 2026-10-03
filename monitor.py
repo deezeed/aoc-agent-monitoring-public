@@ -561,7 +561,7 @@ def _db_save_session(status: dict, sid: str = None):
                 except Exception:
                     pass
 
-            snapshot = json.dumps(status, ensure_ascii=False)
+            snapshot = _pack_snapshot(status)
 
             c = _db_conn()
 
@@ -791,6 +791,60 @@ def _db_get_errors(limit=100):
         except Exception:
             return []
 
+def _pack_snapshot(status) -> bytes:
+    """A session's saved dashboard snapshot, zlib-compressed. Snapshots were
+    ~98% of history.db (123 MB of 125 MB -- mostly agents' log arrays) and
+    compress ~10x; that size is what made every hourly backup, its integrity
+    check and the OneDrive upload of it heavy enough to stall the monitor.
+    Stored as a BLOB in the same TEXT-declared column (SQLite is dynamically
+    typed), so old rows and old backups with plain JSON text still read."""
+    import zlib
+    return sqlite3.Binary(zlib.compress(json.dumps(status, ensure_ascii=False).encode("utf-8"), 6))
+
+def _unpack_snapshot(value):
+    """Inverse of _pack_snapshot; also reads legacy plain-JSON text. None for
+    an empty value."""
+    if not value:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        import zlib
+        return json.loads(zlib.decompress(bytes(value)).decode("utf-8"))
+    return json.loads(value)
+
+def _db_compress_snapshots(batch=25):
+    """One pass at startup: compress every legacy plain-text snapshot in
+    place (a batch per lock hold, so requests aren't blocked for the whole
+    pass), then VACUUM once so the file actually shrinks. Returns the number
+    of rows converted; a no-op once everything is compressed."""
+    import zlib
+    converted = 0
+    try:
+        while True:
+            with _db_lock:
+                c = _db_conn()
+                rows = c.execute("SELECT id, snapshot FROM sessions WHERE typeof(snapshot) = 'text' "
+                                 "AND snapshot != '' LIMIT ?", (batch,)).fetchall()
+                for r in rows:
+                    # compress the stored text as-is (no parse): identical to
+                    # _pack_snapshot's output for valid JSON, and a malformed
+                    # legacy row can't wedge the pass on the same row forever
+                    c.execute("UPDATE sessions SET snapshot = ? WHERE id = ?",
+                              (sqlite3.Binary(zlib.compress(r[1].encode("utf-8"), 6)), r[0]))
+                c.commit()
+                c.close()
+            converted += len(rows)
+            if len(rows) < batch:
+                break
+            time.sleep(0.05)  # let queued DB users in between batches
+        if converted:
+            with _db_lock:
+                c = _db_conn()
+                c.execute("VACUUM")
+                c.close()
+    except Exception as e:
+        _log_bg_error("_db_compress_snapshots", e)
+    return converted
+
 def _db_get_session_detail(sid: str):
     """Return snapshot JSON for a session."""
     with _db_lock:
@@ -808,7 +862,7 @@ def _db_get_session_detail(sid: str):
             """, (sid,)).fetchall()
             c.close()
             return {
-                "snapshot": json.loads(row["snapshot"]) if row and row["snapshot"] else None,
+                "snapshot": _unpack_snapshot(row["snapshot"]) if row else None,
                 "cc_version": (row["cc_version"] if row else None) or "",
                 "tags": _tags_list(row["tags"] if row else None),
                 "agents": [dict(a) for a in agents],
@@ -1530,6 +1584,12 @@ def _backup_worker():
         time.sleep(_BACKUP_INTERVAL_S)  # hourly; dated filename means only today's snapshot actually changes
 
 threading.Thread(target=_backup_worker, daemon=True).start()
+
+def _compress_snapshots_worker():
+    time.sleep(60)  # after startup settles; the backup worker waits longer still
+    _db_compress_snapshots()
+
+threading.Thread(target=_compress_snapshots_worker, daemon=True, name="compress-snapshots").start()
 
 
 def _list_backups() -> list:

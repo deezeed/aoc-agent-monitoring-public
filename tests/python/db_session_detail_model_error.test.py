@@ -15,7 +15,7 @@ from lib.check import Checker
 SCRATCH = tempfile.mkdtemp(prefix="aoc_test_session_detail_")
 DB_FILE = os.path.join(SCRATCH, "history.db")
 
-ns = exec_functions(["_db_conn", "_db_get_session_detail", "_tags_list"], {
+ns = exec_functions(["_db_conn", "_db_get_session_detail", "_tags_list", "_unpack_snapshot"], {
     "sqlite3": sqlite3, "DB_FILE": DB_FILE, "_db_lock": threading.Lock(),
     "json": json,
 })

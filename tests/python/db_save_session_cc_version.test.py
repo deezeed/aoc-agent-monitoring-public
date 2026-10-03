@@ -45,7 +45,7 @@ conn.commit()
 conn.close()
 
 ns = exec_functions(
-    ["_db_conn", "_correct_hms_diff", "_db_save_session", "_db_get_sessions", "_db_get_session_detail", "_MAX_PLAUSIBLE_DURATION_S", "_tags_list"],
+    ["_db_conn", "_correct_hms_diff", "_db_save_session", "_db_get_sessions", "_db_get_session_detail", "_MAX_PLAUSIBLE_DURATION_S", "_tags_list", "_pack_snapshot", "_unpack_snapshot"],
     {
         "sqlite3": sqlite3, "os": os, "json": json, "datetime": datetime, "time": time,
         "DB_FILE": DB_FILE, "_db_lock": threading.Lock(),
