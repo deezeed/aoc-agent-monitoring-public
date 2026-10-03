@@ -31,22 +31,33 @@ try:
 
     ns = make_ns()
 
+    # "Fast" probes get a FAST_S budget, not a tight one: on a starved CPU
+    # (the whole suite running, other load) even a no-op probe has measured
+    # ~0.4s, and the code then rightly logs it as a starvation stall --
+    # which made these checks fail whenever the machine was busy.
+    FAST_S = 1.0
+
     # 1. a fast probe writes nothing and returns None (and creates the logs dir)
     with ns["_open_stall_log"]() as f:
-        r = ns["_probe_status_once"](lambda: None, 0.5, f)
+        r = ns["_probe_status_once"](lambda: None, FAST_S, f)
     c.check("fast probe returns None", r is None)
     c.check("fast probe writes nothing", read_log() == "")
 
     # 2. a slow probe: stacks dumped mid-stall, including the probe's own frame
+    # 1.5s against a 0.2s threshold: the dump comes from faulthandler's own
+    # watchdog thread, which on a starved CPU can wait a good while to be
+    # scheduled -- a 0.4s margin (the old 0.6s probe) wasn't always enough.
     def slow_status_probe():
-        time.sleep(0.6)
+        time.sleep(1.5)
     with ns["_open_stall_log"]() as f:
         r = ns["_probe_status_once"](slow_status_probe, 0.2, f)
     log = read_log()
-    c.check("slow probe returns elapsed seconds", isinstance(r, float) and r >= 0.5)
+    c.check("slow probe returns elapsed seconds", isinstance(r, float) and r >= 1.4)
     c.check("faulthandler dump written", "Timeout (0:00:00" in log and "Thread 0x" in log)
     c.check("dump shows the probe still inside its call", "slow_status_probe" in log)
-    c.check("summary line written after the dump", "/status probe took 0.6s" in log or "/status probe took 0.7s" in log)
+    # matched against the elapsed time the call itself returned, not a fixed
+    # 0.6/0.7s: a loaded machine oversleeps the 0.6s probe
+    c.check("summary line written after the dump", f"/status probe took {r:.1f}s" in log)
     import struct
     tid = f"0x{threading.get_ident():0{struct.calcsize('L') * 2}x}"
     c.check("summary names threads in faulthandler's id format", f"{tid}=MainThread" in log)
@@ -56,13 +67,17 @@ try:
     #    waits on a thread running a long C-level call that never releases it
     open(STALL_LOG, "w").close()
     def gil_hog():
-        re.match(r"(a+)+$", "a" * 23 + "b")  # catastrophic backtracking, holds the GIL
+        re.match(r"(a+)+$", "a" * 24 + "b")  # catastrophic backtracking (~2s), holds the GIL
     def probe_behind_hog():
         t = threading.Thread(target=gil_hog, name="gil-hog")
         t.start()
         t.join()
     with ns["_open_stall_log"]() as f:
-        r = ns["_probe_status_once"](probe_behind_hog, 0.2, f)
+        # 0.5s, not 0.2s: on a loaded machine the hog thread may not even be
+        # running yet at 0.2s (still in thread start-up), and the dump would
+        # miss it. The hog runs ~2s unloaded (each extra "a" doubles it), so
+        # the dump still lands well inside it.
+        r = ns["_probe_status_once"](probe_behind_hog, 0.5, f)
     log = read_log()
     c.check("GIL hog long enough to cross the threshold", r is not None)
     c.check("dump captured the hogging thread mid-call", "in gil_hog" in log)
@@ -72,14 +87,15 @@ try:
     def boom():
         raise ConnectionRefusedError("down")
     with ns["_open_stall_log"]() as f:
-        r = ns["_probe_status_once"](boom, 0.5, f)
+        r = ns["_probe_status_once"](boom, FAST_S, f)
     c.check("raising probe returns None", r is None)
     c.check("raising probe writes nothing", read_log() == "")
 
     # 5. the dump is disarmed after a fast probe (nothing fires later)
     with ns["_open_stall_log"]() as f:
-        ns["_probe_status_once"](lambda: None, 0.2, f)
-        time.sleep(0.4)
+        r = ns["_probe_status_once"](lambda: None, FAST_S, f)
+        time.sleep(FAST_S * 1.5)  # well past the point the dump would have fired
+    c.check("fast probe stayed under its budget", r is None)
     c.check("no late dump after a fast probe", read_log() == "")
 
     # 5b. elapsed crosses the threshold but the dump timer never fired (what
