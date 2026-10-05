@@ -3334,6 +3334,9 @@ def _release_update_worker(installed: str):
             _log_bg_error("_release_update_worker", e)
         time.sleep(_RELEASE_CHECK_INTERVAL_S)
 
+_SELFUPDATE_FETCH_TIMEOUT_S = 30
+_SELFUPDATE_QUIET_FETCH_TIMEOUTS = 2  # consecutive fetch timeouts not logged
+
 def _selfupdate_worker():
     """Background thread: check every 15 min whether this machine's AOC
     checkout is behind origin/master, so a stale copy doesn't silently keep
@@ -3345,9 +3348,23 @@ def _selfupdate_worker():
         _release_update_worker(installed)
         return
     import time as _t
+    fetch_timeouts = 0
     while True:
         try:
-            _run(["git", "-C", AOC_DIR, "fetch", "--quiet"], timeout=15)
+            # The checkout lives in OneDrive, which now and then stalls git
+            # for a while; a single slow fetch is not a problem worth an
+            # error-log line (they made up most of background_errors.log
+            # once the notify workers stopped timing out). Skip the round,
+            # keep the last result, and only log once it keeps happening.
+            try:
+                _run(["git", "-C", AOC_DIR, "fetch", "--quiet"], timeout=_SELFUPDATE_FETCH_TIMEOUT_S)
+                fetch_timeouts = 0
+            except subprocess.TimeoutExpired as e:
+                fetch_timeouts += 1
+                if fetch_timeouts > _SELFUPDATE_QUIET_FETCH_TIMEOUTS:
+                    _log_bg_error("_selfupdate_worker", e)
+                _t.sleep(900)
+                continue
             head = _run(["git", "-C", AOC_DIR, "rev-parse", "HEAD"], timeout=5).stdout.strip()
             remote = _run(["git", "-C", AOC_DIR, "rev-parse", "origin/master"], timeout=5).stdout.strip()
             count_out = _run(["git", "-C", AOC_DIR, "rev-list", "--count", "HEAD..origin/master"], timeout=5).stdout.strip()
