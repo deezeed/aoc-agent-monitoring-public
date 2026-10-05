@@ -1994,6 +1994,22 @@ def _fire_webhook(url: str, payload: dict):
             _log_bg_error("_fire_webhook", e)
     threading.Thread(target=_fire, daemon=True).start()
 
+# Set at the very bottom of the module, once every function the /status
+# builder needs is defined. The notify workers below start long before that.
+_module_loaded = threading.Event()
+
+def _own_status_payload():
+    """The /status payload for in-process consumers (notify/webhook/tray
+    workers), or None while the module is still loading. They used to GET
+    our own /status over HTTP every 3 s with a 2 s timeout: during OS-level
+    stalls the socket round trip timed out and logged a background error per
+    worker per tick, although the payload is right here in memory. This is
+    the same cached object GET /status serializes -- callers must treat it
+    as read-only."""
+    if not _module_loaded.is_set():
+        return None
+    return _build_status_payload()
+
 def _webhook_notify_worker():
     """Server-side counterpart to the client-only _fireWebhook -- mirrors
     _headless_notify_worker's own "poll /status every 3s, diff against a
@@ -2041,8 +2057,9 @@ def _webhook_notify_worker():
             cfg = _webhook_settings
             url = cfg.get("url", "")
             events = cfg.get("events", {})
-            raw = urllib.request.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=2).read()
-            d = json.loads(raw)
+            d = _own_status_payload()
+            if d is None:
+                continue
             agents = {a["id"]: a for a in (d.get("agents") or []) if not str(a.get("id", "")).startswith("hook_")}
             for aid, a in agents.items():
                 old = _prev.get(aid, {})
@@ -13901,13 +13918,13 @@ def _headless_notify_worker():
     but using _show_native_toast instead of pystray's icon.notify() -- for
     --headless (the mode actually run by the watchdog) and plain CLI mode,
     neither of which have a pystray Icon event loop to call .notify() on."""
-    import urllib.request
     _prev = {}
     while True:
         try:
             time.sleep(3)
-            raw = urllib.request.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=2).read()
-            d = json.loads(raw)
+            d = _own_status_payload()
+            if d is None:
+                continue
             agents = {a["id"]: a for a in (d.get("agents") or []) if not str(a.get("id", "")).startswith("hook_")}
             for aid, a in agents.items():
                 old = _prev.get(aid, {})
@@ -13977,13 +13994,13 @@ def _run_app_mode():
     icon = pystray.Icon("AOC", _make_tray_icon(), "AOC — Agent Operations Center", menu)
 
     def _tray_monitor():
-        import urllib.request, json as _json
         _prev = {}
         while True:
             try:
                 time.sleep(3)
-                raw = urllib.request.urlopen(f"http://127.0.0.1:{PORT}/status", timeout=2).read()
-                d = _json.loads(raw)
+                d = _own_status_payload()
+                if d is None:
+                    continue
                 agents = {a["id"]: a for a in (d.get("agents") or []) if not str(a.get("id","")).startswith("hook_")}
                 running = sum(1 for a in agents.values() if a.get("status") in ("running","waiting"))
                 icon.title = f"AOC — {running} running" if running else "AOC — Agent Operations Center"
@@ -14010,6 +14027,8 @@ def _run_app_mode():
     threading.Thread(target=open_window, daemon=True).start()
     icon.run()
 
+
+_module_loaded.set()
 
 if __name__ == "__main__":
     import sys
