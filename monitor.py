@@ -5153,6 +5153,20 @@ body.light .ar-prog { background:rgba(0,0,0,.08); }
   .agent-row { gap:8px; padding:8px 10px; }
   .ar-name { min-width:90px; }
   .ar-prog { display:none; }
+  /* CLI session cards: badge + meta + pill + 3-4 buttons in one row left
+     the meta ~40 px (pill over the name, stats one word per line). Meta
+     takes the first row; pill and buttons wrap below. !important: the
+     meta's flex:1/min-width:0 are inline styles. */
+  .card-head > .card-meta { flex:1 1 calc(100% - 52px) !important; }
+  /* History: one nowrap row pushed the session name off screen. Date, then
+     name on its own line, chips below; toolbar inputs wrap too. */
+  #history-area { padding:12px 10px; }
+  .hist-toolbar { flex-wrap:wrap; row-gap:8px; padding:10px 6px 8px; }
+  .hist-toolbar input[type=text] { flex:1 1 100%; width:auto !important; margin-left:0 !important; }
+  .hist-body { padding:10px 4px; }
+  .hist-row { flex-wrap:wrap; row-gap:4px; padding:9px 11px; }
+  .hist-row .hr-project { flex:1 1 100%; order:-1; }
+  .hist-row .hr-chips { justify-content:flex-start; }
 }
 .ar-unit { font-size:9px; font-family:var(--font2); font-weight:700; letter-spacing:.07em; color:var(--t3); min-width:28px; text-align:center; }
 .ar-name { flex:1; font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
