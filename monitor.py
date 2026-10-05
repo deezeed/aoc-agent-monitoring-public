@@ -47,8 +47,8 @@ PORT = 5151
 # is best-effort only, not guaranteed to render on iOS.
 _ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <polygon points="16,3 27.4,9.5 27.4,22.5 16,29 4.6,22.5 4.6,9.5"
-           fill="#00c4e833" stroke="#00c4e8" stroke-width="2"/>
-  <circle cx="16" cy="16" r="4" fill="#00c4e8"/>
+           fill="#5b9be033" stroke="#5b9be0" stroke-width="2"/>
+  <circle cx="16" cy="16" r="4" fill="#5b9be0"/>
 </svg>"""
 
 def _build_manifest(token: str = "") -> dict:
@@ -65,8 +65,8 @@ def _build_manifest(token: str = "") -> dict:
         "short_name": "AOC",
         "start_url": "/" + suffix,
         "display": "standalone",
-        "background_color": "#04060e",
-        "theme_color": "#04060e",
+        "background_color": "#1b2624",
+        "theme_color": "#16201e",
         "icons": [{"src": "/icon.svg" + suffix, "sizes": "any", "type": "image/svg+xml"}],
     }
 
@@ -1545,8 +1545,11 @@ def _backup_history_db():
             retention_days = _BACKUP_RETENTION_DAYS
         retention_days = max(1, min(365, retention_days))
         cutoff = time.time() - retention_days * 86400
-        for p in glob.glob(os.path.join(backup_dir, "history_*.db")):
-            if p.endswith("_CORRUPT.db"):
+        # -journal: left behind when a backup was interrupted mid-copy; the
+        # .db pattern alone never matched them, so they piled up forever.
+        for p in (glob.glob(os.path.join(backup_dir, "history_*.db"))
+                  + glob.glob(os.path.join(backup_dir, "history_*.db-journal"))):
+            if "_CORRUPT.db" in p:
                 continue  # keep corrupt backups for inspection, don't auto-delete the evidence
             try:
                 if os.path.getmtime(p) < cutoff:
@@ -4825,6 +4828,7 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#16201e">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <link rel="apple-touch-icon" href="/icon.svg">
 <title>AOC — Agent Operations Center</title>
 <style>
@@ -8276,8 +8280,8 @@ function renderGraph(data){
     return `<g onclick="_graphEdgeClick(${jsq(agents[e.a].id)},${jsq(agents[e.b].id)})" style="cursor:pointer">
   <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="transparent" stroke-width="14"/>
   <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${stroke}" stroke-width="${sw}" ${dash?`stroke-dasharray="${dash}"`:''}${marker?` marker-end="${marker}"`:''}${markerS?` marker-start="${markerS}"`:''}/>
-  ${e.files.length?`<text x="${mx}" y="${my}" text-anchor="middle" font-size="8" fill="${tc.edgeText}" font-family="Consolas,monospace">${e.files.length} shared</text>`:''}
-  ${isDep?`<text x="${mx}" y="${my+10}" text-anchor="middle" font-size="7" fill="rgba(224,161,58,.7)" font-family="Consolas,monospace">DEPENDS</text>`:''}
+  ${e.files.length?`<text x="${mx}" y="${my}" text-anchor="middle" font-size="8" fill="${tc.edgeText}" font-family="'Red Hat Mono',Consolas,monospace">${e.files.length} shared</text>`:''}
+  ${isDep?`<text x="${mx}" y="${my+10}" text-anchor="middle" font-size="7" fill="rgba(224,161,58,.7)" font-family="'Red Hat Mono',Consolas,monospace">DEPENDS</text>`:''}
 </g>`;
   }).join('\n');
   /* nodes */
@@ -8300,26 +8304,26 @@ function renderGraph(data){
   <polygon points="${pts}" fill="${isActive?rgba.replace(',1)',',.18)').replace('.85)',',.18)'):tc.nodeFill}" stroke="${rgba}" stroke-width="${isActive?2.8:1.8}"/>
   <circle cx="${x}" cy="${y}" r="${arcR}" fill="none" stroke="${tc.nodeStroke}" stroke-width="2.5"/>
   <circle cx="${x}" cy="${y}" r="${arcR}" fill="none" stroke="${rgba}" stroke-width="2.5" opacity="${isActive?.95:.55}" stroke-dasharray="${arcD} ${arcC}" stroke-linecap="round" transform="rotate(-90 ${x} ${y})"/>
-  <text x="${x}" y="${y-5}" text-anchor="middle" font-family="Consolas,monospace" font-size="11" font-weight="700" fill="${rgba}">${lbl}</text>
-  <text x="${x}" y="${y+9}" text-anchor="middle" font-family="Consolas,monospace" font-size="9" fill="${tc.pctText}">${pct}%</text>
-  <text x="${x}" y="${y+52}" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="${tc.nodeText}">${escHtml(name)}</text>
-  ${connCount>0?`<text x="${x+r+2}" y="${y-r+4}" text-anchor="middle" font-family="Consolas,monospace" font-size="8" fill="${rgba}" opacity=".75">${connCount}</text>`:''}
+  <text x="${x}" y="${y-5}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="11" font-weight="700" fill="${rgba}">${lbl}</text>
+  <text x="${x}" y="${y+9}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="9" fill="${tc.pctText}">${pct}%</text>
+  <text x="${x}" y="${y+52}" text-anchor="middle" font-family="'Atkinson Hyperlegible',sans-serif" font-size="9" fill="${tc.nodeText}">${escHtml(name)}</text>
+  ${connCount>0?`<text x="${x+r+2}" y="${y-r+4}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="8" fill="${rgba}" opacity=".75">${connCount}</text>`:''}
 </g>`;
   }).join('\n');
   /* legend */
   const legend=`
-  <text x="10" y="${H-20}" font-family="Consolas,monospace" font-size="8" fill="${tc.legendHint}" letter-spacing=".05em">click node → detail panel · click edge → shared files</text>
+  <text x="10" y="${H-20}" font-family="'Red Hat Mono',Consolas,monospace" font-size="8" fill="${tc.legendHint}" letter-spacing=".05em">click node → detail panel · click edge → shared files</text>
   <line x1="10" y1="${H-10}" x2="40" y2="${H-10}" stroke="${tc.edgeLine}" stroke-width="1.5" stroke-dasharray="5 3"/>
-  <text x="46" y="${H-7}" font-family="Consolas,monospace" font-size="7" fill="${tc.edgeText}">shared files</text>
+  <text x="46" y="${H-7}" font-family="'Red Hat Mono',Consolas,monospace" font-size="7" fill="${tc.edgeText}">shared files</text>
   <line x1="110" y1="${H-10}" x2="140" y2="${H-10}" stroke="rgba(224,161,58,.55)" stroke-width="1.5" marker-end="url(#arr-dep)"/>
-  <text x="146" y="${H-7}" font-family="Consolas,monospace" font-size="7" fill="${tc.depText}">depends_on</text>`;
+  <text x="146" y="${H-7}" font-family="'Red Hat Mono',Consolas,monospace" font-size="7" fill="${tc.depText}">depends_on</text>`;
   el.innerHTML=`<div style="position:relative;width:100%;display:flex;flex-direction:column;align-items:center;gap:10px">
 <svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;background:${tc.panelBg};border-radius:14px;border:1px solid ${tc.panelBorder}">
 ${defs}
 ${edgeSvg}
 ${nodeSvg}
 ${legend}
-${edges.length===0&&n>1?`<text x="${W/2}" y="${H/2+80}" text-anchor="middle" font-family="Consolas,monospace" font-size="9" fill="${tc.emptyText}" letter-spacing=".1em">NO SHARED FILES — AGENTS INDEPENDENT</text>`:''}
+${edges.length===0&&n>1?`<text x="${W/2}" y="${H/2+80}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="9" fill="${tc.emptyText}" letter-spacing=".1em">NO SHARED FILES — AGENTS INDEPENDENT</text>`:''}
 </svg>
 <div id="graph-tooltip" style="display:none;position:fixed;z-index:5000;pointer-events:none;background:${tc.tooltipBg};border:1px solid ${tc.tooltipBorder};border-radius:10px;padding:10px 14px;max-width:240px;box-shadow:0 8px 32px rgba(0,0,0,.6)"></div>
 </div>`;
@@ -10624,7 +10628,7 @@ function diffStatusWithRemove(prev, next){
     ctx.fillStyle=col;
     ctx.fill();
     /* update favicon */
-    let link=document.querySelector("link[rel*='icon']");
+    let link=document.querySelector("link[rel='icon']");
     if(!link){ link=document.createElement('link'); link.rel='icon'; document.head.appendChild(link); }
     link.href=_cv.toDataURL('image/png');
   }
@@ -11504,14 +11508,14 @@ function renderTree(data){
   const tc=_graphThemeColors();
   const agents = (data&&data.agents||[]).filter(a => !String(a.id||'').startsWith('hook_'));
   if(!agents.length){
-    el.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-family:Consolas,monospace;font-size:13px;color:${tc.emptyText};letter-spacing:.08em">NO AGENTS</div>`;
+    el.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-family:var(--font2);font-size:13px;color:${tc.emptyText};letter-spacing:.08em">NO AGENTS</div>`;
     return;
   }
   const {childMap, agentById, roots, depth} = _buildTree(agents);
   const pos = _layoutTree(agents, childMap, roots, depth);
   const allPos = Object.values(pos);
   if(!allPos.length){
-    el.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-family:Consolas,monospace;font-size:13px;color:${tc.emptyText};letter-spacing:.08em">NO AGENTS</div>`;
+    el.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-family:var(--font2);font-size:13px;color:${tc.emptyText};letter-spacing:.08em">NO AGENTS</div>`;
     return;
   }
   const W = Math.max(...allPos.map(p=>p.x)) + 80;
@@ -11547,10 +11551,10 @@ function renderTree(data){
   <polygon points="${pts}" fill="${isActive?rgba.replace('.85)',',.15)').replace(',1)',',.15)'):tc.nodeFill}" stroke="${rgba}" stroke-width="${isActive?2.5:1.6}"/>
   <circle cx="${px}" cy="${py}" r="${arcR}" fill="none" stroke="${tc.nodeStroke}" stroke-width="2"/>
   <circle cx="${px}" cy="${py}" r="${arcR}" fill="none" stroke="${rgba}" stroke-width="2" opacity="${isActive?.9:.5}" stroke-dasharray="${arcD} ${arcC}" stroke-linecap="round" transform="rotate(-90 ${px} ${py})"/>
-  <text x="${px}" y="${py-4}" text-anchor="middle" font-family="Consolas,monospace" font-size="10" font-weight="700" fill="${rgba}">${lbl}</text>
-  <text x="${px}" y="${py+8}" text-anchor="middle" font-family="Consolas,monospace" font-size="8" fill="${tc.pctText}">${pct}%</text>
-  <text x="${px}" y="${py+40}" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="${tc.nodeText}">${escHtml(name)}</text>
-  ${childCount>0?`<text x="${px+r}" y="${py-r+4}" text-anchor="middle" font-family="Consolas,monospace" font-size="7" fill="${rgba}" opacity=".8">${childCount}↓</text>`:''}
+  <text x="${px}" y="${py-4}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="10" font-weight="700" fill="${rgba}">${lbl}</text>
+  <text x="${px}" y="${py+8}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="8" fill="${tc.pctText}">${pct}%</text>
+  <text x="${px}" y="${py+40}" text-anchor="middle" font-family="'Atkinson Hyperlegible',sans-serif" font-size="9" fill="${tc.nodeText}">${escHtml(name)}</text>
+  ${childCount>0?`<text x="${px+r}" y="${py-r+4}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="7" fill="${rgba}" opacity=".8">${childCount}↓</text>`:''}
 </g>`;
   }).join('');
   const hasHierarchy = agents.some(a => a.parent_id && agentById[a.parent_id]);
@@ -11560,11 +11564,13 @@ function renderTree(data){
   // back when this really was an unfinished, opt-in protocol field. This
   // flat view is the correct, expected state whenever no subagent in the
   // session spawned another subagent itself, not a broken one.
-  const hint = !hasHierarchy ? `<text x="${(W/2).toFixed(0)}" y="${H+20}" text-anchor="middle" font-family="Consolas,monospace" font-size="8" fill="${tc.legendHint}" letter-spacing=".08em">no nested subagent delegation in this session</text>` : '';
   // Explicit width/height = drawn at 1:1. With only a viewBox the SVG
   // stretched to the panel width, so a small tree (W~400) blew up 2-3x into
   // giant hex nodes; a large one now scrolls instead of shrinking.
   const vw = Math.max(W,400), vh = Math.max(H,200)+30;
+  // Centred on the drawn width, not W: a flat tree's W is ~130, which put
+  // the hint's middle near the left edge and clipped its first half.
+  const hint = !hasHierarchy ? `<text x="${(vw/2).toFixed(0)}" y="${H+20}" text-anchor="middle" font-family="'Red Hat Mono',Consolas,monospace" font-size="8" fill="${tc.legendHint}" letter-spacing=".08em">no nested subagent delegation in this session</text>` : '';
   el.innerHTML = `<div style="overflow:auto;width:100%"><svg width="${vw}" height="${vh}" viewBox="0 0 ${vw} ${vh}" style="display:block;margin:0 auto;background:${tc.panelBg};border-radius:14px;border:1px solid ${tc.panelBorder}">${edgeSvg}${nodeSvg}${hint}</svg></div>`;
 }
 
@@ -12949,7 +12955,7 @@ class Handler(BaseHTTPRequestHandler):
             html = HTML.replace("__AOC_TOKEN_PLACEHOLDER__", _auth_token or "") \
                        .replace("__AOC_IS_PRO_PLACEHOLDER__", "true" if _is_pro() else "false")
             self._serve(200, "text/html; charset=utf-8", html.encode())
-        elif path_no_qs == "/icon.svg":
+        elif path_no_qs in ("/icon.svg", "/favicon.ico"):
             self._serve(200, "image/svg+xml", _ICON_SVG.encode())
         elif path_no_qs == "/manifest.json":
             from urllib.parse import urlparse, parse_qs
