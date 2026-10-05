@@ -5015,7 +5015,10 @@ body::before { content:none; }
 
 /* ── AGENT GRID ── */
 .agents { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
-.agents.list-mode { display:flex; flex-direction:column; gap:4px; }
+.agents.list-mode { display:flex; flex-direction:column; gap:10px; }
+.list-mode .sbay-head { padding:6px 12px 5px; }
+.list-mode .sbay-title h2 { font-size:18px; }
+.list-mode .sbay-slots { padding:6px 8px 8px; gap:4px; }
 
 /* ── Flight strips (agents view, card mode) ─────────────────────────────── */
 #agents:not(.list-mode) { grid-template-columns:1fr; gap:14px; }
@@ -5121,6 +5124,19 @@ body::before { content:none; }
 .agent-row.running { border-left:2px solid var(--c); }
 .agent-row.done    { border-left:2px solid var(--g); }
 .agent-row.error   { border-left:2px solid var(--r); }
+.agent-row.waiting { border-left:2px solid var(--o); }
+/* body.light's border-color reset below would otherwise wipe the status rail */
+body.light .agent-row.running { border-left-color:var(--c); }
+body.light .agent-row.done    { border-left-color:var(--g); }
+body.light .agent-row.error   { border-left-color:var(--r); }
+body.light .agent-row.waiting { border-left-color:var(--o); }
+body.light .ar-prog { background:rgba(0,0,0,.08); }
+/* Phone: the fixed-width bits (cost, pill, bar, time) squeezed the name to 0 px */
+@media (max-width: 600px) {
+  .agent-row { gap:8px; padding:8px 10px; }
+  .ar-name { min-width:90px; }
+  .ar-prog { display:none; }
+}
 .ar-unit { font-size:9px; font-family:var(--font2); font-weight:700; letter-spacing:.07em; color:var(--t3); min-width:28px; text-align:center; }
 .ar-name { flex:1; font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ar-pill { font-size:9px; font-family:var(--font2); font-weight:700; letter-spacing:.07em; padding:2px 8px; border-radius:4px; white-space:nowrap; }
@@ -8569,7 +8585,7 @@ function renderAgents(data){
   _applyDensity(_density);
 
   if(listMode){
-    agentsEl.innerHTML=visibleAgents.map(a=>{
+    const _rowById=new Map(visibleAgents.map(a=>{
       const dt=(a.tasks||[]).filter(t=>t.done).length;
       const tt=(a.tasks||[]).length;
       const pct=tt>0?Math.round(dt/tt*100):0;
@@ -8592,7 +8608,7 @@ function renderAgents(data){
       const col=sCol(a.status);
       const tokStr=a.tokens_used?`<span style="font-size:9px;font-family:var(--font2);color:rgba(76,194,133,.7);margin-left:4px">$${_agentCost(a).toFixed(4)}</span>`:'';
       const pinClass=_pinnedIds.has(a.id)?'style="border-left-color:rgba(224,161,58,.6)"':'';
-      return `<div class="agent-row ${a.status}" ${pinClass}>
+      return [a, `<div class="agent-row ${a.status}" ${pinClass}>
         <div class="ar-unit">${_deriveUnit(a)}</div>
         ${a.detected_via==='transcript'?`<span style="color:rgba(224,161,58,.95);font-size:10px;flex-shrink:0" title="${escHtml(_hookMissTitle(a))}">⚠</span>`:''}
         <div class="ar-name" title="${escHtml(a.description||a.name)}">${escHtml(a.name)}</div>
@@ -8601,8 +8617,11 @@ function renderAgents(data){
         <div class="ar-prog"><div class="ar-prog-fill" style="width:${pct}%;background:${col}"></div></div>
         <div class="ar-elapsed">${elapsedStr||'—'}</div>
         <button class="ar-dismiss" onclick="dismissAgent(${jsq(a.id)},${jsq(a.machine||'')})" title="Dismiss">×</button>
-      </div>`;
-    }).join('');
+      </div>`];
+    }));
+    /* Same session bays as card mode, just with compact rows inside. */
+    agentsEl.innerHTML=_groupIntoBays(visibleAgents, data.sessions_list||[])
+      .map(bay=>_sessionBayHtml(bay, bay.agents.map(a=>_rowById.get(a)).join(''))).join('');
   } else {
 
   /* detect new agents and newly completed tasks before render */

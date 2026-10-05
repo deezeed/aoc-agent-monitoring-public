@@ -47,4 +47,11 @@ c.check('every agent is in exactly one bay',
 c.check('no agents -> no bays', _groupIntoBays([], sessions).length === 0);
 c.check('missing sessions list -> still grouped', _groupIntoBays(agents, undefined).length === 5);
 
+// List mode used to render one flat list of rows across all sessions; it
+// must group into the same bays as card mode.
+const render = extractFunction(src, 'renderAgents');
+const listBranch = render.slice(render.indexOf('if(listMode){'), render.indexOf('} else {', render.indexOf('if(listMode){')));
+c.check('list mode groups its rows into session bays',
+  listBranch.includes('_groupIntoBays(') && listBranch.includes('_sessionBayHtml('));
+
 c.finish();
