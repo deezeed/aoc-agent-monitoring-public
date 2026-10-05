@@ -819,8 +819,8 @@ directory.
 own "no `requirements.txt`/`package.json`" choice). Each test extracts the
 real function it's checking straight out of `monitor.py` (via regex for JS,
 via the `ast` module for Python) rather than a hand-copied re-implementation,
-so a test can't silently drift from the shipped code. Currently 1,171
-checks across 100 files (grows with every feature — extracting the pure logic out
+so a test can't silently drift from the shipped code. Currently 1,289
+checks across 111 files (grows with every feature — extracting the pure logic out
 of a DOM/HTTP-driven function specifically so it *can* be tested this way is
 a deliberate, recurring design choice throughout this codebase, not just a
 testing afterthought). Run everything with one command:
