@@ -4028,7 +4028,7 @@ def _apply_agent_update(status: dict, au: dict, session_id: str, session_project
         au["estimated_cost"] = _calc_cost(
             au.get("input_tokens", 0), au.get("output_tokens", 0),
             au.get("cache_write_tokens", 0), au.get("cache_read_tokens", 0),
-            au["model"])
+            au["model"], au.get("cache_write_1h_tokens", 0))
     existing_ids = {a["id"]: a for a in status.get("agents", [])}
     # child_ids (this agent itself spawned these subagents, per aoc_hook.py's
     # _extract_child_agent_ids) sets TREE view's parent_id on each child --
@@ -4373,6 +4373,7 @@ def _transcript_scanner_worker():
                                         "input_tokens": usage.get("input_tokens", 0),
                                         "output_tokens": usage.get("output_tokens", 0),
                                         "cache_write_tokens": usage.get("cache_creation_input_tokens", 0),
+                                        "cache_write_1h_tokens": (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0) or 0,
                                         "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
                                         "_completion_only": True,
                                     }
@@ -4561,6 +4562,7 @@ _threading.Thread(target=_transcript_scanner_worker, daemon=True).start()
 TRANSCRIPT_INDEX_DB = os.path.join(AOC_DATA_DIR, "transcript_index.db")
 _TRANSCRIPT_INDEX_MAX_TEXT = 20000      # chars per message
 _TRANSCRIPT_INDEX_BYTES_PER_TICK = 32 * 1024 * 1024
+_transcript_cost_repair_done = [False]  # once per process, after the first full index pass
 _transcript_index_progress = {"files": 0, "indexed": 0, "messages": 0, "building": False, "updated_at": 0}
 
 
@@ -4924,6 +4926,29 @@ def _cache_stats(conn, since_day, top=12):
     }
 
 
+def _db_repair_transcript_costs(hist_conn, index_conn):
+    """History rows for CLI sessions (no subagents) were written by the
+    transcript scanner, which until 2026-10-06 counted every transcript line
+    -- one per content block, each repeating the response's usage -- so
+    their tokens/cost are ~2.4x too high. For every such row whose transcript
+    still exists, take the deduplicated numbers from the index's usage table.
+    Rows with agents (cost also has subagent spend) and rows whose transcript
+    is gone are left alone. Idempotent; returns how many rows changed."""
+    fixed = {sid: (int(tok or 0), float(cost or 0)) for sid, tok, cost in index_conn.execute(
+        "SELECT session_id, SUM(inp) + SUM(out), SUM(cost) FROM usage GROUP BY session_id")}
+    changed = 0
+    for sid, tok, cost in hist_conn.execute(
+            "SELECT id, tokens, cost FROM sessions WHERE COALESCE(agents, 0) = 0").fetchall():
+        if sid not in fixed:
+            continue
+        ntok, ncost = fixed[sid]
+        if ncost <= 0 or abs((cost or 0) - ncost) <= max(0.01, 0.01 * ncost):
+            continue
+        hist_conn.execute("UPDATE sessions SET tokens = ?, cost = ? WHERE id = ?", (ntok, round(ncost, 6), sid))
+        changed += 1
+    return changed
+
+
 def _transcript_index_worker():
     """Keeps transcript_index.db current: after the startup grace, one tick a
     minute, or back-to-back (short pause) while the first build catches up."""
@@ -4940,6 +4965,18 @@ def _transcript_index_worker():
             msgs = conn.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
             _transcript_index_progress.update(files=seen, indexed=current, messages=msgs,
                                               building=current < seen, updated_at=time.time())
+            if current == seen and not _transcript_cost_repair_done[0]:
+                _transcript_cost_repair_done[0] = True
+                try:
+                    with _db_lock:
+                        hc = _db_conn()
+                        n = _db_repair_transcript_costs(hc, conn)
+                        hc.commit()
+                        hc.close()
+                    if n:
+                        print(f"[history] repaired tokens/cost of {n} CLI session(s) from the transcript index")
+                except Exception as e:
+                    _log_bg_error("_db_repair_transcript_costs", e)
             time.sleep(2 if current < seen else 60)
         except Exception as e:
             _log_bg_error("_transcript_index_worker", e)

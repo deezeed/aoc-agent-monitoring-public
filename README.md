@@ -618,7 +618,11 @@ scanner summed every line, so CLI session tokens/cost were overstated about
 2.4x; it now counts each response once, prices it with its own model
 (Opus 5.5 / Sonnet 5 / Fable 5.1 / Opus 4.5-4.8 were missing from the price
 table and fell back to Sonnet 4 rates) and prices 1-hour cache writes at 2x
-input. History rows saved before that keep their old numbers.
+input. Once the transcript index is built, History rows of CLI sessions
+(no subagents) whose transcript still exists are corrected from it
+automatically; older rows whose transcripts Claude Code has already
+deleted keep their old, too-high numbers. Subagent cost also counts
+1-hour cache writes now (the hook sends that share).
 
 Settings → **NOTIFY** covers **quiet hours** and **muted projects**
 (suppress sound/toast/webhook, either on a schedule or per-project

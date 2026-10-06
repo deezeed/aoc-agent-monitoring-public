@@ -799,6 +799,8 @@ def main():
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "cache_write_tokens": usage.get("cache_creation_input_tokens", 0),
+                    # the 1-hour TTL share costs 2x input instead of 1.25x
+                    "cache_write_1h_tokens": (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0) or 0,
                     "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
                     "model": model,
                 }
