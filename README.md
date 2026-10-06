@@ -223,6 +223,25 @@ via a real (windowed, no-console) `pythonw.exe` subprocess — this
 stdin-to-tempfile indirection exists because pythonw.exe's stdin handling
 from Claude Code's hook invocation was unreliable directly.
 
+### 2b. Plan limits (the statusline)
+On a Pro/Max plan, Claude Code reports how much of the **5-hour** and
+**weekly** limits you've used -- but only to the `statusLine` command, never
+to hooks. `setup.py` therefore also sets `statusLine` to
+`python.exe ~/.claude/hooks/aoc_statusline.py`, which saves those numbers to
+`%LOCALAPPDATA%\AOC\rate_limits.json` and prints a compact status bar
+(`Opus 5.5 · my-project · 5h 42% ↻13:20 · wk 18%`). If you already had a
+`statusLine`, it's kept: it moves to `~/.claude/hooks/aoc_statusline_chain.json`
+and AOC's script runs it with the same input and prints its output
+unchanged. `setup.py --uninstall` puts it back.
+
+The dashboard shows the more urgent window as a meter in the top bar (fill =
+used, tick = projected at reset from the last 30 min of pace; tooltip has
+both windows). A toast fires once per window at 80 %, or earlier when the
+current pace would hit 100 % before the reset, and again when the limit is
+actually hit -- that one also works without the statusline, from the limit
+message Claude Code writes into the transcript. Optional webhook event:
+`rate_limit` (`level` warning/hit, `window`, `pct`, `resets_at`).
+
 ### 3. Two-tier watchdog
 `watchdog.py` runs continuously via a **Windows Task Scheduler task set
 to trigger at login** (not a service) — no elevation, runs as the
@@ -291,7 +310,7 @@ Two different directories, for a reason:
   successful or refused — see **Using the dashboard** below), and
   `logs/alert_audit.log` (every webhook event AOC actually dispatched —
   `done`/`error`/`stuck`/`burn_spike`/`cost_spike`/`waiting_nudge`/
-  `weekly_digest`/`budget_alert` — one JSON line per fire, written from `_fire_webhook`
+  `weekly_digest`/`budget_alert`/`rate_limit` — one JSON line per fire, written from `_fire_webhook`
   itself so both the server-side worker and the client-triggered
   `/webhook_fire` path are covered by the same single write site. The
   in-browser notification history panel is a plain in-memory array that

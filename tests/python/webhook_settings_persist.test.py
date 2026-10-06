@@ -24,11 +24,12 @@ full = _sanitize_webhook_events({
     "done": True, "error": True, "stuck": True,
     "burn_spike": True, "weekly_digest": True, "waiting_nudge": True, "cost_spike": True,
     "budget_alert": True,
+    "rate_limit": True,
 })
-c.check("all 8 known keys are present in the output", set(full.keys()) == {
-    "done", "error", "stuck", "burn_spike", "weekly_digest", "waiting_nudge", "cost_spike", "budget_alert",
+c.check("all 9 known keys are present in the output", set(full.keys()) == {
+    "done", "error", "stuck", "burn_spike", "weekly_digest", "waiting_nudge", "cost_spike", "budget_alert", "rate_limit",
 })
-c.check("all 8 values pass through as True when explicitly set", all(full.values()))
+c.check("all 9 values pass through as True when explicitly set", all(full.values()))
 
 # 2. THE BUG: an events dict shaped like the old client payload (all 6 keys,
 # including the 3 that used to get silently dropped) must round-trip every key
@@ -51,6 +52,7 @@ c.check("missing weekly_digest defaults to False", defaults["weekly_digest"] is 
 c.check("missing waiting_nudge defaults to False", defaults["waiting_nudge"] is False)
 c.check("missing cost_spike defaults to False", defaults["cost_spike"] is False)
 c.check("missing budget_alert defaults to False", defaults["budget_alert"] is False)
+c.check("missing rate_limit defaults to False", defaults["rate_limit"] is False)
 
 # 4. non-bool truthy/falsy values are coerced to real booleans
 coerced = _sanitize_webhook_events({"burn_spike": 1, "waiting_nudge": 0})

@@ -162,6 +162,14 @@ def _iso_utc_to_local_hms(iso_ts: str) -> str:
     except Exception:
         return _now_ts()
 
+def _iso_to_epoch(iso_ts):
+    """Transcript UTC ISO timestamp -> epoch seconds, or None."""
+    try:
+        dt = datetime.strptime(str(iso_ts).split(".")[0].rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+        return float(calendar.timegm(dt.timetuple()))
+    except Exception:
+        return None
+
 def _transcript_session_times(first_ts: str, last_ts: str):
     """(date, started_at, ended_at, duration_s) for a History row, from a
     transcript's first/last UTC ISO timestamps, in local wall-clock time like
@@ -1703,7 +1711,7 @@ def _get_diag_info() -> dict:
 # that handler's `idle = {...}` dict, e.g. session_note today).
 WEBHOOK_SETTINGS_FILE = os.path.join(AOC_DIR, "aoc_webhook_settings.json")
 _webhook_settings_lock = threading.Lock()
-_webhook_settings = {"url": "", "events": {"done": True, "error": True, "stuck": False, "burn_spike": False, "weekly_digest": False, "waiting_nudge": False, "cost_spike": False, "budget_alert": False}}
+_webhook_settings = {"url": "", "events": {"done": True, "error": True, "stuck": False, "burn_spike": False, "weekly_digest": False, "waiting_nudge": False, "cost_spike": False, "budget_alert": False, "rate_limit": False}}
 
 def _load_webhook_settings():
     global _webhook_settings
@@ -1741,6 +1749,7 @@ def _sanitize_webhook_events(events: dict) -> dict:
         "waiting_nudge": bool(events.get("waiting_nudge", False)),
         "cost_spike": bool(events.get("cost_spike", False)),
         "budget_alert": bool(events.get("budget_alert", False)),
+        "rate_limit": bool(events.get("rate_limit", False)),
     }
 
 def _save_webhook_settings(data: dict):
@@ -1994,6 +2003,177 @@ def _fire_webhook(url: str, payload: dict):
             _log_bg_error("_fire_webhook", e)
     threading.Thread(target=_fire, daemon=True).start()
 
+# ── Plan rate limits (Pro/Max 5-hour + weekly windows) ──────────────────────
+# Claude Code hands its statusline command the real utilization Anthropic
+# reports (rate_limits.five_hour/seven_day: used_percentage 0-100, resets_at
+# epoch s). hooks/aoc_statusline.py writes that to RATE_LIMITS_FILE; hooks
+# never see it. Second source: when a limit is actually hit, the transcript
+# line carries quotaLimits {status: "rejected", rateLimitType, resetsAt} --
+# the transcript scanner records those via _record_rate_limit_hit, so
+# "limit reached, resets 13:20" shows even without the statusline installed.
+RATE_LIMITS_FILE = os.path.join(AOC_DATA_DIR, "rate_limits.json")
+_RATE_LIMIT_KINDS = (("five_hour", "5h"), ("seven_day", "weekly"))
+_RATE_LIMIT_WARN_PCT = 80.0
+_rate_limit_lock = threading.Lock()
+# samples: (kind, resets_at) -> [(epoch, pct)] -- one list per window, so a
+# reset never mixes the old window's 95 % into the new window's pace.
+_rate_limit_state = {"mtime": None, "snap": None, "samples": {}, "hits": {}}
+
+
+def _rate_limit_pace(samples, now, span_s=1800):
+    """Pure: percentage points per hour over the last span_s seconds of one
+    window's (epoch, pct) samples. None when there is too little history
+    (< 2 samples or < 5 min between first and last) to say anything."""
+    recent = [(t, p) for t, p in samples if now - t <= span_s]
+    if len(recent) < 2:
+        return None
+    (t0, p0), (t1, p1) = recent[0], recent[-1]
+    if t1 - t0 < 300:
+        return None
+    return max(0.0, (p1 - p0) / (t1 - t0) * 3600)
+
+
+def _rate_limit_view(snap, hits, samples, now):
+    """Pure: statusline snapshot + transcript limit hits + pace samples ->
+    the /status "rate_limits" block, or None when there's nothing to show."""
+    snap = snap or {}
+    updated_at = snap.get("updated_at")
+    windows = []
+    for kind, label in _RATE_LIMIT_KINDS:
+        w = snap.get(kind) or {}
+        pct, resets = w.get("used_percentage"), w.get("resets_at")
+        source = "statusline"
+        hit = hits.get(kind)
+        if hit and hit["resets_at"] > now and (resets is None or hit["seen_at"] >= (updated_at or 0)):
+            pct, resets, source = 100.0, hit["resets_at"], "limit_message"
+        if not isinstance(pct, (int, float)) or not isinstance(resets, (int, float)):
+            continue
+        if resets <= now:
+            windows.append({"kind": kind, "label": label, "pct": None, "resets_at": resets,
+                            "status": "reset", "source": source})
+            continue
+        pace = _rate_limit_pace(samples.get((kind, resets), []), now)
+        projected = eta_full = None
+        if pace is not None:
+            projected = round(pct + pace * (resets - now) / 3600, 1)
+            if pace > 0 and pct < 100:
+                eta = now + (100 - pct) / pace * 3600
+                if eta < resets:
+                    eta_full = int(eta)
+        status = "hit" if pct >= 100 else "warn" if (pct >= _RATE_LIMIT_WARN_PCT or eta_full) else "ok"
+        windows.append({
+            "kind": kind, "label": label, "pct": round(float(pct), 1),
+            "resets_at": int(resets), "resets_in_s": int(resets - now),
+            "pace_pct_per_h": round(pace, 1) if pace is not None else None,
+            "projected_pct": projected, "eta_full_at": eta_full,
+            "status": status, "source": source,
+        })
+    if not windows:
+        return None
+    return {"updated_at": updated_at,
+            "age_s": int(now - updated_at) if isinstance(updated_at, (int, float)) else None,
+            "windows": windows}
+
+
+def _fmt_reset_time(epoch, now):
+    """'13:20' when it's within a day, else 'Tue 13:20'."""
+    dt = datetime.fromtimestamp(epoch)
+    return dt.strftime("%H:%M") if epoch - now < 86400 else dt.strftime("%a %H:%M")
+
+
+def _rate_limit_alerts(view, notified, now):
+    """Pure: which rate-limit notifications are due. Returns a list of
+    (key, toast_title, toast_body, webhook_payload); the caller adds each
+    key to `notified` after firing. One warning and one hit per window
+    (keyed on resets_at), so a new window re-arms both."""
+    out = []
+    for w in (view or {}).get("windows", []):
+        if w.get("status") not in ("warn", "hit"):
+            continue
+        key = (w["kind"], w["resets_at"], w["status"])
+        if key in notified:
+            continue
+        name = "5-hour" if w["kind"] == "five_hour" else "weekly"
+        resets = _fmt_reset_time(w["resets_at"], now)
+        if w["status"] == "hit":
+            title, body = f"⛔ {name.capitalize()} limit reached", f"Resets {resets}"
+        elif w.get("eta_full_at") and w["pct"] < _RATE_LIMIT_WARN_PCT:
+            title = f"⚠ On pace to hit the {name} limit at {_fmt_reset_time(w['eta_full_at'], now)}"
+            body = f"Now {w['pct']:.0f}% · resets {resets}"
+        else:
+            title, body = f"⚠ {name.capitalize()} limit at {w['pct']:.0f}%", f"Resets {resets}"
+        payload = {"event": "rate_limit", "level": "hit" if w["status"] == "hit" else "warning",
+                   "window": w["kind"], "pct": w["pct"], "resets_at": w["resets_at"],
+                   "eta_full_at": w.get("eta_full_at")}
+        out.append((key, title, body, payload))
+    return out
+
+
+RATE_LIMIT_NOTIFIED_FILE = os.path.join(AOC_DATA_DIR, "rate_limit_notified.json")
+
+
+def _load_rate_limit_notified(now):
+    """Already-fired (kind, resets_at, status) keys, persisted so a monitor
+    restart mid-window doesn't toast the same warning again. Expired windows
+    are dropped on load."""
+    data = _load_json_file(RATE_LIMIT_NOTIFIED_FILE)
+    out = set()
+    for k in (data if isinstance(data, list) else []):
+        if isinstance(k, list) and len(k) == 3 and isinstance(k[1], (int, float)) and k[1] > now:
+            out.add((str(k[0]), k[1], str(k[2])))
+    return out
+
+
+def _save_rate_limit_notified(keys):
+    try:
+        os.makedirs(AOC_DATA_DIR, exist_ok=True)
+        tmp = RATE_LIMIT_NOTIFIED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted([list(k) for k in keys]), f)
+        os.replace(tmp, RATE_LIMIT_NOTIFIED_FILE)
+    except Exception as e:
+        _log_bg_error("_save_rate_limit_notified", e)
+
+
+def _record_rate_limit_hit(kind, resets_at, seen_at):
+    """Called by the transcript scanner for a quotaLimits 'rejected' line."""
+    if kind not in dict(_RATE_LIMIT_KINDS) or not isinstance(resets_at, (int, float)):
+        return
+    with _rate_limit_lock:
+        prev = _rate_limit_state["hits"].get(kind)
+        if not prev or seen_at >= prev["seen_at"]:
+            _rate_limit_state["hits"][kind] = {"resets_at": resets_at, "seen_at": seen_at}
+
+
+def _rate_limits_snapshot():
+    """The /status 'rate_limits' block. Re-reads RATE_LIMITS_FILE only when
+    its mtime changes (it's in %LOCALAPPDATA%, not OneDrive, so the stat is
+    cheap) and appends each new reading to that window's pace samples."""
+    now = time.time()
+    with _rate_limit_lock:
+        st = _rate_limit_state
+        try:
+            mtime = os.stat(RATE_LIMITS_FILE).st_mtime
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime != st["mtime"]:
+            snap = _load_json_file(RATE_LIMITS_FILE)
+            if isinstance(snap, dict):
+                st["mtime"], st["snap"] = mtime, snap
+                t = snap.get("updated_at") or now
+                for kind, _label in _RATE_LIMIT_KINDS:
+                    w = snap.get(kind) or {}
+                    if isinstance(w.get("used_percentage"), (int, float)) and isinstance(w.get("resets_at"), (int, float)):
+                        lst = st["samples"].setdefault((kind, w["resets_at"]), [])
+                        if not lst or t > lst[-1][0]:
+                            lst.append((t, float(w["used_percentage"])))
+                            del lst[:-200]
+                for k in [k for k in st["samples"] if k[1] < now]:
+                    del st["samples"][k]
+        return _rate_limit_view(st["snap"], dict(st["hits"]),
+                                {k: list(v) for k, v in st["samples"].items()}, now)
+
+
 # Set at the very bottom of the module, once every function the /status
 # builder needs is defined. The notify workers below start long before that.
 _module_loaded = threading.Event()
@@ -2051,6 +2231,7 @@ def _webhook_notify_worker():
     _budget_cost_cache_at = 0.0
     _budget_notified = set()  # projects already alerted this calendar month
     _budget_notified_month = [datetime.now().strftime("%Y-%m")]
+    _rate_limit_notified = _load_rate_limit_notified(time.time())
     while True:
         try:
             time.sleep(3)
@@ -2173,6 +2354,20 @@ def _webhook_notify_worker():
                             )
                         except Exception:
                             pass
+
+            # Plan rate limits (5-hour / weekly): warn at 80 % or when the
+            # current pace reaches 100 % before the reset, and again on a hit.
+            # Account-wide, so only quiet hours apply (no project to mute).
+            for key, title, body, payload in _rate_limit_alerts(d.get("rate_limits"), _rate_limit_notified, time.time()):
+                _rate_limit_notified.add(key)
+                _save_rate_limit_notified({k for k in _rate_limit_notified if k[1] > time.time()})
+                if not _notification_suppressed(""):
+                    if events.get("rate_limit"):
+                        _fire_webhook(url, payload)
+                    try:
+                        _show_native_toast(title, body)
+                    except Exception:
+                        pass
 
             # Token-burn anomaly: a session whose recent tokens/min rate is a
             # multiple of its own session-long average -- catches a runaway
@@ -4010,6 +4205,10 @@ def _transcript_scanner_worker():
                         except Exception:
                             continue
                         t = obj.get("type")
+                        _ql = obj.get("quotaLimits")
+                        if isinstance(_ql, dict) and _ql.get("status") == "rejected":
+                            _record_rate_limit_hit(_ql.get("rateLimitType"), _ql.get("resetsAt"),
+                                                   _iso_to_epoch(obj.get("timestamp")) or now)
                         if t == "ai-title" and not ai_title:
                             ai_title = obj.get("aiTitle", "")
                             stats["ai_title"] = ai_title
@@ -4963,8 +5162,40 @@ body::before { content:none; }
   color:var(--c); 
 }
 .top-stat .lbl { font-size:11px; color:var(--t3); letter-spacing:.08em; text-transform:uppercase; margin-top:1px; }
+/* plan limit (5h / weekly): fill = used now, tick = projected at reset */
+.rl-stat { cursor:default; }
+.rl-stat .lbl { white-space:nowrap; }
+.rl-meter { position:relative; width:64px; height:4px; margin-top:3px; border-radius:2px; background:rgba(var(--c-rgb),.14); overflow:hidden; }
+.rl-meter i { position:absolute; left:0; top:0; bottom:0; width:0; background:var(--c); border-radius:2px; transition:width .4s; }
+.rl-meter b { position:absolute; top:0; bottom:0; width:2px; background:var(--t2); display:none; }
+.rl-stat.rl-warn .val { color:var(--o); } .rl-stat.rl-warn .rl-meter i { background:var(--o); }
+.rl-stat.rl-hit .val { color:var(--r); } .rl-stat.rl-hit .rl-meter i { background:var(--r); }
 
 .topbar-right { margin-left:auto; display:flex; align-items:center; gap:12px; }
+/* The full topbar needs ~1650 px; below that the right-hand buttons were
+   clipped (settings/theme/notifications unreachable on a 1366 px laptop).
+   Compact the chrome first, never the numbers. */
+@media (max-width: 1650px) {
+  .topbar { gap: 8px; padding: 0 14px; }
+  .top-stat { padding: 0 7px; }
+  .logo-text .t2 { display: none; }
+  .btn-reset-lbl { display: none; }
+  #btn-reset { padding-left: 8px; padding-right: 8px; }
+  #conn-label { display: none; }
+  .topbar-right { gap: 8px; }
+}
+@media (max-width: 1250px) {
+  .topbar .divider { display: none; }
+  .clock-date { display: none; }
+}
+@media (max-width: 1100px) {
+  .logo-text { display: none; }
+  .top-stat { padding: 0 4px; }
+}
+@media (max-width: 960px) {
+  .top-stat:has(#s-files), .top-stat:has(#s-errors), .top-stat:has(#s-elapsed) { display: none; }
+  #btn-notes, #btn-fs { display: none; }
+}
 
 .status-online { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--g); font-weight:600; letter-spacing:.06em; transition:color .4s; }
 .status-online .dot { width:7px; height:7px; border-radius:50%; background:var(--g); box-shadow:0 0 8px var(--g); animation:pulse 2s infinite; transition:background .4s,box-shadow .4s; }
@@ -6154,11 +6385,17 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
     <div class="top-stat"><div class="val" id="s-errors" style="color:var(--t3)">—</div><div class="lbl">Errors</div></div>
     <div class="divider"></div>
     <div class="top-stat"><div class="val" id="s-elapsed" style="font-size:13px">—</div><div class="lbl">Duration</div></div>
+    <div class="divider rl-part" style="display:none"></div>
+    <div class="top-stat rl-part rl-stat" id="rl-stat" style="display:none" title="">
+      <div class="val" id="rl-val">—</div>
+      <div class="rl-meter"><i id="rl-fill"></i><b id="rl-proj"></b></div>
+      <div class="lbl" id="rl-lbl">5h limit</div>
+    </div>
 
     <div class="topbar-right">
-      <button class="btn-reset" id="btn-reset" onclick="resetSession()">
+      <button class="btn-reset" id="btn-reset" onclick="resetSession()" title="Reset session">
         <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-        RESET SESSION
+        <span class="btn-reset-lbl">RESET SESSION</span>
       </button>
       <div id="tunnel-badge" style="display:none;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;background:rgba(var(--c-rgb),.1);border:1px solid rgba(var(--c-rgb),.25);cursor:pointer;transition:background .2s" onclick="openSettings()" title="Cloudflare Tunnel active — click for URL">
         <span style="width:6px;height:6px;border-radius:50%;background:rgba(var(--c-rgb),1);box-shadow:0 0 6px rgba(var(--c-rgb),.8);animation:pulse 2s infinite;flex-shrink:0"></span>
@@ -6475,6 +6712,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
           <label class="settings-toggle"><input type="checkbox" id="st-wh-waiting"> Waiting too long</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-cost"> Cost spike</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-budget"> Budget exceeded</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-ratelimit"> Plan limit (5h / weekly)</label>
         </div>
         <div class="settings-row" style="justify-content:flex-end">
           <button class="adp-btn" onclick="testWebhook()" style="padding:4px 14px;font-size:9px">TEST WEBHOOK</button>
@@ -10168,6 +10406,7 @@ function _applyStatus(sr){
   _tunnelUpdateUI(sr.tunnel);
   _selfUpdateUpdateUI(sr.self_update);
   _infraUpdateUI(sr.infra_health);
+  _rateLimitUpdateUI(sr.rate_limits);
   _updateSweepButton(sr);
   if(_adpAgentId) _renderAdp();
   if(currentView==='summary')  renderSummary(sr);
@@ -11736,7 +11975,7 @@ function _agentCost(a){
 let _budgetLimit = parseFloat(localStorage.getItem('aoc_budget') || '0');
 let _projectBudgets = (()=>{ try{ return JSON.parse(localStorage.getItem('aoc_project_budgets')||'{}'); }catch(e){ return {}; } })();
 let _webhookUrl = localStorage.getItem('aoc_webhook_url') || '';
-let _webhookEvents = JSON.parse(localStorage.getItem('aoc_webhook_events') || '{"done":true,"error":true,"stuck":false,"burn_spike":false,"weekly_digest":false,"waiting_nudge":false,"cost_spike":false,"budget_alert":false}');
+let _webhookEvents = JSON.parse(localStorage.getItem('aoc_webhook_events') || '{"done":true,"error":true,"stuck":false,"burn_spike":false,"weekly_digest":false,"waiting_nudge":false,"cost_spike":false,"budget_alert":false,"rate_limit":false}');
 let _quietStart = localStorage.getItem('aoc_quiet_start') || '';
 let _quietEnd = localStorage.getItem('aoc_quiet_end') || '';
 let _mutedProjects = (()=>{ try{ return JSON.parse(localStorage.getItem('aoc_muted_projects')||'[]'); }catch(e){ return []; } })();
@@ -11972,6 +12211,8 @@ function openSettings(){
   if(v('st-wh-digest')) v('st-wh-digest').checked=!!_webhookEvents.weekly_digest;
   if(v('st-wh-waiting')) v('st-wh-waiting').checked=!!_webhookEvents.waiting_nudge;
   if(v('st-wh-cost')) v('st-wh-cost').checked=!!_webhookEvents.cost_spike;
+  if(v('st-wh-budget')) v('st-wh-budget').checked=!!_webhookEvents.budget_alert;
+  if(v('st-wh-ratelimit')) v('st-wh-ratelimit').checked=!!_webhookEvents.rate_limit;
   if(v('st-quiet-start')) v('st-quiet-start').value=_quietStart;
   if(v('st-quiet-end'))   v('st-quiet-end').value=_quietEnd;
   if(v('st-muted-projects')) v('st-muted-projects').value=_mutedProjects.join(', ');
@@ -12000,6 +12241,7 @@ function openSettings(){
       if(v('st-wh-waiting')) v('st-wh-waiting').checked=!!_webhookEvents.waiting_nudge;
       if(v('st-wh-cost')) v('st-wh-cost').checked=!!_webhookEvents.cost_spike;
       if(v('st-wh-budget')) v('st-wh-budget').checked=!!_webhookEvents.budget_alert;
+      if(v('st-wh-ratelimit')) v('st-wh-ratelimit').checked=!!_webhookEvents.rate_limit;
     }
   }).catch(()=>{});
   /* Same idea for quiet hours / muted projects -- server is the source of
@@ -12095,6 +12337,7 @@ async function saveSettings(){
     waiting_nudge: v('st-wh-waiting')?.checked ?? false,
     cost_spike: v('st-wh-cost')?.checked ?? false,
     budget_alert: v('st-wh-budget')?.checked ?? false,
+    rate_limit: v('st-wh-ratelimit')?.checked ?? false,
   };
   _quietStart = v('st-quiet-start')?.value || '';
   _quietEnd = v('st-quiet-end')?.value || '';
@@ -12281,6 +12524,52 @@ function _fmtEpochAgo(epochSeconds){
   if(diff<3600) return Math.floor(diff/60)+'m ago';
   if(diff<86400) return Math.floor(diff/3600)+'h ago';
   return Math.floor(diff/86400)+'d ago';
+}
+/* Pure: the /status rate_limits block -> what the topbar shows. Picks the
+   most severe window (hit > warn > ok), 5-hour first on a tie, since that's
+   the one that interrupts work. nowS = epoch seconds. */
+function _rateLimitDisplay(rl, nowS){
+  const ws=((rl||{}).windows||[]).filter(w=>w.status!=='reset'&&typeof w.pct==='number');
+  if(!ws.length) return {show:false};
+  const rank={hit:2,warn:1,ok:0};
+  const w=ws.slice().sort((a,b)=>(rank[b.status]||0)-(rank[a.status]||0))[0];
+  const hm=s=>{ s=Math.max(0,Math.round(s)); const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+    return d?`${d}d ${h}h`:h?`${h}h ${m}m`:`${m}m`; };
+  const clock=e=>{ const dt=new Date(e*1000); return String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0'); };
+  const name=k=>k==='five_hour'?'5-hour':'Weekly';
+  const lines=ws.map(x=>{
+    let t=`${name(x.kind)}: ${x.pct.toFixed(0)}% used · resets in ${hm(x.resets_at-nowS)}`;
+    if(x.pace_pct_per_h!=null) t+=` · pace ${x.pace_pct_per_h.toFixed(1)}%/h`;
+    if(x.eta_full_at) t+=` → hits 100% at ${clock(x.eta_full_at)}`;
+    else if(x.projected_pct!=null) t+=` → ~${Math.min(100,x.projected_pct).toFixed(0)}% at reset`;
+    if(x.source==='limit_message') t+=' (from the limit message)';
+    return t;
+  });
+  if(rl.age_s!=null) lines.push(`Updated ${hm(rl.age_s)} ago by the Claude Code statusline`);
+  const left=w.resets_at-nowS;
+  return {
+    show:true, level:w.status,
+    val:w.status==='hit'?'LIMIT':`${w.pct.toFixed(0)}%`,
+    lbl:`${w.kind==='five_hour'?'5h':'Week'} · ↻ ${hm(left)}`,
+    fill:Math.min(100,Math.max(0,w.pct)),
+    proj:w.projected_pct!=null&&w.status!=='hit'?Math.min(100,w.projected_pct):null,
+    title:lines.join('\n'),
+  };
+}
+function _rateLimitUpdateUI(rl){
+  const d=_rateLimitDisplay(rl, Date.now()/1000);
+  document.querySelectorAll('.rl-part').forEach(el=>{ el.style.display=d.show?'':'none'; });
+  if(!d.show) return;
+  const stat=document.getElementById('rl-stat');
+  stat.classList.toggle('rl-warn', d.level==='warn');
+  stat.classList.toggle('rl-hit', d.level==='hit');
+  stat.title=d.title;
+  document.getElementById('rl-val').textContent=d.val;
+  document.getElementById('rl-lbl').textContent=d.lbl;
+  document.getElementById('rl-fill').style.width=d.fill+'%';
+  const proj=document.getElementById('rl-proj');
+  proj.style.display=d.proj!=null?'block':'none';
+  if(d.proj!=null) proj.style.left=`calc(${d.proj}% - 1px)`;
 }
 function _infraUpdateUI(infra){
   if(!infra) return;
@@ -12846,6 +13135,7 @@ def _build_status_payload_uncached() -> dict:
     with _self_update_lock:
         data["self_update"] = dict(_self_update_status)
     data["infra_health"] = _infra_health_snapshot()
+    data["rate_limits"] = _rate_limits_snapshot()
     return data
 
 

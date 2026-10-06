@@ -86,6 +86,8 @@ SENTINEL_SCRIPT = os.path.join(AOC_DIR, "sentinel.py")
 HOOKS_SRC_DIR = os.path.join(AOC_DIR, "hooks")
 HOOKS_DST_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks")
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+STATUSLINE_SCRIPT = "aoc_statusline.py"
+STATUSLINE_CHAIN_FILE = os.path.join(HOOKS_DST_DIR, "aoc_statusline_chain.json")
 
 TASK_NAME = r"\AOC\AOC Watchdog"
 SENTINEL_TASK_NAME = r"\AOC\AOC Sentinel"
@@ -114,7 +116,7 @@ def deploy_hook_scripts(pythonw: str) -> None:
     if not DRY_RUN:
         os.makedirs(HOOKS_DST_DIR, exist_ok=True)
 
-    for src_name in ("aoc_hook.py", "run_hook.pyw"):
+    for src_name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT):
         with open(os.path.join(HOOKS_SRC_DIR, src_name), encoding="utf-8") as f:
             content = f.read()
         content = content.replace("__MONITOR_SCRIPT__", MONITOR_SCRIPT.replace("\\", "/"))
@@ -137,7 +139,7 @@ def deploy_hook_scripts(pythonw: str) -> None:
                 f.write(content)
 
     if not DRY_RUN:
-        print(f"[ok] deployed aoc_hook.py + run_hook.pyw -> {HOOKS_DST_DIR}")
+        print(f"[ok] deployed aoc_hook.py + run_hook.pyw + {STATUSLINE_SCRIPT} -> {HOOKS_DST_DIR}")
 
 
 def deploy_cloud_config() -> None:
@@ -157,6 +159,81 @@ def deploy_cloud_config() -> None:
     with open(os.path.join(HOOKS_DST_DIR, "aoc_api_key.txt"), "w", encoding="utf-8") as f:
         f.write(CLOUD_KEY.strip())
     print(f"[ok] wrote cloud forwarding config -> {HOOKS_DST_DIR} (url={CLOUD_URL})")
+
+
+def _find_python_console(pythonw: str) -> str:
+    """The statusline must print to stdout, which pythonw.exe can't --
+    use the python.exe sitting next to it."""
+    candidate = os.path.join(os.path.dirname(pythonw), "python.exe")
+    return candidate if os.path.exists(candidate) else sys.executable
+
+
+def _statusline_command(python: str) -> str:
+    script = os.path.join(HOOKS_DST_DIR, STATUSLINE_SCRIPT).replace("\\", "/")
+    return f'"{python.replace(chr(92), "/")}" "{script}"'
+
+
+def _is_aoc_statusline(sl) -> bool:
+    return isinstance(sl, dict) and \
+        sl.get("command", "").replace("\\", "/").rstrip('"').endswith(STATUSLINE_SCRIPT)
+
+
+def _merge_statusline(settings: dict, command: str):
+    """Pure core of merge_statusline_settings. Returns (action, chain):
+    action is "added" / "updated" / "unchanged" / "wrapped"; chain is the
+    user's own statusLine object to save to aoc_statusline_chain.json
+    ("wrapped" only) -- the AOC script runs it and prints its output, so
+    their status bar looks exactly as before."""
+    current = settings.get("statusLine")
+    if _is_aoc_statusline(current):
+        if current.get("command") == command:
+            return "unchanged", None
+        current["command"] = command
+        return "updated", None
+    new = {"type": "command", "command": command, "padding": 0}
+    if isinstance(current, dict) and current.get("command"):
+        for k in ("padding", "refreshInterval"):
+            if k in current:
+                new[k] = current[k]
+        settings["statusLine"] = new
+        return "wrapped", current
+    settings["statusLine"] = new
+    return "added", None
+
+
+def _remove_statusline(settings: dict, chain):
+    """Pure core of the uninstall path: puts the user's wrapped statusLine
+    back (chain), or drops AOC's. Returns True if settings changed."""
+    if not _is_aoc_statusline(settings.get("statusLine")):
+        return False
+    if isinstance(chain, dict) and chain.get("command"):
+        settings["statusLine"] = chain
+    else:
+        del settings["statusLine"]
+    return True
+
+
+def merge_statusline_settings(pythonw: str) -> None:
+    settings = _load_settings()
+    action, chain = _merge_statusline(settings, _statusline_command(_find_python_console(pythonw)))
+    if DRY_RUN:
+        msg = {"added": "would add the AOC statusLine (plan-limit meter)",
+               "updated": "would update the AOC statusLine command",
+               "unchanged": "AOC statusLine already configured, no change",
+               "wrapped": "would wrap your existing statusLine (its output stays the same) "
+                          f"and save it to {STATUSLINE_CHAIN_FILE}"}[action]
+        print(f"[dry-run] {msg}")
+        return
+    if action == "unchanged":
+        print(f"[ok] AOC statusLine already present in {SETTINGS_FILE}")
+        return
+    if chain is not None:
+        os.makedirs(HOOKS_DST_DIR, exist_ok=True)
+        with open(STATUSLINE_CHAIN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"statusLine": chain}, f, indent=2)
+    _save_settings(settings)
+    print(f"[ok] statusLine {action} in {SETTINGS_FILE}" +
+          (" -- your previous one still runs, AOC just records the plan limits" if action == "wrapped" else ""))
 
 
 def _hook_command(pythonw: str) -> str:
@@ -341,10 +418,13 @@ def validate() -> None:
             print(f"[WARN] settings.json missing hook events: {missing}")
         else:
             print("[ok] settings.json has all 4 AOC hook events")
+        sl = settings.get("statusLine")
+        print(f"[{'ok' if _is_aoc_statusline(sl) else 'WARN'}] statusLine "
+              + ("runs the AOC plan-limit recorder" if _is_aoc_statusline(sl) else "is not AOC's -- the plan-limit meter stays empty"))
     except Exception as e:
         print(f"[FAIL] could not read back settings.json: {e}")
 
-    for fname in ("aoc_hook.py", "run_hook.pyw"):
+    for fname in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT):
         p = os.path.join(HOOKS_DST_DIR, fname)
         print(f"[{'ok' if os.path.exists(p) else 'FAIL'}] {p}")
 
@@ -408,11 +488,20 @@ def uninstall() -> None:
     user's data (%LOCALAPPDATA%\\AOC: history.db, logs, backups) alone."""
     settings = _load_settings()
     removed = _remove_hook_entries(settings)
-    if removed:
+    chain = None
+    try:
+        with open(STATUSLINE_CHAIN_FILE, encoding="utf-8") as f:
+            chain = json.load(f).get("statusLine")
+    except Exception:
+        pass
+    sl_changed = _remove_statusline(settings, chain)
+    if removed or sl_changed:
         _save_settings(settings)
     print(f"[ok] removed {removed} AOC hook entr{'y' if removed == 1 else 'ies'} from {SETTINGS_FILE}")
+    if sl_changed:
+        print("[ok] " + ("restored your previous statusLine" if chain else "removed the AOC statusLine"))
 
-    for name in ("aoc_hook.py", "run_hook.pyw"):
+    for name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, os.path.basename(STATUSLINE_CHAIN_FILE)):
         try:
             os.remove(os.path.join(HOOKS_DST_DIR, name))
             print(f"[ok] deleted {os.path.join(HOOKS_DST_DIR, name)}")
@@ -459,6 +548,7 @@ def main():
     deploy_hook_scripts(pythonw)
     deploy_cloud_config()
     merge_hook_settings(pythonw)
+    merge_statusline_settings(pythonw)
     register_watchdog_task(pythonw)
     register_sentinel_task(pythonw)
 
