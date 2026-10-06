@@ -157,6 +157,8 @@ otherwise `?token=`/`X-AOC-Token` — see **Security model** below).
 | GET | `/history/<session_id>` | One session's full per-agent detail + files |
 | GET | `/history/save_current` | Force-save the live session to `history.db` now |
 | GET | `/analytics` | Aggregates behind History → Analytics (by day/project/model/...) |
+| GET | `/search_transcripts?q=` | Full-text search over past conversations (History → Conversations) |
+| GET | `/cache_stats?days=7\|30\|0` | Prompt-cache / spend breakdown behind History → Cache |
 | GET | `/export_costs.csv`, `/export_costs_by_model.csv`, `/export_costs_by_subagent_type.csv` | CSV cost reports (`?from=&to=`) |
 | GET | `/errors` | Persistent cross-session error list (backs the ERRORS panel) |
 | GET | `/diag` | Self-diagnostics — uptime, threads, memory, DB/backup size |
@@ -580,6 +582,43 @@ that saved row (`POST /history_tags`) rather than going through the live
 session-note mechanism, since tagging is inherently something you do
 after the fact. The existing History search box already reaches them for
 free (`/history/search`'s query also matches against `tags`).
+
+**Waiting on you.** A session whose Claude finished its turn shows what
+Claude last said right on its CLI card and session bay -- labelled *Claude
+asks* when it ends with a question -- so you see what it needs without
+switching windows. Sessions waiting 10+ minutes are also listed in a strip
+above every view, longest wait first (click one to jump to the CLI view).
+The text comes from the transcript scanner (`last_message` in `/status`).
+
+**History → CONVERSATIONS** searches what was actually *said* in past
+Claude Code sessions -- your prompts and Claude's replies, not tool calls
+or tool output. Every word must match, the last one as a prefix, and
+accents don't matter (`pokracuj` finds `pokračuj`). Results are grouped
+per session with the matching lines highlighted; **OPEN** shows the saved
+session, **⟲ RESUME** copies `cd "<folder>"; claude --resume <id>`. The
+index is a separate SQLite FTS5 file, `%LOCALAPPDATA%\AOC\transcript_index.db`
+(a few MB, rebuildable -- delete it to start over), built from
+`~/.claude/projects` a few minutes after AOC starts and kept current once a
+minute. Local machine only; remote machines aren't searched.
+
+**History → CACHE** explains where Claude Code's token spend goes (7 days /
+30 days / all): spend, share of prompt tokens served from the prompt cache,
+what the cache saved, average context per call, and a cost split (cache
+reads / cache writes / output / uncached input). Below that, plain-language
+findings -- e.g. that most of the spend is Claude re-reading a long
+conversation on every call, or how many times a session's whole context had
+to be cached again after you came back more than an hour later (Claude
+Code's cache lives one hour) and what that cost -- then the most expensive
+sessions and a per-model table. It's computed from the same transcript
+index, one row per session/model/day, with every API response counted once.
+
+Cost accuracy: Claude Code writes one transcript line per content block of a
+response, each repeating the same usage. Until 2026-10-06 the transcript
+scanner summed every line, so CLI session tokens/cost were overstated about
+2.4x; it now counts each response once, prices it with its own model
+(Opus 5.5 / Sonnet 5 / Fable 5.1 / Opus 4.5-4.8 were missing from the price
+table and fell back to Sonnet 4 rates) and prices 1-hour cache writes at 2x
+input. History rows saved before that keep their old numbers.
 
 Settings → **NOTIFY** covers **quiet hours** and **muted projects**
 (suppress sound/toast/webhook, either on a schedule or per-project

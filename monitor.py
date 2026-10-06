@@ -3951,14 +3951,31 @@ def _read_ai_title(jsonl_path: str) -> str:
 # ever sent it, so that bar never rendered.
 _CLAUDE_CONTEXT_WINDOW = 200_000
 
+# First matching prefix wins, so specific ids come before their family
+# ("claude-opus-4-5" before "claude-opus-4"). cache_write is the 5-minute
+# TTL rate (1.25x input); 1-hour writes cost 2x input -- see
+# _CACHE_WRITE_1H_MULT. Rates from Anthropic's model table (2026-06).
 _MODEL_PRICING = {
+    "claude-fable-5-1":  (10.0, 50.0, 12.50, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 12.50, 0.25),
+    "claude-fable-5":    (10.0, 50.0, 12.50, 1.00),
+    "claude-mythos-5":   (10.0, 50.0, 12.50, 1.00),
+    "claude-opus-5-5":   (4.0,  20.0,  5.00, 0.20),
+    "claude-opus-5":     (5.0,  25.0,  6.25, 0.50),
+    "claude-opus-4-8":   (5.0,  25.0,  6.25, 0.50),
+    "claude-opus-4-7":   (5.0,  25.0,  6.25, 0.50),
+    "claude-opus-4-6":   (5.0,  25.0,  6.25, 0.50),
+    "claude-opus-4-5":   (5.0,  25.0,  6.25, 0.50),
     "claude-opus-4":     (15.0, 75.0, 18.75, 1.50),
+    "claude-sonnet-5":   (2.0,  10.0,  2.50, 0.20),
     "claude-sonnet-4":   (3.0,  15.0,  3.75, 0.30),
-    "claude-haiku-4":    (0.80,  4.0,  1.00, 0.08),
+    "claude-haiku-4":    (1.0,   5.0,  1.25, 0.10),
     "claude-opus-3":     (15.0, 75.0, 18.75, 1.50),
     "claude-sonnet-3-5": (3.0,  15.0,  3.75, 0.30),
+    "claude-3-5-haiku":  (0.80,  4.0,  1.00, 0.08),
     "claude-haiku-3":    (0.25,  1.25, 0.30, 0.03),
 }
+_CACHE_WRITE_1H_MULT = 2.0
 
 _transcript_cursors: dict = {}   # session_id → {"path": str, "offset": int, "stats": dict}
 _transcript_cursors_lock = _threading.Lock()
@@ -3969,9 +3986,15 @@ def _model_pricing(model: str):
             return pricing
     return (3.0, 15.0, 3.75, 0.30)  # default: sonnet-4
 
-def _calc_cost(inp: int, out: int, cache_write: int, cache_read: int, model: str) -> float:
+def _calc_cost(inp: int, out: int, cache_write: int, cache_read: int, model: str,
+               cache_write_1h: int = 0) -> float:
+    """cache_write is all cache-creation tokens; cache_write_1h is the part
+    written with the 1-hour TTL (usage.cache_creation.ephemeral_1h_input_tokens),
+    which costs 2x input instead of 1.25x. Claude Code writes 1-hour entries."""
     pi, po, pw, pr = _model_pricing(model)
-    return (inp * pi + out * po + cache_write * pw + cache_read * pr) / 1_000_000
+    cw_1h = min(max(cache_write_1h or 0, 0), cache_write or 0)
+    return (inp * pi + out * po + ((cache_write or 0) - cw_1h) * pw
+            + cw_1h * pi * _CACHE_WRITE_1H_MULT + cache_read * pr) / 1_000_000
 
 
 # child_id -> parent_id, for a parent's child_ids arriving before the
@@ -4128,6 +4151,51 @@ def _apply_agent_update(status: dict, au: dict, session_id: str, session_project
             _log_bg_error("_apply_agent_update:agent_start", e)
 
 
+def _assistant_text(obj, limit=1500):
+    """Pure: the visible text of one main-thread assistant transcript line
+    (text blocks joined), or "" -- what Claude last said, shown on a session
+    that's waiting on you. Subagent (sidechain) lines don't count."""
+    if not isinstance(obj, dict) or obj.get("type") != "assistant" or obj.get("isSidechain"):
+        return ""
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return ""
+    parts = [b.get("text", "") for b in content
+             if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()]
+    text = "\n\n".join(p.strip() for p in parts)
+    # keep the END: a question to the user comes last
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
+def _usage_first_sighting(stats: dict, msg_id, request_id) -> bool:
+    """True the first time a (message id, request id) pair is seen in this
+    session's transcript. Lines without either id are counted (old formats)."""
+    if not msg_id and not request_id:
+        return True
+    seen = stats.setdefault("usage_keys", set())
+    key = (msg_id or "", request_id or "")
+    if key in seen:
+        return False
+    seen.add(key)
+    return True
+
+
+def _accumulate_usage(stats: dict, usage: dict, model: str) -> None:
+    """Add one API response's usage to a session's running totals."""
+    inp = usage.get("input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    cw = usage.get("cache_creation_input_tokens", 0) or 0
+    cr = usage.get("cache_read_input_tokens", 0) or 0
+    cw_1h = ((usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0)
+    stats["input_tokens"] = stats.get("input_tokens", 0) + inp
+    stats["output_tokens"] = stats.get("output_tokens", 0) + out
+    stats["cache_write_tokens"] = stats.get("cache_write_tokens", 0) + cw
+    stats["cache_write_1h_tokens"] = stats.get("cache_write_1h_tokens", 0) + cw_1h
+    stats["cache_read_tokens"] = stats.get("cache_read_tokens", 0) + cr
+    stats["msg_count"] = stats.get("msg_count", 0) + 1
+    stats["cost_acc"] = stats.get("cost_acc", 0.0) + _calc_cost(inp, out, cw, cr, model, cw_1h)
+
+
 def _transcript_scanner_worker():
     """Background thread: scan ~/.claude/projects/ for active sessions every 30s.
     Incrementally reads transcripts to extract token usage, model, cost, and ai-title.
@@ -4232,11 +4300,16 @@ def _transcript_scanner_worker():
                                 if not stats.get("first_ts"):
                                     stats["first_ts"] = ts
                                 stats["last_ts"] = ts
-                            stats["input_tokens"] = stats.get("input_tokens", 0) + usage.get("input_tokens", 0)
-                            stats["output_tokens"] = stats.get("output_tokens", 0) + usage.get("output_tokens", 0)
-                            stats["cache_write_tokens"] = stats.get("cache_write_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
-                            stats["cache_read_tokens"] = stats.get("cache_read_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-                            stats["msg_count"] = stats.get("msg_count", 0) + 1
+                            # One API response is written as one line PER CONTENT
+                            # BLOCK (thinking, text, tool_use...), each repeating
+                            # the same usage -- summing every line overcounted
+                            # tokens and cost ~2.4x. Count each (message id,
+                            # request id) once, priced with its own model.
+                            if usage and _usage_first_sighting(stats, msg.get("id"), obj.get("requestId")):
+                                _accumulate_usage(stats, usage, msg.get("model") or stats.get("model", ""))
+                            _last_txt = _assistant_text(obj)
+                            if _last_txt:
+                                stats["last_message"] = _last_txt
 
                             # Agent/Task subagent start -- same id scheme as
                             # aoc_hook.py's agent_id_from_hook() (ag_ + md5(tool_use_id)),
@@ -4371,15 +4444,8 @@ def _transcript_scanner_worker():
                                 au["tokens_used"] = int(usage_m.group(1))
                             agent_events.append(au)
 
-                    # Recalculate cost
-                    model = stats.get("model", "")
-                    stats["estimated_cost"] = _calc_cost(
-                        stats.get("input_tokens", 0),
-                        stats.get("output_tokens", 0),
-                        stats.get("cache_write_tokens", 0),
-                        stats.get("cache_read_tokens", 0),
-                        model
-                    )
+                    # per-message cost, summed in _accumulate_usage
+                    stats["estimated_cost"] = stats.get("cost_acc", 0.0)
 
                     # Save updated cursor
                     with _transcript_cursors_lock:
@@ -4421,6 +4487,8 @@ def _transcript_scanner_worker():
                         if "waiting_on_you" in stats:
                             _accumulate_waiting_time(sess, stats["waiting_on_you"], now)
                             sess["waiting_on_you"] = stats["waiting_on_you"]
+                        if stats.get("last_message"):
+                            sess["last_message"] = stats["last_message"]
                         if ai_title:
                             # Self-heals an already-corrupted stored value, not
                             # just "set if missing" -- the previous version of
@@ -4483,6 +4551,408 @@ def _transcript_scanner_worker():
 
 
 _threading.Thread(target=_transcript_scanner_worker, daemon=True).start()
+
+
+# ── Conversation search (full text over ~/.claude/projects transcripts) ─────
+# Own SQLite file next to history.db, not inside it: history.db is copied by
+# the hourly backup, and the index is rebuildable from the transcripts at any
+# time. Only what people actually wrote/read is indexed -- user prompts and
+# assistant text -- not tool calls/results, which are ~99 % of the bytes.
+TRANSCRIPT_INDEX_DB = os.path.join(AOC_DATA_DIR, "transcript_index.db")
+_TRANSCRIPT_INDEX_MAX_TEXT = 20000      # chars per message
+_TRANSCRIPT_INDEX_BYTES_PER_TICK = 32 * 1024 * 1024
+_transcript_index_progress = {"files": 0, "indexed": 0, "messages": 0, "building": False, "updated_at": 0}
+
+
+# Bump when the schema or what gets extracted changes: the index is derived
+# data, so an old one is simply dropped and rebuilt from the transcripts.
+_TRANSCRIPT_INDEX_VERSION = 2
+
+
+def _transcript_index_connect(path=None):
+    conn = sqlite3.connect(path or TRANSCRIPT_INDEX_DB, timeout=10, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    if conn.execute("PRAGMA user_version").fetchone()[0] != _TRANSCRIPT_INDEX_VERSION:
+        conn.executescript("""
+            DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS sessions_meta;
+            DROP TABLE IF EXISTS msgs; DROP TABLE IF EXISTS usage;
+        """)
+        conn.execute(f"PRAGMA user_version = {_TRANSCRIPT_INDEX_VERSION}")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, offset INTEGER NOT NULL,
+                                          session_id TEXT NOT NULL, last_usage_key TEXT);
+        CREATE TABLE IF NOT EXISTS sessions_meta (session_id TEXT PRIMARY KEY, project TEXT, cwd TEXT,
+                                                  title TEXT, first_ts TEXT, last_ts TEXT,
+                                                  last_call_epoch REAL);
+        CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(
+            text, session_id UNINDEXED, ts UNINDEXED, role UNINDEXED,
+            tokenize = 'unicode61 remove_diacritics 2');
+        -- one row per session, model and local day; tokens deduplicated per
+        -- API response. cold_* = re-caches: responses (not a session's first)
+        -- that wrote most of their prompt to the cache again instead of
+        -- reading it (see _usage_line_sample); cold_idle_n = those after
+        -- >= 55 min of silence (Claude Code's cache lives 1 hour).
+        CREATE TABLE IF NOT EXISTS usage (
+            session_id TEXT NOT NULL, model TEXT NOT NULL, day TEXT NOT NULL,
+            n INTEGER DEFAULT 0, inp INTEGER DEFAULT 0, out INTEGER DEFAULT 0,
+            cw INTEGER DEFAULT 0, cw1h INTEGER DEFAULT 0, cr INTEGER DEFAULT 0, cost REAL DEFAULT 0,
+            cold_n INTEGER DEFAULT 0, cold_cw INTEGER DEFAULT 0, cold_cw1h INTEGER DEFAULT 0,
+            cold_idle_n INTEGER DEFAULT 0,
+            PRIMARY KEY (session_id, model, day));
+    """)
+    return conn
+
+
+_COLD_IDLE_S = 55 * 60
+_RECACHE_MIN_TOKENS = 20000
+
+
+def _usage_line_sample(obj, prev_key, prev_call_epoch):
+    """Pure: one transcript line -> (sample | None, key, call_epoch). A sample
+    is one API response's usage: {model, day, inp, out, cw, cw1h, cr, cold,
+    cold_idle}. Lines repeating the previous (message id, request id) -- one
+    per content block of the same response, always adjacent -- return None."""
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None, prev_key, prev_call_epoch
+    msg = obj.get("message") or {}
+    u = msg.get("usage")
+    if not isinstance(u, dict):
+        return None, prev_key, prev_call_epoch
+    key = f"{msg.get('id') or ''}|{obj.get('requestId') or ''}"
+    if key != "|" and key == prev_key:
+        return None, prev_key, prev_call_epoch
+    model = msg.get("model") or ""
+    if model.startswith("<"):  # "<synthetic>" harness messages, no API call
+        return None, key, prev_call_epoch
+    epoch = _iso_to_epoch(obj.get("timestamp"))
+    cw = u.get("cache_creation_input_tokens", 0) or 0
+    cr = u.get("cache_read_input_tokens", 0) or 0
+    inp = u.get("input_tokens", 0) or 0
+    # a re-cache: at least half the prompt (and >= 20k tokens) written again
+    # -- the cache had expired, the model changed, or the context was
+    # compacted/rewritten. Normal turns write only the newest messages.
+    cold = (prev_call_epoch is not None and cw >= _RECACHE_MIN_TOKENS
+            and cw * 2 >= cw + cr + inp)
+    sample = {
+        "model": model,
+        "day": time.strftime("%Y-%m-%d", time.localtime(epoch)) if epoch else "",
+        "inp": inp, "out": u.get("output_tokens", 0) or 0,
+        "cw": cw, "cw1h": (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0) or 0,
+        "cr": cr, "cold": cold,
+        "cold_idle": bool(cold and epoch and prev_call_epoch and epoch - prev_call_epoch >= _COLD_IDLE_S),
+    }
+    return sample, key, (epoch or prev_call_epoch)
+
+
+def _usage_add_samples(conn, session_id, samples):
+    """Fold samples into the usage table (one UPSERT per session/model/day)."""
+    agg = {}
+    for sm in samples:
+        k = (sm["model"], sm["day"])
+        a = agg.setdefault(k, [0] * 11)
+        a[0] += 1
+        a[1] += sm["inp"]; a[2] += sm["out"]; a[3] += sm["cw"]; a[4] += sm["cw1h"]; a[5] += sm["cr"]
+        a[6] += _calc_cost(sm["inp"], sm["out"], sm["cw"], sm["cr"], sm["model"], sm["cw1h"])
+        if sm["cold"]:
+            a[7] += 1; a[8] += sm["cw"]; a[9] += sm["cw1h"]
+            a[10] += 1 if sm["cold_idle"] else 0
+    for (model, day), a in agg.items():
+        conn.execute("""
+            INSERT INTO usage (session_id, model, day, n, inp, out, cw, cw1h, cr, cost,
+                               cold_n, cold_cw, cold_cw1h, cold_idle_n)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (session_id, model, day) DO UPDATE SET
+                n = n + excluded.n, inp = inp + excluded.inp, out = out + excluded.out,
+                cw = cw + excluded.cw, cw1h = cw1h + excluded.cw1h, cr = cr + excluded.cr,
+                cost = cost + excluded.cost, cold_n = cold_n + excluded.cold_n,
+                cold_cw = cold_cw + excluded.cold_cw, cold_cw1h = cold_cw1h + excluded.cold_cw1h,
+                cold_idle_n = cold_idle_n + excluded.cold_idle_n""",
+                     (session_id, model, day, *a))
+
+
+def _transcript_line_messages(obj):
+    """Pure: one parsed transcript line -> [(role, text)] worth indexing.
+    User prompts (plain strings and text blocks) and assistant text blocks;
+    skips tool calls/results, thinking, meta/caveat lines, subagent
+    (sidechain) traffic and harness-injected '<task-notification>'-style
+    strings."""
+    if not isinstance(obj, dict) or obj.get("isSidechain") or obj.get("isMeta"):
+        return []
+    t = obj.get("type")
+    if t not in ("user", "assistant"):
+        return []
+    content = (obj.get("message") or {}).get("content")
+    out = []
+    if isinstance(content, str):
+        if t == "user" and content.strip() and not content.lstrip().startswith("<"):
+            out.append((t, content))
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
+                if t == "user" and b["text"].lstrip().startswith("<"):
+                    continue
+                out.append((t, b["text"]))
+    return [(r, txt[:_TRANSCRIPT_INDEX_MAX_TEXT]) for r, txt in out]
+
+
+def _transcript_index_file(conn, path, session_id, project, offset, max_bytes):
+    """Index the complete lines of one transcript from `offset` on (at most
+    ~max_bytes). A file that shrank (rewritten) is re-indexed from 0.
+    Returns (new_offset, bytes_read, messages_added). Caller commits."""
+    size = os.path.getsize(path)
+    if size < offset:
+        conn.execute("DELETE FROM msgs WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM usage WHERE session_id = ?", (session_id,))
+        conn.execute("UPDATE sessions_meta SET last_call_epoch = NULL WHERE session_id = ?", (session_id,))
+        conn.execute("UPDATE files SET last_usage_key = NULL WHERE path = ?", (path,))
+        offset = 0
+    if size == offset:
+        return offset, 0, 0
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read(max_bytes)
+    end = data.rfind(b"\n")
+    if end < 0:
+        # a single line longer than max_bytes: take it whole
+        if len(data) < max_bytes:
+            return offset, 0, 0  # partial last line, still being written
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.readline()
+        end = len(data) - 1
+        if not data.endswith(b"\n"):
+            return offset, 0, 0
+    chunk = data[:end + 1]
+    rows, meta, samples = [], {}, []
+    r = conn.execute("SELECT last_usage_key FROM files WHERE path = ?", (path,)).fetchone()
+    prev_key = r[0] if r else None
+    r = conn.execute("SELECT last_call_epoch FROM sessions_meta WHERE session_id = ?", (session_id,)).fetchone()
+    prev_call = r[0] if r else None
+    for raw in chunk.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+            meta["title"] = obj["aiTitle"]
+        ts = obj.get("timestamp") or ""
+        if ts and not obj.get("isSidechain"):
+            meta.setdefault("first_ts", ts)
+            meta["last_ts"] = ts
+        if obj.get("cwd") and "cwd" not in meta:
+            meta["cwd"] = obj["cwd"]
+        for role, text in _transcript_line_messages(obj):
+            rows.append((text, session_id, ts, role))
+        sample, prev_key, prev_call = _usage_line_sample(obj, prev_key, prev_call)
+        if sample:
+            samples.append(sample)
+    _usage_add_samples(conn, session_id, samples)
+    if rows:
+        conn.executemany("INSERT INTO msgs (text, session_id, ts, role) VALUES (?, ?, ?, ?)", rows)
+    conn.execute("INSERT OR IGNORE INTO sessions_meta (session_id, project) VALUES (?, ?)", (session_id, project))
+    conn.execute("UPDATE sessions_meta SET last_call_epoch = ? WHERE session_id = ?", (prev_call, session_id))
+    if meta:
+        conn.execute("""UPDATE sessions_meta SET
+                            title = COALESCE(?, title), cwd = COALESCE(cwd, ?),
+                            first_ts = COALESCE(first_ts, ?), last_ts = COALESCE(?, last_ts)
+                        WHERE session_id = ?""",
+                     (meta.get("title"), meta.get("cwd"), meta.get("first_ts"), meta.get("last_ts"), session_id))
+    new_offset = offset + len(chunk)
+    conn.execute("INSERT OR REPLACE INTO files (path, offset, session_id, last_usage_key) VALUES (?, ?, ?, ?)",
+                 (path, new_offset, session_id, prev_key))
+    return new_offset, len(chunk), len(rows)
+
+
+def _transcript_index_tick(conn, projects_base, budget_bytes=_TRANSCRIPT_INDEX_BYTES_PER_TICK):
+    """One pass: index new bytes of every top-level transcript, newest files
+    first, until budget_bytes is spent. Returns (files_seen, files_current,
+    bytes_read) -- files_current < files_seen means more work is pending."""
+    known = dict(conn.execute("SELECT path, offset FROM files"))
+    entries = []
+    for proj in os.listdir(projects_base) if os.path.isdir(projects_base) else []:
+        pdir = os.path.join(projects_base, proj)
+        if not os.path.isdir(pdir):
+            continue
+        for fname in os.listdir(pdir):
+            if fname.endswith(".jsonl"):
+                fp = os.path.join(pdir, fname)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, fp, proj, fname[:-6]))
+    entries.sort(reverse=True)
+    spent, current = 0, 0
+    for _mtime, size, fp, proj, sid in entries:
+        off = known.get(fp, 0)
+        if size == off:
+            current += 1
+            continue
+        if spent >= budget_bytes:
+            continue
+        try:
+            new_off, n, _added = _transcript_index_file(conn, fp, sid, _decode_project_name(proj), off,
+                                                       budget_bytes - spent if budget_bytes > spent else 1)
+        except OSError:
+            continue
+        conn.commit()
+        spent += n
+        if new_off == size:
+            current += 1
+    return len(entries), current, spent
+
+
+def _fts_query(q):
+    """User text -> an FTS5 MATCH expression: every word must appear (AND),
+    each quoted so FTS syntax in the input (AND, NEAR, -, :, *) is literal;
+    the last word also matches as a prefix, for search-as-you-type."""
+    words = [w for w in re.findall(r"[\w][\w'.\-]*", q or "", re.UNICODE) if w.strip("'.-")]
+    if not words:
+        return ""
+    parts = ['"' + w.replace('"', '""') + '"' for w in words[:12]]
+    parts[-1] += "*"
+    return " ".join(parts)
+
+
+def _search_transcripts(conn, q, limit_sessions=30, hits_per_session=3):
+    """Matches grouped by session, best match first: [{session_id, title,
+    project, cwd, first_ts, last_ts, hits: [{role, ts, snippet}], n_hits}].
+    Snippets mark matches with \\x02...\\x03 (the UI escapes, then swaps in
+    <mark>), so no HTML ever comes out of the index."""
+    expr = _fts_query(q)
+    if not expr:
+        return []
+    rows = conn.execute(
+        "SELECT session_id, role, ts, snippet(msgs, 0, char(2), char(3), '…', 14) "
+        "FROM msgs WHERE msgs MATCH ? ORDER BY rank LIMIT 2000", (expr,)).fetchall()
+    sessions, order = {}, []
+    for sid, role, ts, snip in rows:
+        s = sessions.get(sid)
+        if s is None:
+            if len(order) >= limit_sessions:
+                continue
+            s = sessions[sid] = {"session_id": sid, "hits": [], "n_hits": 0}
+            order.append(sid)
+        s["n_hits"] += 1
+        if len(s["hits"]) < hits_per_session:
+            s["hits"].append({"role": role, "ts": ts, "snippet": snip})
+    if order:
+        marks = ",".join("?" * len(order))
+        for sid, project, cwd, title, first_ts, last_ts in conn.execute(
+                f"SELECT session_id, project, cwd, title, first_ts, last_ts FROM sessions_meta "
+                f"WHERE session_id IN ({marks})", order):
+            sessions[sid].update(project=project or "", cwd=cwd or "", title=title or "",
+                                 first_ts=first_ts or "", last_ts=last_ts or "")
+    return [sessions[sid] for sid in order]
+
+
+def _cache_stats(conn, since_day, top=12):
+    """Prompt-cache report over usage rows with day >= since_day:
+    totals, by_day, by_model and the sessions where the cache did worst.
+      hit_rate   = cache reads / all prompt tokens (reads + writes + uncached)
+      saved      = what the cache reads would have cost as plain input, minus
+                   what they did cost
+      cold_extra = what the cold re-writes cost beyond reading the same
+                   tokens from a warm cache (5-min writes 1.25x, 1-hour 2x)"""
+    def money(model, cr, cold_cw, cold_cw1h):
+        pi, _po, pw, pr = _model_pricing(model or "")
+        saved = cr * (pi - pr) / 1e6
+        c1h = min(cold_cw1h, cold_cw)
+        extra = ((cold_cw - c1h) * (pw - pr) + c1h * (pi * _CACHE_WRITE_1H_MULT - pr)) / 1e6
+        return saved, extra
+
+    rows = conn.execute("""
+        SELECT u.session_id, u.model, u.day, u.n, u.inp, u.out, u.cw, u.cw1h, u.cr, u.cost,
+               u.cold_n, u.cold_cw, u.cold_cw1h, u.cold_idle_n
+        FROM usage u WHERE u.day >= ?""", (since_day,)).fetchall()
+    keys = ("n", "inp", "out", "cw", "cr", "cost", "cold_n", "cold_cw", "cold_idle_n", "saved", "cold_extra",
+            "cost_read", "cost_write", "cost_out", "cost_in")
+
+    def blank():
+        return dict.fromkeys(keys, 0)
+
+    def add(d, r, saved, extra, split):
+        d["n"] += r[3]; d["inp"] += r[4]; d["out"] += r[5]; d["cw"] += r[6]; d["cr"] += r[8]
+        d["cost"] += r[9]; d["cold_n"] += r[10]; d["cold_cw"] += r[11]; d["cold_idle_n"] += r[13]
+        d["saved"] += saved; d["cold_extra"] += extra
+        for k, v in split.items():
+            d[k] += v
+
+    total, by_day, by_model, by_sess = blank(), {}, {}, {}
+    for r in rows:
+        saved, extra = money(r[1], r[8], r[11], r[12])
+        pi, po, pw, pr = _model_pricing(r[1] or "")
+        c1h = min(r[7], r[6])
+        split = {"cost_read": r[8] * pr / 1e6, "cost_out": r[5] * po / 1e6, "cost_in": r[4] * pi / 1e6,
+                 "cost_write": ((r[6] - c1h) * pw + c1h * pi * _CACHE_WRITE_1H_MULT) / 1e6}
+        for d in (total, by_day.setdefault(r[2], blank()), by_model.setdefault(r[1], blank()),
+                  by_sess.setdefault(r[0], blank())):
+            add(d, r, saved, extra, split)
+
+    def finish(d):
+        prompt = d["inp"] + d["cw"] + d["cr"]
+        d["hit_rate"] = round(d["cr"] / prompt, 4) if prompt else None
+        d["avg_context"] = int(prompt / d["n"]) if d["n"] else 0
+        for k in ("cost", "saved", "cold_extra", "cost_read", "cost_write", "cost_out", "cost_in"):
+            d[k] = round(d[k], 4)
+        return d
+
+    sessions = []
+    if by_sess:
+        ids = list(by_sess)
+        meta = {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            for sid, project, cwd, title, last_ts in conn.execute(
+                    f"SELECT session_id, project, cwd, title, last_ts FROM sessions_meta "
+                    f"WHERE session_id IN ({','.join('?' * len(part))})", part):
+                meta[sid] = {"project": project or "", "cwd": cwd or "", "title": title or "", "last_ts": last_ts or ""}
+        for sid, d in by_sess.items():
+            sessions.append(dict(finish(d), session_id=sid, **meta.get(sid, {"project": "", "cwd": "", "title": "", "last_ts": ""})))
+        # most expensive first -- the report explains where each one's money went
+        sessions.sort(key=lambda x: x["cost"], reverse=True)
+    return {
+        "since": since_day,
+        "total": finish(total),
+        "by_day": [dict(finish(d), day=k) for k, d in sorted(by_day.items())],
+        "by_model": sorted((dict(finish(d), model=k) for k, d in by_model.items()), key=lambda x: -x["cost"]),
+        "sessions": sessions[:top],
+    }
+
+
+def _transcript_index_worker():
+    """Keeps transcript_index.db current: after the startup grace, one tick a
+    minute, or back-to-back (short pause) while the first build catches up."""
+    projects_base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    time.sleep(_STARTUP_GRACE_S)
+    conn = None
+    while True:
+        try:
+            if conn is None:
+                os.makedirs(AOC_DATA_DIR, exist_ok=True)
+                conn = _transcript_index_connect()
+            _transcript_index_progress["building"] = True
+            seen, current, _spent = _transcript_index_tick(conn, projects_base)
+            msgs = conn.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
+            _transcript_index_progress.update(files=seen, indexed=current, messages=msgs,
+                                              building=current < seen, updated_at=time.time())
+            time.sleep(2 if current < seen else 60)
+        except Exception as e:
+            _log_bg_error("_transcript_index_worker", e)
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
+            time.sleep(60)
+
+
+_threading.Thread(target=_transcript_index_worker, daemon=True).start()
 
 
 _TS_RE = re.compile(r'"timestamp"\s*:\s*"([0-9T:.\-]+Z?)"')
@@ -5710,6 +6180,65 @@ button.le-tag { cursor:pointer; }
 .hist-toolbar { display:flex;align-items:center;gap:10px;padding:12px 16px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0; }
 .hist-title { font-family:var(--font2);font-size:11px;letter-spacing:.14em;color:var(--c);font-weight:700; }
 .hist-body { flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:8px; }
+/* .hist-body is a fixed-height flex column: without this the report's
+   blocks shrink to fit it (the bar became a 3 px line, tables got clipped) */
+.cache-report { flex-shrink:0;display:flex;flex-direction:column;gap:8px;min-width:0; }
+.woy-strip { flex-shrink:0;display:flex;align-items:stretch;gap:8px;flex-wrap:wrap;padding:0 0 10px; }
+.woy-head { font:700 10px var(--font2);letter-spacing:.1em;color:var(--o);align-self:center;white-space:nowrap; }
+.woy-item { display:flex;flex-direction:column;align-items:flex-start;gap:2px;max-width:340px;min-width:0;text-align:left;cursor:pointer;
+  padding:6px 10px;border-radius:8px;border:1px solid rgba(224,161,58,.35);background:rgba(224,161,58,.07);color:var(--t2);font:inherit; }
+.woy-item:hover { background:rgba(224,161,58,.14); }
+.woy-name { font-size:12px;font-weight:600;color:var(--t);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.woy-wait { font:400 10px var(--font2);color:var(--o); }
+.woy-text { font-size:11px;line-height:1.4;color:var(--t2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden; }
+.woy-more { font:400 10px var(--font2);color:var(--t3);align-self:center; }
+.woy-quote { margin-top:5px;font-size:11px;line-height:1.45;color:var(--t2);padding:5px 8px;border-left:2px solid var(--o);
+  background:rgba(224,161,58,.06);border-radius:0 6px 6px 0; }
+/* clamp on the inner box: with padding on the clamped box itself a sliver
+   of the 4th line showed through */
+.woy-q { display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden; }
+.woy-quote.asked { color:var(--t); }
+.woy-lbl { font:700 8px var(--font2);letter-spacing:.08em;text-transform:uppercase;color:var(--o);margin-right:6px; }
+.sbay > .woy-quote { margin:0 12px 8px; }
+@media (max-width: 600px) { .woy-item { max-width:100%; } }
+.cache-bar { flex-shrink:0;display:flex;gap:2px;height:14px;border-radius:4px;overflow:hidden;margin:4px 0 6px; }
+.cache-seg { display:block;height:100%;min-width:0; }
+.cache-seg:first-child { border-radius:4px 0 0 4px; } .cache-seg:last-child { border-radius:0 4px 4px 0; }
+.cache-legend { display:flex;flex-wrap:wrap;gap:6px 18px;margin-bottom:10px; }
+.cache-leg { display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t2);cursor:default; }
+.cache-leg i { width:10px;height:10px;border-radius:2px;flex-shrink:0; }
+.cache-leg-v { color:var(--t);font-family:var(--font2);font-size:11px; }
+.cache-leg-p { color:var(--t3);font-family:var(--font2);font-size:10px; }
+.cache-insight { display:flex;gap:8px;font-size:12px;line-height:1.5;color:var(--t2);padding:7px 10px;margin-bottom:6px;border-radius:8px;background:rgba(var(--c-rgb),.05);border:1px solid rgba(var(--c-rgb),.14); }
+.cache-table-wrap { overflow-x:auto;max-width:100%; }
+.cache-table { width:100%;border-collapse:collapse;font-size:12px;color:var(--t2); }
+.cache-table th { font:600 9px var(--font2);letter-spacing:.08em;text-transform:uppercase;color:var(--t3);text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);white-space:nowrap; }
+.cache-table td { padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap; }
+.cache-table .num { text-align:right;font-family:var(--font2);font-size:11px; }
+.cache-name { max-width:280px;overflow:hidden;text-overflow:ellipsis;color:var(--t); }
+.cache-extra { color:var(--t3);font-size:10px; }
+body.light .cache-table td { border-bottom-color:rgba(0,0,0,.06); }
+@media (max-width: 600px) { .cache-name { max-width:140px; } .cache-opt { display:none; } }
+.conv-input { font-family:var(--font);font-size:12px;padding:5px 12px;border-radius:7px;border:1px solid rgba(var(--c-rgb),.35);background:rgba(var(--c-rgb),.05);color:var(--t);margin-left:10px;width:280px;max-width:100%;min-width:0; }
+.conv-input:focus { outline:none;border-color:var(--c); }
+.conv-status { font-family:var(--font2);font-size:10px;color:var(--t3);letter-spacing:.04em; }
+.conv-empty { padding:36px 10px;text-align:center;color:var(--t3);font-size:12px;line-height:1.6; }
+.conv-card { padding:10px 14px;border-radius:11px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-width:0; }
+.conv-head { display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap; }
+.conv-title { font-size:13px;font-weight:600;color:var(--t);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto; }
+.conv-where { font:400 11px var(--font2);color:var(--t3);white-space:nowrap; }
+.conv-when { font:400 10px var(--font2);color:var(--t3);margin-left:auto;white-space:nowrap; }
+.conv-btn { font-size:9px;padding:2px 9px; }
+.conv-hit { display:flex;gap:8px;align-items:baseline;font-size:12px;line-height:1.5;color:var(--t2);min-width:0; }
+.conv-role { font:700 8px var(--font2);letter-spacing:.08em;padding:1px 5px;border-radius:4px;flex-shrink:0; }
+.conv-you { color:var(--o);background:rgba(224,161,58,.12); }
+.conv-claude { color:var(--c);background:rgba(var(--c-rgb),.12); }
+.conv-time { font:400 10px var(--font2);color:var(--t3);flex-shrink:0; }
+.conv-snip { min-width:0;overflow-wrap:anywhere; }
+.conv-snip mark { background:rgba(224,161,58,.28);color:var(--t);border-radius:2px;padding:0 1px; }
+.conv-more { font:400 10px var(--font2);color:var(--t3);padding-left:2px; }
+body.light .conv-card { background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.08); }
+body.light .conv-snip mark { background:rgba(224,161,58,.35); }
 .hist-section { font-family:var(--font2);font-size:9px;letter-spacing:.14em;color:var(--t3);margin:8px 0 4px;text-transform:uppercase; }
 .hist-row { display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:11px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);cursor:pointer;transition:background .2s,border-color .2s; }
 .hist-row:hover { background:rgba(var(--c-rgb),.06);border-color:rgba(var(--c-rgb),.2); }
@@ -6481,6 +7010,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
         <div class="kpi-lbl">ALL TIME</div>
       </div>
     </div>
+    <div id="waiting-strip" class="woy-strip" style="display:none"></div>
     <div id="top-projects-bar" style="display:none;gap:10px;padding:0 0 10px;flex-shrink:0;font-family:var(--font2);font-size:10px;color:var(--t3);align-items:center;flex-wrap:wrap"></div>
     <div id="cards-area">
       <div id="sweep-bar" style="display:flex;gap:6px;padding:0 0 10px;flex-shrink:0">
@@ -8734,6 +9264,53 @@ function toggleBay(key){
   if(lastStatus) renderAgents(lastStatus);
 }
 
+/* ── waiting on you ──
+   Pure: Claude's last message -> what to show on a waiting session. The end
+   of the message matters (a question to you comes last), so long text keeps
+   its tail; markdown markers are dropped for a one-glance quote. */
+function _lastMessageInfo(text, max){
+  max=max||220;
+  let t=String(text||'').trim();
+  if(!t) return null;
+  const paras=t.split(/\n\s*\n/).map(p=>p.trim()).filter(Boolean);
+  const last=paras[paras.length-1]||t;
+  const clean=x=>x.replace(/```[\s\S]*?```/g,' ').replace(/[*_`#]+/g,'').replace(/^\s*>\s?/gm,'').replace(/^\s*[-•]\s+/gm,'').replace(/\s+/g,' ').trim();
+  const asked=/\?\s*$/.test(clean(last));
+  let q=clean(last)||clean(t);
+  if(q.length>max) q='…'+q.slice(q.length-max+1).replace(/^\S*\s/,'');
+  return {asked, text:q, full:clean(t)};
+}
+/* Pure: sessions waiting on you for at least minSecs, longest wait first. */
+function _waitingSessions(list, minSecs){
+  return (list||[]).filter(s=>s&&s.session_active!==false&&s.waiting_on_you&&(s.waiting_secs||0)>=minSecs)
+    .sort((a,b)=>(b.waiting_secs||0)-(a.waiting_secs||0));
+}
+function _woyQuoteHtml(s){
+  const info=_lastMessageInfo(s.last_message);
+  if(!info) return '';
+  return `<div class="woy-quote${info.asked?' asked':''}" title="${escHtml(info.full.slice(0,1500))}"><div class="woy-q"><span class="woy-lbl">${info.asked?'Claude asks':'Claude said'}</span>${escHtml(info.text)}</div></div>`;
+}
+/* Pure: the strip above the views listing sessions waiting > 10 min. */
+function _waitingStripHtml(list){
+  if(!list.length) return '';
+  const items=list.slice(0,4).map(s=>{
+    const name=s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||s.id.slice(0,8);
+    const info=_lastMessageInfo(s.last_message, 140);
+    return `<button class="woy-item" onclick="setView('cli')" title="${escHtml(info?info.full.slice(0,1500):'Open the CLI view')}">
+      <span class="woy-name">${escHtml(name)}</span><span class="woy-wait">${escHtml(_fmtDurationDHM(s.waiting_secs||0))}</span>
+      ${info?`<span class="woy-text">${info.asked?'❓ ':''}${escHtml(info.text)}</span>`:''}</button>`;
+  }).join('');
+  const more=list.length>4?`<span class="woy-more">+${list.length-4} more</span>`:'';
+  return `<span class="woy-head">⏳ ${list.length} WAITING ON YOU</span>${items}${more}`;
+}
+function _waitingStripUpdate(sr){
+  const el=document.getElementById('waiting-strip');
+  if(!el) return;
+  const html=_waitingStripHtml(_waitingSessions(sr&&sr.sessions_list, 600));
+  if(el.innerHTML!==html) el.innerHTML=html;
+  el.style.display=html?'flex':'none';
+}
+
 function _sessionBayHtml(bay, stripsHtml){
   const s=bay.session||{};
   const cwdBase=s.cwd?(s.cwd.replace(/\\/g,'/').split('/').filter(Boolean).pop()||''):'';
@@ -8766,6 +9343,7 @@ function _sessionBayHtml(bay, stripsHtml){
       <div class="sbay-right"><span class="sbay-counts">${counts}</span>${state}${dismiss}
         <button class="bay-btn" onclick="toggleBay(${jsq(bay.key)})" aria-expanded="${!collapsed}" title="${collapsed?'Show':'Hide'} this session's agents">${collapsed?'▼':'▲'}</button></div>
     </header>
+    ${waiting?_woyQuoteHtml(s):''}
     ${collapsed?'':`<div class="sbay-slots">${stripsHtml}</div>`}
   </section>`;
 }
@@ -9257,6 +9835,7 @@ function renderAgents(data){
             </div>
             ${metaLine}
             ${statsLine}
+            ${waitingOnYou?_woyQuoteHtml(s):''}
             ${noteLine}
             ${burnBadge}
             ${activitySparkline}
@@ -9628,7 +10207,8 @@ function _formatHookReliability(hmc){
 }
 
 /* ── history view ── */
-let _histTab='sessions'; // 'sessions' | 'analytics'
+let _histTab='sessions'; // 'sessions' | 'analytics' | 'search' | 'cache'
+let _cacheDays=30;
 let _selectedProjectTrend=''; // project name whose own cost trend is pinned open in Analytics, '' = none
 function _selectProjectTrend(project){
   _selectedProjectTrend=(_selectedProjectTrend===project)?'':project; // clicking the same project again closes it
@@ -9649,7 +10229,12 @@ function _selectFileTrend(path){
   _selectedFileTrend=(_selectedFileTrend===path)?'':path;
   renderHistory();
 }
+/* Each renderHistory() call bumps this; after every await a call checks it is
+   still the newest, so a slow /history fetch from an earlier tab can't
+   overwrite the tab the user switched to meanwhile. */
+let _histRenderGen=0;
 async function renderHistory(){
+  const gen=++_histRenderGen;
   _histLastRender=Date.now();
   const el=document.getElementById('history-area');
   if(!el) return;
@@ -9663,7 +10248,11 @@ async function renderHistory(){
       <div class="adp-tabs" style="border:none;margin-left:8px">
         <div class="adp-tab ${_histTab==='sessions'?'active':''}" onclick="_histTab='sessions';renderHistory()">SESSIONS</div>
         <div class="adp-tab ${_histTab==='analytics'?'active':''}" onclick="_histTab='analytics';renderHistory()">ANALYTICS</div>
+        <div class="adp-tab ${_histTab==='search'?'active':''}" onclick="_histTab='search';renderHistory()" title="Search what you and Claude wrote in past conversations">CONVERSATIONS</div>
+        <div class="adp-tab ${_histTab==='cache'?'active':''}" onclick="_histTab='cache';renderHistory()" title="Where the token spend goes and how well the prompt cache works">CACHE</div>
       </div>
+      ${_histTab==='cache'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
+      ${_histTab==='search'?`<input type="search" id="conv-search-input" class="conv-input" placeholder="Search past conversations…" value="${escHtml(_convQuery)}" oninput="setConvSearch(this.value)" autocomplete="off">`:''}
       ${_histTab==='sessions'?`<input type="text" id="hist-search-input" placeholder="Filter by name, project, id, or tag..." value="${escHtml(_histSearchQuery)}" oninput="setHistSearch(this.value)" style="font-family:var(--font2);font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:10px;width:150px">
       <input type="date" id="hist-search-from" value="${escHtml(_histSearchFrom)}" oninput="setHistDateFrom(this.value)" title="From date" style="font-family:var(--font2);font-size:11px;padding:4px 8px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:6px">
       <input type="date" id="hist-search-to" value="${escHtml(_histSearchTo)}" oninput="setHistDateTo(this.value)" title="To date" style="font-family:var(--font2);font-size:11px;padding:4px 8px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:6px">`:''}
@@ -9697,10 +10286,24 @@ async function renderHistory(){
   </div>`;
 
   const body=document.getElementById('hist-body');
+  if(_histTab==='cache'){
+    try{
+      const d=await fetch('/cache_stats?days='+_cacheDays).then(r=>r.json());
+      if(gen===_histRenderGen) body.innerHTML=_cacheReportHtml(d);
+    }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the cache report.</div>'; }
+    return;
+  }
+  if(_histTab==='search'){
+    const inp=document.getElementById('conv-search-input');
+    if(inp){ inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+    _runConvSearch();
+    return;
+  }
   if(_histTab==='analytics'){
     try{
       const localAnalytics=await fetch('/analytics').then(r=>r.json());
       const remoteAnalytics=await _fetchRemoteJSON('/analytics');
+      if(gen!==_histRenderGen) return;
       const d=_mergeAnalytics(localAnalytics,remoteAnalytics);
       const t=d.total||{};
       const byDay=d.by_day||[];
@@ -9981,6 +10584,7 @@ async function renderHistory(){
     try{
       const localSessions=await fetch('/history').then(r=>r.json());
       const remoteSessions=await _fetchRemoteJSON('/history');
+      if(gen!==_histRenderGen) return;
       _histSessionsCache=_mergeHistorySessions(localSessions,remoteSessions);
       _renderHistSessionsBody();
     }catch(e){ body.innerHTML='<div style="color:var(--r);padding:20px;font-family:var(--font2);font-size:10px">Error loading history</div>'; }
@@ -10091,6 +10695,156 @@ async function _renderHistSessionsBody(){
       </div>`;}).join('')}
   `).join('');
 }
+/* ── prompt-cache report (History → CACHE) ── */
+const _CACHE_SPLIT=[  /* categorical order validated for both surfaces (dataviz validator) */
+  {k:'cost_read', label:'Cache reads', dark:'#3987e5', light:'#2a78d6',
+   tip:'Every call sends the whole conversation again; cached tokens are cheap but there are a lot of them'},
+  {k:'cost_write', label:'Cache writes', dark:'#d95926', light:'#eb6834',
+   tip:'New messages added to the cache, plus full re-caches'},
+  {k:'cost_out', label:'Output', dark:'#199e70', light:'#1baf7a', tip:"Claude's replies and tool calls"},
+  {k:'cost_in', label:'Uncached input', dark:'#c98500', light:'#eda100', tip:'Prompt tokens sent without the cache'},
+];
+/* $1,234 / $56.70 / $0.0123 -- whole dollars once it's big, cents below
+   that, 4 decimals only for sub-dollar amounts */
+function _fmtMoney(c){
+  if(c==null||isNaN(c)) return '—';
+  c=+c;
+  return c>=1000?'$'+Math.round(c).toLocaleString('en-US'):c>=1?'$'+c.toFixed(2):'$'+c.toFixed(4);
+}
+function _fmtTokShort(n){
+  n=Number(n)||0;
+  return n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?Math.round(n/1e3)+'k':String(n);
+}
+/* Pure: /cache_stats response -> plain-language findings, most important first. */
+function _cacheInsights(t){
+  const out=[];
+  if(!t||!t.cost) return out;
+  const readShare=t.cost_read/t.cost;
+  if(readShare>=0.4) out.push({icon:'📚', text:`${Math.round(readShare*100)}% of the spend is Claude re-reading the conversation: every call sends the whole context again — about ${_fmtTokShort(t.avg_context)} tokens per call here. Long sessions get more expensive with every message; when a task is done, start a fresh session or run /compact.`});
+  if(t.cold_n>0) out.push({icon:'🧊', text:`${t.cold_n} time${t.cold_n===1?'':'s'} a session's whole context had to be cached again${t.cold_idle_n?` (${t.cold_idle_n===t.cold_n?'all':t.cold_idle_n} after an hour or more away — Claude Code's cache lasts 1 hour)`:''}, costing ${_fmtMoney(t.cold_extra)} more than a warm cache would have. Coming back within the hour, or starting fresh with a short summary, avoids it.`});
+  if(t.hit_rate!=null&&t.hit_rate<0.8) out.push({icon:'⚠', text:`Only ${Math.round(t.hit_rate*100)}% of prompt tokens came from the cache — usually a sign of frequent model switches or context being rewritten.`});
+  if(t.saved>0) out.push({icon:'✓', text:`The cache saved about ${_fmtMoney(t.saved)}: the ${_fmtTokShort(t.cr)} cached tokens would have cost that much more as plain input.`});
+  return out;
+}
+/* Pure: /cache_stats response -> report HTML. */
+function _cacheReportHtml(d){
+  d=d||{};
+  const idx=d.index||{};
+  if(d.error) return `<div class="conv-empty">The cache report failed — see Health → background errors.</div>`;
+  const st=d.stats, t=st&&st.total;
+  if(!t||!t.n){
+    return `<div class="conv-empty">${idx.building||!idx.updated_at
+      ?'Still reading your Claude Code transcripts — the report appears once the index is built (a few minutes after AOC starts).'
+      :'No Claude Code calls in this period.'}</div>`;
+  }
+  const light=document.body&&document.body.classList.contains('light');
+  const pct=v=>t.cost?v/t.cost*100:0;
+  const segs=_CACHE_SPLIT.filter(x=>t[x.k]>0);
+  const bar=segs.map(x=>`<span class="cache-seg" style="width:${pct(t[x.k]).toFixed(2)}%;background:${light?x.light:x.dark}" title="${escHtml(x.label)}: ${_fmtMoney(t[x.k])} (${pct(t[x.k]).toFixed(1)}%)"></span>`).join('');
+  const legend=_CACHE_SPLIT.map(x=>`<div class="cache-leg" title="${escHtml(x.tip)}"><i style="background:${light?x.light:x.dark}"></i><span class="cache-leg-l">${escHtml(x.label)}</span><span class="cache-leg-v">${_fmtMoney(t[x.k])}</span><span class="cache-leg-p">${pct(t[x.k]).toFixed(1)}%</span></div>`).join('');
+  const kpi=(v,l,tip)=>`<div class="hist-kpi" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const kpis=[
+    kpi(_fmtMoney(t.cost),'Spend','Estimated API-price cost of every Claude Code call in this period (on a subscription you pay the plan, not this)'),
+    kpi(t.hit_rate==null?'—':Math.round(t.hit_rate*100)+'%','From cache','Share of prompt tokens read from the cache instead of being sent again at full price'),
+    kpi(_fmtMoney(t.saved),'Saved by cache','What the cached tokens would have cost as plain input, minus what they did cost'),
+    kpi(String(t.cold_n),'Re-caches','Calls that had to write most of the context to the cache again (cache expired, model switched, or context rewritten)'),
+    kpi(_fmtTokShort(t.avg_context),'Avg context','Prompt tokens per call — the whole conversation is sent every time'),
+  ].join('');
+  const ins=_cacheInsights(t).map(i=>`<div class="cache-insight"><span>${i.icon}</span><span>${escHtml(i.text)}</span></div>`).join('');
+  const sess=(st.sessions||[]).map(x=>{
+    const folder=(x.cwd||'').split(/[\\/]/).filter(Boolean).pop()||'';
+    const name=x.title||x.project||folder||x.session_id.slice(0,8);
+    return `<tr>
+      <td class="cache-name"><span title="${escHtml(x.session_id)}">${escHtml(name)}</span></td>
+      <td class="num">${_fmtMoney(x.cost)}</td>
+      <td class="num">${x.cost?Math.round(x.cost_read/x.cost*100):0}%</td>
+      <td class="num cache-opt">${_fmtTokShort(x.avg_context)}</td>
+      <td class="num cache-opt">${x.hit_rate==null?'—':Math.round(x.hit_rate*100)+'%'}</td>
+      <td class="num">${x.cold_n?`${x.cold_n} <span class="cache-extra">+${_fmtMoney(x.cold_extra)}</span>`:'—'}</td>
+      <td><button class="adp-btn conv-btn" onclick="showHistoryDetail(${jsq(x.session_id)})">OPEN</button></td>
+    </tr>`;
+  }).join('');
+  const models=(st.by_model||[]).map(m=>`<tr><td>${escHtml(m.model||'?')}</td><td class="num">${m.n.toLocaleString()}</td><td class="num">${_fmtMoney(m.cost)}</td><td class="num">${m.hit_rate==null?'—':Math.round(m.hit_rate*100)+'%'}</td><td class="num">${_fmtTokShort(m.avg_context)}</td><td class="num">${m.cold_n||'—'}</td></tr>`).join('');
+  return `<div class="cache-report">
+    <div class="hist-analytics">${kpis}</div>
+    <div class="hist-section">WHERE THE MONEY GOES</div>
+    <div class="cache-bar" role="img" aria-label="${escHtml(_CACHE_SPLIT.map(x=>x.label+' '+pct(t[x.k]).toFixed(0)+'%').join(', '))}">${bar}</div>
+    <div class="cache-legend">${legend}</div>
+    ${ins}
+    <div class="hist-section">MOST EXPENSIVE SESSIONS</div>
+    <div class="cache-table-wrap"><table class="cache-table">
+      <thead><tr><th>Session</th><th class="num">Spend</th><th class="num" title="Share of the session's spend that was re-reading context">Re-reading</th><th class="num cache-opt">Avg context</th><th class="num cache-opt">From cache</th><th class="num">Re-caches</th><th></th></tr></thead>
+      <tbody>${sess}</tbody></table></div>
+    <div class="hist-section">BY MODEL</div>
+    <div class="cache-table-wrap"><table class="cache-table">
+      <thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Spend</th><th class="num">From cache</th><th class="num">Avg context</th><th class="num">Re-caches</th></tr></thead>
+      <tbody>${models}</tbody></table></div>
+    <div class="conv-status" style="margin-top:6px">Estimated at API prices from the Claude Code transcripts on this machine (subagent transcripts not included). ${idx.building?'Still indexing — numbers will grow.':''}</div>
+  </div>`;
+}
+
+/* ── conversation search (History → CONVERSATIONS) ── */
+let _convQuery='';
+let _convTimer=null;
+let _convSeq=0;
+function setConvSearch(v){
+  _convQuery=v;
+  clearTimeout(_convTimer);
+  _convTimer=setTimeout(_runConvSearch, 250);
+}
+async function _runConvSearch(){
+  const body=document.getElementById('hist-body');
+  if(!body||_histTab!=='search') return;
+  const seq=++_convSeq;
+  let d;
+  try{
+    d=await fetch('/search_transcripts?q='+encodeURIComponent(_convQuery.trim())).then(r=>r.json());
+  }catch(e){ d={error:'search failed', sessions:[]}; }
+  if(seq!==_convSeq||_histTab!=='search') return;  // a newer keystroke won
+  const b=document.getElementById('hist-body');
+  if(b) b.innerHTML=_convResultsHtml(d, Date.now());
+}
+/* Index snippets mark matches with \x02..\x03 -- escape first, then mark. */
+function _convSnippetHtml(s){
+  return escHtml(String(s||'')).replace(/\x02/g,'<mark>').replace(/\x03/g,'</mark>').replace(/\n+/g,' ');
+}
+/* Pure: /search_transcripts response -> results HTML. */
+function _convResultsHtml(d, nowMs){
+  d=d||{};
+  const idx=d.index||{};
+  const q=(d.query||'').trim();
+  const status=idx.building
+    ?`Indexing conversations… ${idx.indexed||0} of ${idx.files||0} transcripts done`
+    :(idx.updated_at?`${(idx.messages||0).toLocaleString()} messages from ${idx.files||0} conversations indexed`
+                    :'The search index is built a few minutes after AOC starts');
+  const head=`<div class="conv-status">${escHtml(status)}</div>`;
+  if(d.error) return head+`<div class="conv-empty">Search failed — see Health → background errors.</div>`;
+  if(!q) return head+`<div class="conv-empty">Type words you remember from a conversation — yours or Claude's. All words must match; accents don't matter.</div>`;
+  const ss=d.sessions||[];
+  if(!ss.length) return head+`<div class="conv-empty">No conversation mentions “${escHtml(q)}”${idx.building?' yet — still indexing':''}.</div>`;
+  const day=ts=>{ if(!ts) return ''; const t=new Date(ts); if(isNaN(t)) return '';
+    const ago=Math.floor((nowMs-t.getTime())/86400000);
+    return ago<1?'today':ago<2?'yesterday':ago<7?ago+' days ago':t.toISOString().slice(0,10); };
+  const clock=ts=>{ const t=new Date(ts); return isNaN(t)?'':String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0'); };
+  return head+ss.map(s=>{
+    const folder=(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||'';
+    const title=s.title||s.project||folder||s.session_id.slice(0,8);
+    const where=s.project||folder;
+    const more=s.n_hits>s.hits.length?`<div class="conv-more">+${s.n_hits-s.hits.length} more match${s.n_hits-s.hits.length===1?'':'es'}</div>`:'';
+    return `<div class="conv-card">
+      <div class="conv-head">
+        <span class="conv-title" title="${escHtml(s.session_id)}">${escHtml(title)}</span>
+        ${where&&where!==title?`<span class="conv-where">// ${escHtml(where)}</span>`:''}
+        <span class="conv-when">${escHtml(day(s.last_ts))}</span>
+        <button class="adp-btn conv-btn" onclick="showHistoryDetail(${jsq(s.session_id)})" title="Open this session in History">OPEN</button>
+        <button class="adp-btn conv-btn" onclick="_copyResumeCmd(${jsq(s.session_id)},${jsq(s.cwd||'')})" title="Copy a command that reopens this conversation in Claude Code">⟲ RESUME</button>
+      </div>
+      ${s.hits.map(h=>`<div class="conv-hit"><span class="conv-role conv-${h.role==='user'?'you':'claude'}">${h.role==='user'?'YOU':'CLAUDE'}</span><span class="conv-time">${escHtml(clock(h.ts))}</span><span class="conv-snip">${_convSnippetHtml(h.snippet)}</span></div>`).join('')}
+      ${more}
+    </div>`;
+  }).join('');
+}
+
 function setHistSearch(val){
   _histSearchQuery=val.toLowerCase();
   const inp=document.getElementById('hist-search-input');
@@ -10407,6 +11161,7 @@ function _applyStatus(sr){
   _selfUpdateUpdateUI(sr.self_update);
   _infraUpdateUI(sr.infra_health);
   _rateLimitUpdateUI(sr.rate_limits);
+  _waitingStripUpdate(sr);
   _updateSweepButton(sr);
   if(_adpAgentId) _renderAdp();
   if(currentView==='summary')  renderSummary(sr);
@@ -10414,7 +11169,7 @@ function _applyStatus(sr){
   if(currentView==='heat')     renderHeatmap(sr);
   if(currentView==='tree')     renderTree(sr);
   if(currentView==='timeline') renderTimeline(sr);
-  if(currentView==='history'&&Date.now()-_histLastRender>10000){ _histLastRender=Date.now(); renderHistory(); }
+  if(currentView==='history'&&_histTab!=='search'&&_histTab!=='cache'&&Date.now()-_histLastRender>10000){ _histLastRender=Date.now(); renderHistory(); }
   if(currentView==='diag'&&Date.now()-_diagLastRender>10000){ _diagLastRender=Date.now(); renderDiag(); }
   if(_rightTab==='files') _renderRpFiles(sr);
   if(_rightTab==='audit') _renderRpAudit();
@@ -12141,8 +12896,8 @@ function _authCopyUrl(){
   navigator.clipboard.writeText(el.value).then(()=>showToast('info','URL copied to clipboard')).catch(()=>{ el.select(); document.execCommand('copy'); showToast('info','URL copied'); });
 }
 
-function _copyResumeCmd(id){
-  const cmd='claude --resume '+id;
+function _copyResumeCmd(id, cwd){
+  const cmd=(cwd?'cd "'+cwd+'"; ':'')+'claude --resume '+id;
   navigator.clipboard.writeText(cmd).then(()=>showToast('info','Resume command copied',cmd)).catch(()=>{
     const ta=document.createElement('textarea');
     ta.value=cmd; ta.style.position='fixed'; ta.style.opacity='0';
@@ -13098,6 +13853,7 @@ def _build_status_payload_uncached() -> dict:
          "last_ts": v.get("last_ts", ""),
          "host_pid": v.get("host_pid"),
          "waiting_on_you": v.get("waiting_on_you", False),
+         "last_message": v.get("last_message", ""),
          "note": v.get("note", ""),
          "pr_url": _pr_link_cache_snapshot.get(v.get("git_branch", ""), {}).get("url"),
          "waiting_secs": _compute_waiting_secs(v, now_epoch)}
@@ -13189,6 +13945,49 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
         return (qs.get("from") or [""])[0], (qs.get("to") or [""])[0]
+
+    def _get_cache_stats(self):
+        """Prompt-cache report (History -> CACHE) from transcript_index.db's
+        usage table. ?days=7|30|0 (0 = everything indexed)."""
+        from urllib.parse import urlparse, parse_qs
+        try:
+            days = max(0, min(int((parse_qs(urlparse(self.path).query).get("days") or ["30"])[0]), 3650))
+        except ValueError:
+            days = 30
+        since = "0000-00-00" if days == 0 else time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
+        out = {"days": days, "index": dict(_transcript_index_progress), "stats": None}
+        if os.path.exists(TRANSCRIPT_INDEX_DB):
+            conn = None
+            try:
+                conn = _transcript_index_connect()
+                out["stats"] = _cache_stats(conn, since)
+            except Exception as e:
+                _log_bg_error("_get_cache_stats", e)
+                out["error"] = "cache stats failed"
+            finally:
+                if conn is not None:
+                    conn.close()
+        self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode())
+
+    def _get_search_transcripts(self):
+        """Full-text search over past conversations (transcript_index.db,
+        kept current by _transcript_index_worker). Always returns the index
+        progress so the UI can say 'still indexing' instead of 'no match'."""
+        from urllib.parse import urlparse, parse_qs
+        q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0][:200]
+        out = {"query": q, "sessions": [], "index": dict(_transcript_index_progress)}
+        if q.strip() and os.path.exists(TRANSCRIPT_INDEX_DB):
+            conn = None
+            try:
+                conn = _transcript_index_connect()
+                out["sessions"] = _search_transcripts(conn, q)
+            except Exception as e:
+                _log_bg_error("_get_search_transcripts", e)
+                out["error"] = "search failed"
+            finally:
+                if conn is not None:
+                    conn.close()
+        self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode())
 
     def _get_auditlog(self):
         files = _log.list_logs()
@@ -13402,6 +14201,10 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
         elif path_no_qs == "/auditlog":
             self._get_auditlog()
+        elif path_no_qs == "/search_transcripts":
+            self._get_search_transcripts()
+        elif path_no_qs == "/cache_stats":
+            self._get_cache_stats()
         elif self.path.startswith("/diff"):
             self._get_diff()
         elif self.path.startswith("/git"):

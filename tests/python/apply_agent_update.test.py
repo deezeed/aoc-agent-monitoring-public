@@ -34,7 +34,7 @@ def make_ns(log_cls=_FakeLog):
     # _log_bg_error is stubbed the same way -- _apply_agent_update's
     # agent_start failure path calls it by name, so it must exist in this
     # namespace even though no test here makes it fire until case 12.
-    ns = exec_functions(["_apply_agent_update", "_calc_cost", "_model_pricing", "_MODEL_PRICING", "_CLAUDE_CONTEXT_WINDOW"],
+    ns = exec_functions(["_apply_agent_update", "_calc_cost", "_model_pricing", "_MODEL_PRICING", "_CACHE_WRITE_1H_MULT", "_CLAUDE_CONTEXT_WINDOW"],
                         {"_log": fake_log, "_pending_parent_links": {},
                          "_log_bg_error": lambda where, exc: bg_errors.append((where, str(exc)))})
     return ns, fake_log, bg_errors
