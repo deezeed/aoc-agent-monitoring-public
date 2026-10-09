@@ -2174,6 +2174,80 @@ def _rate_limits_snapshot():
                                 {k: list(v) for k, v in st["samples"].items()}, now)
 
 
+# ── Context window per CLI session ──────────────────────────────────────────
+# hooks/aoc_statusline.py writes CONTEXT_DIR\<session_id>.json from Claude
+# Code's statusline input: context_window fill (used_percentage, window
+# 200k/1M, input_tokens) + prompt_cache expiry. Without the statusline there
+# is no file and the card simply shows no meter.
+CONTEXT_DIR = os.path.join(AOC_DATA_DIR, "context")
+_CONTEXT_PRUNE_AFTER_S = 3 * 86400
+_context_lock = threading.Lock()
+_context_state = {"files": {}, "pruned_at": 0.0}  # sid -> (mtime, dict)
+
+
+def _context_view(raw):
+    """Pure: a saved context file -> the /status 'context' dict, or None if
+    it isn't usable. level: ok < 70 % <= warn < 85 % <= high (auto-compact
+    territory; Claude Code compacts on its own close to the limit)."""
+    if not isinstance(raw, dict):
+        return None
+    pct, window = raw.get("used_percentage"), raw.get("window")
+    if not isinstance(pct, (int, float)) or not isinstance(window, (int, float)) or window <= 0:
+        return None
+    pct = max(0.0, min(100.0, float(pct)))
+    exp = raw.get("cache_expires_at")
+    rec = raw.get("recache_tokens")
+    return {
+        "pct": round(pct, 1),
+        "window": int(window),
+        "tokens": int(raw.get("input_tokens") or 0),
+        "level": "high" if pct >= 85 else "warn" if pct >= 70 else "ok",
+        "cache_expires_at": exp if isinstance(exp, (int, float)) else None,
+        "cache_ttl": raw.get("cache_ttl") if raw.get("cache_ttl") in ("5m", "1h") else None,
+        "recache_tokens": int(rec) if isinstance(rec, (int, float)) else None,
+        "updated_at": raw.get("updated_at"),
+    }
+
+
+def _context_snapshot(session_ids):
+    """{session_id: context view} for the given sessions. Files live in
+    %LOCALAPPDATA% (not OneDrive), so a stat per session is cheap; a file is
+    re-read only when its mtime changes. Files untouched for 3 days are
+    deleted, at most once an hour."""
+    now = time.time()
+    out = {}
+    with _context_lock:
+        cache = _context_state["files"]
+        for sid in session_ids:
+            if not sid or not all(ch.isalnum() or ch in "-_" for ch in sid):
+                continue
+            path = os.path.join(CONTEXT_DIR, sid + ".json")
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                cache.pop(sid, None)
+                continue
+            hit = cache.get(sid)
+            if not hit or hit[0] != mtime:
+                hit = (mtime, _context_view(_load_json_file(path)))
+                cache[sid] = hit
+            if hit[1]:
+                out[sid] = hit[1]
+        if now - _context_state["pruned_at"] >= 3600:
+            _context_state["pruned_at"] = now
+            try:
+                for name in os.listdir(CONTEXT_DIR):
+                    p = os.path.join(CONTEXT_DIR, name)
+                    try:
+                        if now - os.stat(p).st_mtime > _CONTEXT_PRUNE_AFTER_S:
+                            os.remove(p)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+    return out
+
+
 # Set at the very bottom of the module, once every function the /status
 # builder needs is defined. The notify workers below start long before that.
 _module_loaded = threading.Event()
@@ -6237,6 +6311,16 @@ button.le-tag { cursor:pointer; }
 .woy-quote.asked { color:var(--t); }
 .woy-lbl { font:700 8px var(--font2);letter-spacing:.08em;text-transform:uppercase;color:var(--o);margin-right:6px; }
 .sbay > .woy-quote { margin:0 12px 8px; }
+.ctx-meter { display:flex;align-items:center;gap:7px;margin-top:5px;font:400 10px var(--font2);color:var(--t2);min-width:0;flex-wrap:wrap; }
+.ctx-lbl { font:700 8px var(--font2);letter-spacing:.08em;color:var(--t3); }
+.ctx-bar { flex:0 0 72px;height:5px;border-radius:3px;background:rgba(var(--c-rgb),.14);overflow:hidden; }
+.ctx-bar > span { display:block;height:100%;background:var(--g);border-radius:3px; }
+.ctx-warn .ctx-bar > span { background:var(--o); }
+.ctx-high .ctx-bar > span { background:var(--r); }
+.ctx-high .ctx-val { color:var(--r); }
+.ctx-cache { color:var(--t3);padding-left:7px;border-left:1px solid rgba(var(--c-rgb),.25); }
+.ctx-cache.cold { color:var(--o); }
+.sbay > .ctx-meter { margin:-2px 14px 8px; }
 @media (max-width: 600px) { .woy-item { max-width:100%; } }
 .cache-bar { flex-shrink:0;display:flex;gap:2px;height:14px;border-radius:4px;overflow:hidden;margin:4px 0 6px; }
 .cache-seg { display:block;height:100%;min-width:0; }
@@ -9327,6 +9411,28 @@ function _woyQuoteHtml(s){
   if(!info) return '';
   return `<div class="woy-quote${info.asked?' asked':''}" title="${escHtml(info.full.slice(0,1500))}"><div class="woy-q"><span class="woy-lbl">${info.asked?'Claude asks':'Claude said'}</span>${escHtml(info.text)}</div></div>`;
 }
+/* Pure: context-window meter for a CLI session (s.context comes from the
+   statusline, see _context_snapshot). While the session waits on you it
+   also says when the prompt cache goes cold -- after that, the next
+   message re-caches the whole context at the cache-write price. */
+function _ctxMeterHtml(s, nowSec){
+  const c=s&&s.context;
+  if(!c||typeof c.pct!=='number'||!c.window) return '';
+  const fmtTok=n=>n>=1e6?(n/1e6).toFixed(n%1e6?1:0)+'M':n>=1e3?Math.round(n/1e3)+'k':String(n);
+  const pct=Math.max(0,Math.min(100,c.pct));
+  const lvl=c.level==='high'||c.level==='warn'?c.level:'ok';
+  const hint=lvl==='high'?' · compact soon':'';
+  let cache='';
+  if(s.session_active!==false&&s.waiting_on_you&&c.cache_expires_at){
+    const left=c.cache_expires_at-nowSec;
+    const re=c.recache_tokens?` (~${fmtTok(c.recache_tokens)} tok re-cached)`:'';
+    cache=left>0
+      ?`<span class="ctx-cache" title="Prompt cache (${escHtml(c.cache_ttl||'')}) expires ${new Date(c.cache_expires_at*1000).toLocaleTimeString()}. Reply before then to keep it warm${escHtml(re)}.">cache warm · ${escHtml(_fmtDurationDHM(Math.ceil(left/60)*60))} left</span>`
+      :`<span class="ctx-cache cold" title="The prompt cache expired: the next message writes the whole context to cache again${escHtml(re)}.">cache cold</span>`;
+  }
+  const title=`Context window: ${(c.tokens||0).toLocaleString()} of ${c.window.toLocaleString()} tokens (${pct.toFixed(1)} %). Claude Code auto-compacts close to the limit.`;
+  return `<div class="ctx-meter ctx-${lvl}" title="${escHtml(title)}"><span class="ctx-lbl">CTX</span><span class="ctx-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="ctx-val">${Math.round(pct)}% · ${fmtTok(c.tokens||0)}/${fmtTok(c.window)}${hint}</span>${cache}</div>`;
+}
 /* Pure: the strip above the views listing sessions waiting > 10 min. */
 function _waitingStripHtml(list){
   if(!list.length) return '';
@@ -9380,6 +9486,7 @@ function _sessionBayHtml(bay, stripsHtml){
       <div class="sbay-right"><span class="sbay-counts">${counts}</span>${state}${dismiss}
         <button class="bay-btn" onclick="toggleBay(${jsq(bay.key)})" aria-expanded="${!collapsed}" title="${collapsed?'Show':'Hide'} this session's agents">${collapsed?'▼':'▲'}</button></div>
     </header>
+    ${active?_ctxMeterHtml(s, Date.now()/1000):''}
     ${waiting?_woyQuoteHtml(s):''}
     ${collapsed?'':`<div class="sbay-slots">${stripsHtml}</div>`}
   </section>`;
@@ -9872,6 +9979,7 @@ function renderAgents(data){
             </div>
             ${metaLine}
             ${statsLine}
+            ${isActive?_ctxMeterHtml(s, Date.now()/1000):''}
             ${waitingOnYou?_woyQuoteHtml(s):''}
             ${noteLine}
             ${burnBadge}
@@ -13896,6 +14004,9 @@ def _build_status_payload_uncached() -> dict:
          "waiting_secs": _compute_waiting_secs(v, now_epoch)}
         for k, v in sessions_from_dict.items()
     ]
+    _ctx = _context_snapshot([s["id"] for s in active_sessions])
+    for s in active_sessions:
+        s["context"] = _ctx.get(s["id"])
     # sessions_count: floor at the real claude.exe process count (background
     # scanner, _claude_proc_worker, counts claude.exe processes every 2s). Hook-tracked
     # sessions can under-count — a CLI sitting idle with no fresh heartbeat,

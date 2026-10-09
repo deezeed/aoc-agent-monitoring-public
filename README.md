@@ -590,6 +590,16 @@ switching windows. Sessions waiting 10+ minutes are also listed in a strip
 above every view, longest wait first (click one to jump to the CLI view).
 The text comes from the transcript scanner (`last_message` in `/status`).
 
+**Context meter.** Every active CLI card and session bay shows how full that
+session's context window is (`CTX 41% · 412k/1M`): green, amber from 70 %,
+red with *compact soon* from 85 % (Claude Code auto-compacts close to the
+limit). While a session waits on you it also shows how long its prompt cache
+stays warm (`cache warm · 25m left`) or that it went cold -- after that, the
+next message writes the whole context to cache again. The numbers come from
+Claude Code's statusline input (`context_window`, `prompt_cache`), which
+`aoc_statusline.py` saves per session to `%LOCALAPPDATA%\AOC\context\`; without
+the statusline (see 2b) there is no meter. `context` per session in `/status`.
+
 **History → CONVERSATIONS** searches what was actually *said* in past
 Claude Code sessions -- your prompts and Claude's replies, not tool calls
 or tool output. Every word must match, the last one as a prefix, and
