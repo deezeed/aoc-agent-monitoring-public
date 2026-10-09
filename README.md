@@ -590,6 +590,24 @@ switching windows. Sessions waiting 10+ minutes are also listed in a strip
 above every view, longest wait first (click one to jump to the CLI view).
 The text comes from the transcript scanner (`last_message` in `/status`).
 
+**Needs your OK.** A session blocked mid-turn on a permission prompt (or a
+question dialog) is not "done, your move" -- it can't go on at all. The
+`Notification` hook (matcher `permission_prompt|elicitation_dialog`) marks it
+`waiting_kind: permission`/`question` with Claude Code's message ("Claude needs
+your permission to use Bash"): red **NEEDS OK** / **QUESTION** pill, the
+message instead of Claude's last text, and it jumps to the front of the
+waiting strip after 30 s instead of 10 min. Answering the prompt clears it
+(the tool result lands in the transcript). A finished turn stays **WAITING**.
+
+**Switch to the terminal.** ⧉ on an active local CLI card (and *Terminal* on
+its bay, or a click on its entry in the waiting strip) brings the window
+running that session to the front: the nearest parent process that owns a
+window (Windows Terminal, VS Code, a console), else the window whose title
+is the session's name (Claude Code titles its terminal that way; Git Bash's
+mintty isn't in the Windows parent chain). Windows Terminal comes forward
+but stays on its current tab. `POST /focus_session {session_id}` --
+accepted only from this machine itself, never through a tunnel.
+
 **History → COMMITS** shows what each git commit Claude Code made cost:
 the session's spend since its previous commit (or since it started), so the
 work that went into it. Per repository: commits, spend, cost per commit,

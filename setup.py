@@ -99,6 +99,7 @@ HOOK_SPECS = [
     ("PreToolUse", "Agent"),
     ("PostToolUse", "Agent"),
     ("Stop", ""),
+    ("Notification", "permission_prompt|elicitation_dialog"),
 ]
 
 
@@ -417,7 +418,7 @@ def validate() -> None:
         if missing:
             print(f"[WARN] settings.json missing hook events: {missing}")
         else:
-            print("[ok] settings.json has all 4 AOC hook events")
+            print(f"[ok] settings.json has all {len(HOOK_SPECS)} AOC hook events")
         sl = settings.get("statusLine")
         print(f"[{'ok' if _is_aoc_statusline(sl) else 'WARN'}] statusLine "
               + ("runs the AOC plan-limit recorder" if _is_aoc_statusline(sl) else "is not AOC's -- the plan-limit meter stays empty"))

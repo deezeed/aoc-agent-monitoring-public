@@ -681,10 +681,31 @@ def main():
         # Stop = Claude just finished a turn, control is back with the human ("waiting on
         # you"); UserPromptSubmit = the human just replied, Claude is about to work again.
         payload["waiting_on_you"] = (event_name == "Stop")
+        if event_name == "Stop":
+            payload["waiting_kind"] = "turn"
         host_pid = _find_claude_ancestor_pid()
         if host_pid:
             payload["host_pid"] = host_pid
         post_aoc("/update", payload)
+        sys.exit(0)
+
+    # Notification (matcher permission_prompt|elicitation_dialog): Claude is
+    # blocked on the human mid-turn -- a permission prompt or a question
+    # dialog -- not finished. The message says what for.
+    if event_name == "Notification":
+        ntype = hook.get("notification_type", "")
+        if ntype in ("permission_prompt", "elicitation_dialog"):
+            ensure_monitor()
+            payload = {"session_id": session_id, "cwd": cwd, "project": project, "session_active": True,
+                       "waiting_on_you": True,
+                       "waiting_kind": "permission" if ntype == "permission_prompt" else "question",
+                       "waiting_message": str(hook.get("message") or "")[:300]}
+            if ai_title:
+                payload["display_name"] = ai_title
+            host_pid = _find_claude_ancestor_pid()
+            if host_pid:
+                payload["host_pid"] = host_pid
+            post_aoc("/update", payload)
         sys.exit(0)
 
     tool_name = hook.get("tool_name", "")

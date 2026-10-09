@@ -2994,8 +2994,9 @@ def _reap_stray_tunnel_process():
         _log_bg_error("_reap_stray_tunnel_process", e)
     _clear_tunnel_pid()
 
-def _snapshot_processes():
-    """[(pid, lowercase exe name)] for every running process, from one
+def _snapshot_processes(with_parent=False):
+    """[(pid, lowercase exe name)] -- or (pid, exe, parent pid) with
+    with_parent -- for every running process, from one
     CreateToolhelp32Snapshot walk (fast, subprocess-free -- the technique
     aoc_hook.py's own ancestor walk uses; ~7ms). None if the snapshot
     itself fails, so callers can tell "no such process" from "couldn't
@@ -3030,7 +3031,9 @@ def _snapshot_processes():
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
             if kernel32.Process32First(snapshot, ctypes.byref(entry)):
                 while True:
-                    out.append((entry.th32ProcessID, entry.szExeFile.decode("mbcs", "ignore").lower()))
+                    exe = entry.szExeFile.decode("mbcs", "ignore").lower()
+                    out.append((entry.th32ProcessID, exe, entry.th32ParentProcessID) if with_parent
+                               else (entry.th32ProcessID, exe))
                     if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
                         break
         finally:
@@ -3038,6 +3041,104 @@ def _snapshot_processes():
         return out
     except Exception:
         return None
+
+def _norm_window_title(t):
+    """Pure: lowercase, without the spinner/status glyphs Claude Code puts
+    in front of the terminal title (e.g. '◑ AOC pokračování')."""
+    t = (t or "").strip().lower()
+    while t and not t[0].isalnum():
+        t = t[1:].lstrip()
+    return t
+
+
+def _pick_session_window(windows, ancestors, title):
+    """Pure: which top-level window shows a CLI session. windows =
+    [(hwnd, pid, title)] (visible, titled), ancestors = the claude.exe's
+    parent pids, nearest first. 1) the nearest ancestor that owns a window
+    (Windows Terminal, VS Code, a console); 2) else a window whose title
+    contains the session's name -- Claude Code titles its terminal with it,
+    and Git Bash's mintty is not in the Windows parent chain. An exact
+    title beats a substring. -> (hwnd, 'ancestor'|'title') or (None, None)."""
+    by_pid = {}
+    for hwnd, pid, _t in windows:
+        by_pid.setdefault(pid, hwnd)
+    for pid in ancestors:
+        if pid in by_pid:
+            return by_pid[pid], "ancestor"
+    want = _norm_window_title(title)
+    if len(want) < 3:
+        return None, None
+    exact = [h for h, _p, t in windows if _norm_window_title(t) == want]
+    if exact:
+        return exact[0], "title"
+    part = [h for h, _p, t in windows if want in _norm_window_title(t)]
+    return (part[0], "title") if len(part) == 1 else (None, None)
+
+
+def _ancestor_pids(pid, procs, depth=12):
+    """Pure: parent pids of `pid` (nearest first) from (pid, exe, ppid) rows."""
+    parent = {p: pp for p, _e, pp in procs or ()}
+    out, cur = [], parent.get(pid)
+    while cur and cur not in out and len(out) < depth:
+        out.append(cur)
+        cur = parent.get(cur)
+    return out
+
+
+def _list_top_windows():
+    """[(hwnd, pid, title)] of visible, titled, unowned top-level windows."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    out = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _lp):
+        if user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, 4):  # GW_OWNER
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n > 0:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                out.append((hwnd, pid.value, buf.value))
+        return True
+    user32.EnumWindows(proto(cb), 0)
+    return out
+
+
+def _focus_window(hwnd):
+    """Restore + bring a window to the foreground. Windows only lets the
+    foreground app do that; a synthetic Alt press (the usual workaround)
+    lifts the lock for this background process. True if it worked."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.keybd_event(0x12, 0, 0, 0)            # Alt down
+    ok = bool(user32.SetForegroundWindow(hwnd))
+    user32.keybd_event(0x12, 0, 2, 0)            # Alt up
+    if not ok:
+        user32.SwitchToThisWindow(hwnd, True)
+        ok = user32.GetForegroundWindow() == hwnd
+    return ok
+
+
+def _focus_session_terminal(session_id):
+    """POST /focus_session: bring the terminal window running this local
+    CLI session to the front. -> (http status, payload)."""
+    with _status_lock:
+        sess = dict((_load_status().get("sessions") or {}).get(session_id) or {})
+    if not sess:
+        return 404, {"ok": False, "error": "unknown session"}
+    pid = sess.get("host_pid")
+    procs = _snapshot_processes(with_parent=True) if pid else None
+    hwnd, how = _pick_session_window(_list_top_windows(), _ancestor_pids(pid, procs) if pid else [],
+                                     sess.get("display_name") or "")
+    if not hwnd:
+        return 404, {"ok": False, "error": "terminal window not found"}
+    return 200, {"ok": _focus_window(hwnd), "matched": how}
+
 
 def _pid_exe_name(pid) -> str:
     """Return the lowercase exe filename for a live PID ("" if gone) --
@@ -3966,6 +4067,14 @@ def _waiting_on_you_from_line(t, stop_reason):
         return False
     return None
 
+def _transcript_woy_applies(sess: dict, stats: dict) -> bool:
+    """Whether the transcript scanner's waiting_on_you (from the last turn
+    line it read) may override the session's flag: only when that line is
+    newer than the hook's last word. The Notification hook marks a session
+    'waiting for permission' while the transcript's last line is still the
+    tool_use that asked -- read up to 30 s later, it must not clear it."""
+    return (stats.get("woy_epoch") or 0) > (sess.get("waiting_hook_epoch") or 0)
+
 def _compute_waiting_secs(sess: dict, now_epoch: float) -> int:
     """How long a session has been sitting in waiting_on_you state, in
     seconds. Works with no new tracking field: the Stop heartbeat that
@@ -4362,6 +4471,7 @@ def _transcript_scanner_worker():
                             _woy = _waiting_on_you_from_line(t, msg.get("stop_reason"))
                             if _woy is not None:
                                 stats["waiting_on_you"] = _woy
+                                stats["woy_epoch"] = _iso_to_epoch(obj.get("timestamp")) or now
                             if not stats.get("model") and msg.get("model"):
                                 stats["model"] = msg["model"]
                             if not stats.get("cc_version") and obj.get("version"):
@@ -4424,6 +4534,7 @@ def _transcript_scanner_worker():
 
                         elif t == "user":
                             stats["waiting_on_you"] = _waiting_on_you_from_line(t, None)
+                            stats["woy_epoch"] = _iso_to_epoch(obj.get("timestamp")) or now
                             # Agent/Task completion via the SYNCHRONOUS path -- a
                             # foreground Agent call (run_in_background: false)
                             # resolves with a normal tool_result whose sibling
@@ -4559,8 +4670,11 @@ def _transcript_scanner_worker():
                         # Not folded into the loop above: "val != 0" is True for a bool,
                         # since bool is an int subclass and False == 0 -- that check would
                         # silently swallow every "False" value forever.
-                        if "waiting_on_you" in stats:
+                        if "waiting_on_you" in stats and _transcript_woy_applies(sess, stats):
                             _accumulate_waiting_time(sess, stats["waiting_on_you"], now)
+                            if bool(stats["waiting_on_you"]) != bool(sess.get("waiting_on_you")):
+                                sess["waiting_kind"] = "turn" if stats["waiting_on_you"] else ""
+                                sess["waiting_message"] = ""
                             sess["waiting_on_you"] = stats["waiting_on_you"]
                         if stats.get("last_message"):
                             sess["last_message"] = stats["last_message"]
@@ -6155,6 +6269,10 @@ body::before { content:none; }
 .bay-state { font:600 12px var(--font3); letter-spacing:.14em; text-transform:uppercase; padding:2px 8px; border-radius:3px; border:1px solid var(--bay-edge); color:var(--t2); white-space:nowrap; }
 .bay-state.active { color:var(--t); }
 .bay-state.waiting { color:var(--console); background:var(--o); border-color:var(--o); }
+.bay-state.waiting.blocked { background:var(--r); border-color:var(--r); }
+.woy-quote.blocked { border-left-color:var(--r); }
+.woy-quote.blocked .woy-lbl { color:var(--r); }
+.woy-item.blocked .woy-wait { color:var(--r); }
 .bay-btn { background:none; border:1px solid var(--bay-edge); color:var(--t2); border-radius:3px; min-width:28px; height:24px; padding:0 7px; font:600 12px var(--font3); letter-spacing:.08em; text-transform:uppercase; cursor:pointer; }
 .bay-btn:hover { color:var(--t); border-color:var(--t3); }
 .bay-btn:focus-visible { outline:2px solid var(--o); outline-offset:1px; }
@@ -6386,6 +6504,8 @@ body.light .ar-prog { background:rgba(0,0,0,.08); }
 .status-pill.done    .sdot { background:var(--g); }
 .status-pill.error   .sdot { background:var(--r); }
 .status-pill.waiting .sdot { background:var(--o); animation:pulse 1.5s infinite; }
+.status-pill.waiting.blocked { border-color:var(--r); color:var(--r); }
+.status-pill.waiting.blocked .sdot { background:var(--r); }
 
 /* tasks */
 .tasks { display:flex; flex-direction:column; gap:3px; margin:10px 0 8px; }
@@ -8322,7 +8442,7 @@ function _renderSessionCompare(){
           <div style="font-size:13px;font-weight:700;color:${c};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</div>
           ${s.git_branch?`<div style="font-size:10px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px">⎇ ${s.pr_url?`<a href="${escHtml(s.pr_url)}" target="_blank" onclick="event.stopPropagation()" style="color:inherit;text-decoration:underline;text-decoration-style:dotted" title="Open PR on GitHub">${escHtml(s.git_branch)}</a>`:escHtml(s.git_branch)}</div>`:''}
         </div>
-        <div class="status-pill ${isActive?(waitingOnYou?'waiting':'running'):''}" style="font-size:9px;padding:2px 7px;flex-shrink:0" ${waitingOnYou?'title="Claude finished its last turn and is waiting for your next message"':''}><span class="sdot"></span>${isActive?(waitingOnYou?'WAITING'+waitingDurStr:'ACTIVE'):'CLOSED'}</div>
+        <div class="status-pill ${isActive?(waitingOnYou?'waiting'+(_waitLabel(s).blocked?' blocked':''):'running'):''}" style="font-size:9px;padding:2px 7px;flex-shrink:0" ${waitingOnYou?`title="${escHtml(_waitLabel(s).tip)}"`:''}><span class="sdot"></span>${isActive?(waitingOnYou?_waitLabel(s).word+waitingDurStr:'ACTIVE'):'CLOSED'}</div>
       </div>
       <div class="cmp-sec">STATS</div>
       <div class="cmp-stat-row"><span class="cmp-stat-lbl">Duration</span><span class="cmp-stat-val ${dA!==null&&dB!==null?(durBetter?'better':'worse'):''}">${fmtDur(dA)}</span></div>
@@ -9686,12 +9806,30 @@ function _lastMessageInfo(text, max){
   if(q.length>max) q='…'+q.slice(q.length-max+1).replace(/^\S*\s/,'');
   return {asked, text:q, full:clean(t)};
 }
-/* Pure: sessions waiting on you for at least minSecs, longest wait first. */
+/* Pure: how to name what a waiting session waits for. waiting_kind comes
+   from the hooks: 'turn' = Claude finished its turn (Stop), 'permission' /
+   'question' = blocked mid-turn on a permission prompt / question dialog
+   (Notification hook). blocked = Claude can't go on until you answer. */
+function _waitLabel(s){
+  const k=s&&s.waiting_kind;
+  if(k==='permission') return {word:'NEEDS OK', bay:'Needs your OK', blocked:true, icon:'🔐',
+    tip:'Claude is blocked on a permission prompt'+(s.waiting_message?': '+s.waiting_message:'')};
+  if(k==='question') return {word:'QUESTION', bay:'Has a question', blocked:true, icon:'❓',
+    tip:'Claude is waiting for your answer in a dialog'+(s.waiting_message?': '+s.waiting_message:'')};
+  return {word:'WAITING', bay:'Waiting on you', blocked:false, icon:'',
+    tip:'Claude finished its last turn and is waiting for your next message'};
+}
+/* Pure: sessions waiting on you for at least minSecs, longest wait first.
+   A session blocked mid-turn (permission/question) counts after 30 s. */
 function _waitingSessions(list, minSecs){
-  return (list||[]).filter(s=>s&&s.session_active!==false&&s.waiting_on_you&&(s.waiting_secs||0)>=minSecs)
-    .sort((a,b)=>(b.waiting_secs||0)-(a.waiting_secs||0));
+  return (list||[]).filter(s=>s&&s.session_active!==false&&s.waiting_on_you
+      &&(s.waiting_secs||0)>=(_waitLabel(s).blocked?Math.min(minSecs,30):minSecs))
+    .sort((a,b)=>(_waitLabel(b).blocked-_waitLabel(a).blocked)||((b.waiting_secs||0)-(a.waiting_secs||0)));
 }
 function _woyQuoteHtml(s){
+  const wl=_waitLabel(s);
+  if(wl.blocked&&s.waiting_message)
+    return `<div class="woy-quote asked blocked" title="${escHtml(wl.tip)}"><div class="woy-q"><span class="woy-lbl">${escHtml(wl.bay)}</span>${escHtml(s.waiting_message)}</div></div>`;
   const info=_lastMessageInfo(s.last_message);
   if(!info) return '';
   return `<div class="woy-quote${info.asked?' asked':''}" title="${escHtml(info.full.slice(0,1500))}"><div class="woy-q"><span class="woy-lbl">${info.asked?'Claude asks':'Claude said'}</span>${escHtml(info.text)}</div></div>`;
@@ -9724,9 +9862,12 @@ function _waitingStripHtml(list){
   const items=list.slice(0,4).map(s=>{
     const name=s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||s.id.slice(0,8);
     const info=_lastMessageInfo(s.last_message, 140);
-    return `<button class="woy-item" onclick="setView('cli')" title="${escHtml(info?info.full.slice(0,1500):'Open the CLI view')}">
+    const wl=_waitLabel(s);
+    const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
+    const focus=s._isLocal===false||!s.host_pid?'':` onclick="_focusSession(${jsq(s.id)})"`;
+    return `<button class="woy-item${wl.blocked?' blocked':''}"${focus||` onclick="setView('cli')"`} title="${escHtml((focus?'Switch to its terminal. ':'')+(wl.blocked?wl.tip:(info?info.full.slice(0,1500):'Open the CLI view')))}">
       <span class="woy-name">${escHtml(name)}</span><span class="woy-wait">${escHtml(_fmtDurationDHM(s.waiting_secs||0))}</span>
-      ${info?`<span class="woy-text">${info.asked?'❓ ':''}${escHtml(info.text)}</span>`:''}</button>`;
+      ${text?`<span class="woy-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</span>`:''}</button>`;
   }).join('');
   const more=list.length>4?`<span class="woy-more">+${list.length-4} more</span>`:'';
   return `<span class="woy-head">⏳ ${list.length} WAITING ON YOU</span>${items}${more}`;
@@ -9739,6 +9880,15 @@ function _waitingStripUpdate(sr){
   el.style.display=html?'flex':'none';
 }
 
+async function _focusSession(id){
+  try{
+    const r=await fetch('/focus_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:id})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok||!d.ok) showToast('warning','Terminal not found',d.error==='terminal window not found'
+      ?'Could not find the window running this session.':'Could not switch to the terminal.');
+  }catch(e){ showToast('warning','Terminal not found','Could not switch to the terminal.'); }
+}
+
 function _sessionBayHtml(bay, stripsHtml){
   const s=bay.session||{};
   const cwdBase=s.cwd?(s.cwd.replace(/\\/g,'/').split('/').filter(Boolean).pop()||''):'';
@@ -9746,7 +9896,7 @@ function _sessionBayHtml(bay, stripsHtml){
   const active=bay.session ? s.session_active!==false : null;
   const waiting=active&&!!s.waiting_on_you;
   const state=active===null?''
-    : waiting?`<span class="bay-state waiting">Waiting on you${(s.waiting_secs||0)>=60?' · '+_fmtDurationDHM(s.waiting_secs):''}</span>`
+    : waiting?`<span class="bay-state waiting${_waitLabel(s).blocked?' blocked':''}" title="${escHtml(_waitLabel(s).tip)}">${_waitLabel(s).bay}${(s.waiting_secs||0)>=60?' · '+_fmtDurationDHM(s.waiting_secs):''}</span>`
     : active?'<span class="bay-state active">Working</span>'
     : '<span class="bay-state">Closed</span>';
   const tok=(s.input_tokens||0)+(s.output_tokens||0);
@@ -9764,7 +9914,8 @@ function _sessionBayHtml(bay, stripsHtml){
   bay.agents.forEach(a=>{ if(a.status==='error') n.err++; else if(a.status==='done') n.done++; else n.run++; });
   const counts=[n.run?`<b class="bc-run">${n.run} active</b>`:'', n.err?`<b class="bc-err">${n.err} failed</b>`:'', n.done?`<b class="bc-done">${n.done} done</b>`:''].filter(Boolean).join('');
   const collapsed=_collapsedBays.has(bay.key);
-  const dismiss=active===false?`<button class="bay-btn" onclick="_dismissSession(${jsq(bay.sessionId)},${jsq(bay.machine)})" title="Dismiss closed session">Dismiss</button>`:'';
+  const dismiss=active===false?`<button class="bay-btn" onclick="_dismissSession(${jsq(bay.sessionId)},${jsq(bay.machine)})" title="Dismiss closed session">Dismiss</button>`
+    : active&&!bay.isRemote&&s.host_pid?`<button class="bay-btn" onclick="_focusSession(${jsq(bay.sessionId)})" title="Switch to this session's terminal window">Terminal</button>`:'';
   return `<section class="sbay${waiting?' waiting':''}${active===false?' closed':''}${collapsed?' collapsed':''}" data-bay="${escHtml(bay.key)}">
     <header class="sbay-head">
       <div class="sbay-title"><h2 title="${escHtml(s.cwd||title)}">${escHtml(title)}</h2><span class="sbay-meta">${meta}</span></div>
@@ -10270,8 +10421,9 @@ function renderAgents(data){
             ${burnBadge}
             ${activitySparkline}
           </div>
-          <div class="status-pill ${isActive?(waitingOnYou?'waiting':'running'):''}" ${waitingOnYou?'title="Claude finished its last turn and is waiting for your next message"':''}><span class="${isActive?'sdot':''}"></span>${isActive?(waitingOnYou?'WAITING'+waitingDurStr:'ACTIVE'):'CLOSED'}</div>
+          <div class="status-pill ${isActive?(waitingOnYou?'waiting'+(_waitLabel(s).blocked?' blocked':''):'running'):''}" ${waitingOnYou?`title="${escHtml(_waitLabel(s).tip)}"`:''}><span class="${isActive?'sdot':''}"></span>${isActive?(waitingOnYou?_waitLabel(s).word+waitingDurStr:'ACTIVE'):'CLOSED'}</div>
           ${!sIsRemote?`<button onclick="event.stopPropagation();openNotesPanel(${jsq(s.id)})" title="${s.note?'Edit note':'Add note'}" style="background:none;border:none;color:${s.note?'var(--c)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${s.note?'var(--c)':'var(--t3)'}'">📝</button>`:''}
+          ${isActive&&!sIsRemote&&s.host_pid?`<button onclick="event.stopPropagation();_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window" style="background:none;border:none;color:${waitingOnYou?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${waitingOnYou?'var(--o)':'var(--t3)'}'">⧉</button>`:''}
           <button onclick="event.stopPropagation();exportSessionDetail(${jsq(s.id)})" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
           <button onclick="toggleSessionCompare(${jsq(s.id)},event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
           ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession(${jsq(s.id)},${jsq(s.project||s.cwd||'this session')},${jsq(s.machine||'')})" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(240,164,151,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(240,164,151,.7)'">⛔</button>`:''}
@@ -14363,6 +14515,8 @@ def _build_status_payload_uncached() -> dict:
          "last_ts": v.get("last_ts", ""),
          "host_pid": v.get("host_pid"),
          "waiting_on_you": v.get("waiting_on_you", False),
+         "waiting_kind": (v.get("waiting_kind") or "turn") if v.get("waiting_on_you") else "",
+         "waiting_message": v.get("waiting_message", "") if v.get("waiting_on_you") else "",
          "last_message": v.get("last_message", ""),
          "note": v.get("note", ""),
          "pr_url": _pr_link_cache_snapshot.get(v.get("git_branch", ""), {}).get("url"),
@@ -14865,6 +15019,16 @@ class Handler(BaseHTTPRequestHandler):
                     # as a fallback for sessions where the hook silently misses).
                     _accumulate_waiting_time(sessions[session_id], update["waiting_on_you"], now_epoch)
                     sessions[session_id]["waiting_on_you"] = update["waiting_on_you"]
+                    # the transcript scanner only overrides this with lines newer
+                    # than the hook's word (see _transcript_woy_applies)
+                    sessions[session_id]["waiting_hook_epoch"] = now_epoch
+                    if update["waiting_on_you"]:
+                        kind = update.get("waiting_kind")
+                        sessions[session_id]["waiting_kind"] = kind if kind in ("turn", "permission", "question") else "turn"
+                        sessions[session_id]["waiting_message"] = _fix_mojibake(str(update.get("waiting_message") or ""))[:300]
+                    else:
+                        sessions[session_id]["waiting_kind"] = ""
+                        sessions[session_id]["waiting_message"] = ""
                 # mark session as having had agents (used for sessions_count)
                 if update.get("agents"):
                     sessions[session_id]["has_agents"] = True
@@ -15043,6 +15207,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if path_no_qs == "/update":
             self._post_update(body)
+
+        elif path_no_qs == "/focus_session":
+            # a desktop action: only from this machine itself, never through
+            # a tunnel or a Remote Machines peer
+            if self.client_address[0] not in ("127.0.0.1", "::1") or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"local only"}'); return
+            try:
+                sid = str((json.loads(body or b"{}") or {}).get("session_id") or "")
+                code, payload = _focus_session_terminal(sid)
+                self._serve(code, "application/json", json.dumps(payload).encode())
+            except Exception as e:
+                _log_bg_error("focus_session", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
 
         elif path_no_qs == "/remove":
             try:
