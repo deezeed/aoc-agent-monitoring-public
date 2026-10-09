@@ -52,11 +52,12 @@ c.check('agent label uses name when present', agents.some(x => x.label === 'Expl
 c.check('agent label falls back to id when name is empty', agents.some(x => x.label === 'ag_real2'));
 c.check('agent sub includes its status', agents.some(x => x.sub === 'Agent · running') && agents.some(x => x.sub === 'Agent · done'));
 
-// 4. static entries: exactly 7 settings panes and 10 views, every time
-// (AGENTS and CLI count as two views since they were promoted from a
-// CARDS sub-tab to top-level views)
+// 4. static entries: exactly 7 settings panes and 11 views, every time
+// (TODAY, plus AGENTS and CLI as two views since they were promoted from
+// a CARDS sub-tab to top-level views)
 c.check('exactly 7 Settings entries', out.filter(x => x.sub === 'Settings').length === 7);
-c.check('exactly 10 View entries', out.filter(x => x.sub === 'View').length === 10);
+c.check('exactly 11 View entries', out.filter(x => x.sub === 'View').length === 11);
+c.check('Today is a palette view', out.some(x => x.sub === 'View' && x.label === 'View → Today'));
 
 // 5. every candidate has a callable action (the palette invokes it on
 // selection without further checks)

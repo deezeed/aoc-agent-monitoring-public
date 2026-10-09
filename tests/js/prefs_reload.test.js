@@ -29,7 +29,7 @@ eval(extractFunction(src, '_loadPrefs'));
 
 const saved = {
   view: 'history', list: false, sf: 'all', muted: false, theme: 'dark',
-  collapsed: ['agent-1'], pinned: ['agent-2'], bays: ['|sess-1', 'laptop|sess-2'], panelCollapsed: true,
+  collapsed: ['agent-1'], pinned: ['agent-2'], bays: ['|sess-1', 'laptop|sess-2'], panelCollapsed: true, today: 1,
 };
 store.aoc_prefs = JSON.stringify(saved);
 
@@ -44,6 +44,19 @@ c.check('loading does not wipe stored pinned', JSON.stringify(after.pinned) === 
 c.check('loading does not wipe stored collapsed cards', JSON.stringify(after.collapsed) === '["agent-1"]');
 c.check('loading does not wipe stored bays', JSON.stringify(after.bays) === '["|sess-1","laptop|sess-2"]');
 c.check('loading does not wipe stored panel state', after.panelCollapsed === true);
+
+// TODAY is the home view: no prefs -> Today; prefs saved before Today
+// existed (no today flag) open on Today once, and from then on the saved
+// view is respected again.
+store.aoc_prefs = JSON.stringify({ view: 'cli' });
+_loadPrefs();
+c.check('old prefs -> Today once', currentView === 'today' && JSON.parse(store.aoc_prefs).today === 1);
+store.aoc_prefs = JSON.stringify({ view: 'cli', today: 1 });
+_loadPrefs();
+c.check('...then the saved view again', currentView === 'cli');
+delete store.aoc_prefs;
+_loadPrefs();
+c.check('first run -> Today', currentView === 'today');
 
 // Garbage in the bays list is dropped, not turned into keys.
 store.aoc_prefs = JSON.stringify({ bays: ['ok|1', 7, null, { x: 1 }] });

@@ -356,8 +356,17 @@ Two different directories, for a reason:
 
 ## Using the dashboard
 
+**TODAY** (`Y`) is the home view: the date and what today cost (vs the
+average of the 7 days before), how many sessions are open and what today's
+commits cost; **Needs you** -- every session waiting on you, the ones blocked
+on a permission prompt first, with what Claude asked, its context meter and a
+*Terminal* button; **Working** -- the busy sessions with their running agents;
+plan limits; spend by project today; today's commits (a link to History →
+COMMITS). It opens on first run, and once for anyone upgrading; after that
+the dashboard remembers the last view as before.
+
 Views (toolbar buttons, each with a single-letter hotkey once the page has
-focus): **A**gents(**C**), **C**LI(**B**), **T**imeline, **S**ummary,
+focus): toda(**Y**), **A**gents(**C**), **C**LI(**B**), **T**imeline, **S**ummary,
 **G**raph, heat(**X**), health(**K**), tree(**W**), history(**V**),
 term(**M**). AGENTS and CLI used to be a sub-tab toggle inside one CARDS
 view; they're now two top-level views in their own right, each still

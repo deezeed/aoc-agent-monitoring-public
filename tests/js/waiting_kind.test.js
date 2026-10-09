@@ -33,6 +33,6 @@ c.check('strip: local session -> focus its terminal', h.includes('_focusSession(
 h = _waitingStripHtml([S('r', 900, { _isLocal: false })]);
 c.check('strip: remote session -> CLI view', h.includes("setView('cli')") && !h.includes('_focusSession'));
 h = _waitingStripHtml([S('n', 900, { host_pid: null })]);
-c.check('strip: no host pid -> CLI view', !h.includes('_focusSession'));
+c.check('strip: local session without a host pid still focuses (window found by title)', h.includes('_focusSession'));
 
 c.finish();

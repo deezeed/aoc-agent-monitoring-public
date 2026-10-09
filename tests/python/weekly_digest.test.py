@@ -75,10 +75,20 @@ c.check("unrecognized cadence's marker falls back to the ISO week form (matching
         _digest_marker_for(monday_930, "bogus-value") == monday_930.strftime("%G-%V"))
 
 # ── _build_digest_summary ──
+import datetime as _real_dt
+
+
+class _FakeDT:
+    """'today' is 2026-07-19 for the digest windows."""
+    @staticmethod
+    def now():
+        return _real_dt.datetime(2026, 7, 19, 12, 0)
+
+
 # 14 rows: the first 7 are "this week" (index 0-6), the next 7 are
 # "last week" (index 7-13) -- lets prev_week_cost/cost_pct_change be
 # tested meaningfully, not just the last-7-days sum.
-ns2 = exec_functions(["_build_digest_summary"], extra_globals={
+ns2 = exec_functions(["_week_windows", "_build_digest_summary"], extra_globals={"datetime": _FakeDT,
     "_notify_settings": {"muted_projects": []},
     "_db_analytics": lambda: {
         "by_day": [
@@ -115,7 +125,7 @@ c.check("cost_pct_change matches (this-prev)/prev*100, rounded to 1dp",
         summary["cost_pct_change"] == round((_this_cost - _prev_cost) / _prev_cost * 100, 1))
 
 # a week with no prior week at all -> cost_pct_change is None, not a crash
-ns_noprev = exec_functions(["_build_digest_summary"], extra_globals={
+ns_noprev = exec_functions(["_week_windows", "_build_digest_summary"], extra_globals={"datetime": _FakeDT,
     "_notify_settings": {"muted_projects": []},
     "_db_analytics": lambda: {"by_day": [{"date": "2026-07-19", "sessions": 1, "tokens": 100, "cost": 1.0, "errors": 0}]},
 })
@@ -124,7 +134,7 @@ c.check("no prior week data -> prev_week_cost is 0", noprev_summary["prev_week_c
 c.check("no prior week data -> cost_pct_change is None (nothing to compare against)", noprev_summary["cost_pct_change"] is None)
 
 # empty by_day (no data yet) doesn't crash, returns zeros for every field
-ns3 = exec_functions(["_build_digest_summary"], extra_globals={
+ns3 = exec_functions(["_week_windows", "_build_digest_summary"], extra_globals={"datetime": _FakeDT,
     "_notify_settings": {"muted_projects": []},
     "_db_analytics": lambda: {"by_day": []},
 })
@@ -139,7 +149,7 @@ c.check("empty analytics -> all-zero summary, no crash", empty_summary == {
 # suppressed, so its numbers silently inflating the digest (itself a
 # notification) would defeat the point of muting it.
 _muted_call_args = []
-ns_muted = exec_functions(["_build_digest_summary"], extra_globals={
+ns_muted = exec_functions(["_week_windows", "_build_digest_summary"], extra_globals={"datetime": _FakeDT,
     "_notify_settings": {"muted_projects": ["NoisyProject", ""]},  # blank entry must be filtered, not passed through
     "_db_analytics": lambda: (_ for _ in ()).throw(AssertionError("unfiltered _db_analytics() must not be called when a project is muted")),
     "_db_by_day_excluding_projects": lambda excluded, **kw: (_muted_call_args.append(excluded) or [
@@ -151,5 +161,19 @@ c.check("muted_projects routes through _db_by_day_excluding_projects, not the un
         muted_summary["sessions"] == 2 and muted_summary["cost"] == 1.0)
 c.check("blank entries in muted_projects are dropped before being passed down",
         _muted_call_args == [["NoisyProject"]])
+
+# sparse by_day: only days with sessions have rows -- 7 rows must not
+# stretch the "week" back over a month
+ns_gap = exec_functions(["_week_windows", "_build_digest_summary"], extra_globals={"datetime": _FakeDT,
+    "_notify_settings": {"muted_projects": []},
+    "_db_analytics": lambda: {"by_day": [
+        {"date": "2026-07-19", "sessions": 1, "tokens": 1, "cost": 4.0, "errors": 0},
+        {"date": "2026-07-10", "sessions": 1, "tokens": 1, "cost": 2.0, "errors": 0},   # 9 days ago -> previous week
+        {"date": "2026-06-20", "sessions": 1, "tokens": 1, "cost": 50.0, "errors": 0},  # a month ago -> neither
+    ]},
+})
+gap = ns_gap["_build_digest_summary"]()
+c.check("sparse days: windows go by calendar date", gap["cost"] == 4.0 and gap["prev_week_cost"] == 2.0
+        and gap["cost_pct_change"] == 100.0)
 
 c.finish()

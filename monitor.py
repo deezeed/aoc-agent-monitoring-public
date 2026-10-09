@@ -909,11 +909,21 @@ def _db_analytics():
                        SUM(tokens) as tokens, SUM(cost) as cost
                 FROM agents
             """).fetchone()
+            # CLI sessions with no subagents have no agents rows at all: their
+            # tokens/cost (the main conversation, from the transcript scanner)
+            # live only in sessions.*. Without them every agents-table sum
+            # below missed most of the spend -- days of plain CLI work showed
+            # $0 (and the header's week-over-week cost read "-100 %").
+            cli_only = c.execute("""
+                SELECT date, project, COALESCE(tokens, 0) AS tokens, COALESCE(cost, 0) AS cost
+                FROM sessions s WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.session_id = s.id)
+            """).fetchall()
             total = {
                 "sessions": total_sessions["sessions"], "files": total_sessions["files"],
                 "agents": total_agents["agents"], "done": total_agents["done"],
-                "errors": total_agents["errors"], "tokens": total_agents["tokens"],
-                "cost": total_agents["cost"],
+                "errors": total_agents["errors"],
+                "tokens": (total_agents["tokens"] or 0) + sum(r["tokens"] for r in cli_only),
+                "cost": (total_agents["cost"] or 0.0) + sum(r["cost"] for r in cli_only),
             }
             today_sessions = c.execute("""
                 SELECT COUNT(*) as sessions, AVG(duration_s) as avg_duration_s
@@ -930,8 +940,9 @@ def _db_analytics():
             today = {
                 "sessions": today_sessions["sessions"], "avg_duration_s": today_sessions["avg_duration_s"],
                 "agents": today_agents["agents"], "done": today_agents["done"],
-                "errors": today_agents["errors"], "tokens": today_agents["tokens"],
-                "cost": today_agents["cost"],
+                "errors": today_agents["errors"],
+                "tokens": (today_agents["tokens"] or 0) + sum(r["tokens"] for r in cli_only if r["date"] == today_str),
+                "cost": (today_agents["cost"] or 0.0) + sum(r["cost"] for r in cli_only if r["date"] == today_str),
             }
             # Same agents-table-is-authoritative fix as total/today above,
             # applied to the day/project breakdowns -- tokens/cost/agents/
@@ -960,9 +971,12 @@ def _db_analytics():
             by_day = []
             for r in by_day_sessions:
                 ag = by_day_agents.get(r["date"])
+                cli_tok = sum(x["tokens"] for x in cli_only if x["date"] == r["date"])
+                cli_cost = sum(x["cost"] for x in cli_only if x["date"] == r["date"])
                 by_day.append({
                     "date": r["date"], "sessions": r["sessions"],
-                    "tokens": ag["tokens"] if ag else 0, "cost": ag["cost"] if ag else 0.0,
+                    "tokens": ((ag["tokens"] or 0) if ag else 0) + cli_tok,
+                    "cost": ((ag["cost"] or 0.0) if ag else 0.0) + cli_cost,
                     "agents": ag["agents"] if ag else 0, "errors": ag["errors"] if ag else 0,
                     "avg_duration_s": r["avg_duration_s"],
                     "task_done": r["task_done"], "task_total": r["task_total"],
@@ -986,9 +1000,12 @@ def _db_analytics():
             by_project_all = []
             for r in by_project_sessions:
                 ag = by_project_agents.get(r["project"])
+                cli_tok = sum(x["tokens"] for x in cli_only if x["project"] == r["project"])
+                cli_cost = sum(x["cost"] for x in cli_only if x["project"] == r["project"])
                 by_project_all.append({
                     "project": r["project"], "sessions": r["sessions"],
-                    "tokens": ag["tokens"] if ag else 0, "cost": ag["cost"] if ag else 0.0,
+                    "tokens": ((ag["tokens"] or 0) if ag else 0) + cli_tok,
+                    "cost": ((ag["cost"] or 0.0) if ag else 0.0) + cli_cost,
                     "agents": ag["agents"] if ag else 0, "done": ag["done"] if ag else 0,
                     "errors": ag["errors"] if ag else 0,
                     "task_done": r["task_done"], "task_total": r["task_total"],
@@ -1026,6 +1043,16 @@ def _db_analytics():
                 WHERE s.project != ''
                 GROUP BY s.date, s.project ORDER BY s.date ASC
             """).fetchall()
+            _bdp = {(r["date"], r["project"]): {"date": r["date"], "project": r["project"],
+                                                "tokens": r["tokens"] or 0, "cost": r["cost"] or 0.0}
+                    for r in by_day_project}
+            for x in cli_only:
+                if x["project"]:
+                    d = _bdp.setdefault((x["date"], x["project"]),
+                                        {"date": x["date"], "project": x["project"], "tokens": 0, "cost": 0.0})
+                    d["tokens"] += x["tokens"]
+                    d["cost"] += x["cost"]
+            by_day_project = sorted(_bdp.values(), key=lambda d: d["date"] or "")
             # Cost/token breakdown by model (Sonnet vs Opus vs Haiku, etc.) --
             # only ever populated for agents saved since the `model` column
             # was added, so old rows are simply absent rather than showing a
@@ -1304,6 +1331,9 @@ def _db_by_day_excluding_projects(excluded_projects, limit: int = 30) -> list:
             else:
                 where = "1=1"
                 params = []
+            # sessions.tokens/cost: for a session with agents they are its
+            # agents' sum (_db_save_session), for a CLI-only session the main
+            # conversation -- so the plain SUM covers both kinds.
             rows = c.execute(f"""
                 SELECT date, COUNT(*) as sessions, SUM(tokens) as tokens, SUM(cost) as cost,
                        SUM(errors) as errors
@@ -3870,14 +3900,26 @@ def _should_send_digest(now, last_sent_week: str, cadence: str = "weekly") -> bo
         return False
     return _digest_marker_for(now, cadence) != last_sent_week
 
+def _week_windows(by_day, today):
+    """Pure: by_day rows of the last 7 calendar days (today included) and of
+    the 7 before. by_day only has days with sessions, so 7 rows could span
+    weeks -- windows go by date. today = datetime.date."""
+    import datetime as _dt
+    last, prev = [], []
+    for r in by_day or []:
+        try:
+            age = (today - _dt.date.fromisoformat(str(r.get("date") or "")[:10])).days
+        except ValueError:
+            continue
+        if 0 <= age < 7:
+            last.append(r)
+        elif 7 <= age < 14:
+            prev.append(r)
+    return last, prev
+
 def _build_digest_summary() -> dict:
-    """Sum the last 7 entries of by_day (already ordered DESC by date) for
-    the weekly digest. Also sums the PRECEDING 7 entries for a
-    week-over-week cost trend. Approximation note: by_day only contains
-    rows for days with actual activity, so slicing by array position
-    isn't calendar-exact if a day had zero sessions -- same "simple
-    run-rate, not a precise calendar reconciliation" spirit as the
-    month-end cost projection elsewhere in this file.
+    """The weekly digest: the last 7 calendar days of by_day, and the 7
+    before for a week-over-week cost trend (see _week_windows).
 
     Excludes any project in muted_projects -- a muted project already has
     its individual toast/webhook events suppressed, and the digest is
@@ -3888,8 +3930,7 @@ def _build_digest_summary() -> dict:
     for identical output."""
     muted = [p for p in (_notify_settings.get("muted_projects") or []) if p]
     by_day = _db_by_day_excluding_projects(muted) if muted else _db_analytics().get("by_day", [])
-    last7 = by_day[:7]
-    prev7 = by_day[7:14]
+    last7, prev7 = _week_windows(by_day, datetime.now().date())
     cost = round(sum(r.get("cost") or 0.0 for r in last7), 2)
     prev_week_cost = round(sum(r.get("cost") or 0.0 for r in prev7), 2)
     cost_pct_change = round((cost - prev_week_cost) / prev_week_cost * 100, 1) if prev_week_cost > 0 else None
@@ -6724,6 +6765,46 @@ button.le-tag { cursor:pointer; }
 .cache-leg-p { color:var(--t3);font-family:var(--font2);font-size:10px; }
 .cache-insight { display:flex;gap:8px;font-size:12px;line-height:1.5;color:var(--t2);padding:7px 10px;margin-bottom:6px;border-radius:8px;background:rgba(var(--c-rgb),.05);border:1px solid rgba(var(--c-rgb),.14); }
 .cache-table-wrap { overflow-x:auto;max-width:100%; }
+/* ── TODAY view ── */
+#today-area { flex:1;overflow-y:auto;padding:6px 4px 24px;min-height:0; }
+.td-wrap { max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:14px; }
+.td-head h2 { font:600 26px var(--font3);letter-spacing:.02em;color:var(--t);margin:0 0 6px; }
+.td-facts { display:flex;flex-wrap:wrap;gap:6px 22px;font-size:13px;color:var(--t2); }
+.td-facts b { color:var(--t);font-family:var(--font2);font-weight:600; }
+.td-delta { font:400 11px var(--font2);margin-left:4px; }
+.td-delta.up { color:var(--o); } .td-delta.down { color:var(--g); }
+.td-grid { display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px;align-items:start; }
+.td-col { display:flex;flex-direction:column;gap:14px;min-width:0; }
+.td-card { background:var(--bay);border:1px solid var(--bay-edge);border-radius:6px;padding:12px 14px;min-width:0; }
+.td-card h3 { font:700 11px var(--font2);letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin:0 0 8px;display:flex;align-items:center;gap:8px; }
+.td-count { background:var(--o);color:var(--console);border-radius:9px;padding:0 7px;font-size:10px;letter-spacing:0; }
+.td-more { margin-left:auto;font-size:9px;padding:2px 8px; }
+.td-empty { font-size:12px;color:var(--t3);padding:4px 0; }
+.td-row { display:flex;align-items:flex-start;gap:10px;padding:9px 0 9px 10px;border-top:1px solid rgba(var(--c-rgb),.08);border-left:2px solid transparent; }
+.td-row:first-of-type { border-top:none; }
+.td-row.blocked { border-left-color:var(--r); }
+.td-main { flex:1;min-width:0; }
+.td-name { font-weight:700;color:var(--t);font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap; }
+.td-tag { font:600 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o); }
+.td-tag.blocked { color:var(--r); } .td-tag.run { color:var(--c); }
+.td-text { font-size:12px;color:var(--t2);margin-top:3px;line-height:1.45;overflow-wrap:anywhere; }
+.td-sub { font:400 10px var(--font2);color:var(--t3);margin-top:2px; }
+.td-btn { font-size:9px;padding:3px 9px;flex-shrink:0;margin-top:1px; }
+.td-lim { display:grid;grid-template-columns:62px 1fr 44px;gap:4px 10px;align-items:center;padding:4px 0;font-size:12px; }
+.td-lim-name { color:var(--t2); } .td-lim-val { font-family:var(--font2);text-align:right;color:var(--t); }
+.td-lim-bar { flex:none;width:auto; }
+.td-lim-reset { grid-column:2 / 4;font:400 10px var(--font2);color:var(--t3); }
+.td-proj { display:grid;grid-template-columns:minmax(0,1fr) 90px 64px;gap:10px;align-items:center;padding:4px 0;font-size:12px; }
+.td-proj-name { overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t); }
+.td-proj-bar { width:auto; } .td-proj-val { font-family:var(--font2);text-align:right;color:var(--t2); }
+.td-commit { display:grid;grid-template-columns:42px 58px minmax(0,1fr) 54px;gap:8px;align-items:baseline;padding:5px 0;font-size:12px;border-top:1px solid rgba(var(--c-rgb),.08); }
+.td-commit:first-of-type { border-top:none; }
+.td-c-time { font:400 10px var(--font2);color:var(--t3); }
+.td-c-subj { min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t); }
+.td-c-cost { font-family:var(--font2);text-align:right;color:var(--t2);font-size:11px; }
+@media (max-width: 900px) { .td-grid { grid-template-columns:minmax(0,1fr); } }
+@media (max-width: 600px) { .td-head h2 { font-size:21px; } .td-commit { grid-template-columns:52px minmax(0,1fr) 50px; } .td-c-time { display:none; } }
+
 .cc-ins { color:var(--g); }
 .cc-del { color:var(--r); }
 .cc-sha { font:400 11px var(--font2);color:var(--c); }
@@ -7486,6 +7567,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
   <div class="main" id="main-area">
     <div class="view-toggle">
       <!-- Group 1: live-agent visualizations -- 7 different views of the exact same running-agent/session data -->
+      <button class="vtbtn"        id="vt-today"  onclick="setView('today')" title="Today: what needs you, what's running, today's spend and commits (Y)">TODAY</button>
       <button class="vtbtn active" id="vt-agents" onclick="setView('agents')">AGENTS</button>
       <button class="vtbtn"        id="vt-cli"    onclick="setView('cli')">CLI</button>
       <button class="vtbtn"        id="vt-tl"      onclick="setView('timeline')">TIMELINE</button>
@@ -7551,6 +7633,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
       <div id="status-filter-bar" style="display:none;gap:6px;padding:0 0 8px;flex-wrap:wrap"></div>
       <div class="agents" id="agents"></div>
     </div>
+    <div id="today-area" style="display:none"></div>
     <div id="timeline-area" style="display:none"></div>
     <div id="summary-area" style="display:none;flex-direction:column;gap:0;flex:1;align-items:center"></div>
     <div id="graph-area"   style="display:none;flex:1;align-items:center;justify-content:center;padding:20px;overflow:auto;min-height:0"></div>
@@ -7612,6 +7695,10 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
 
   <!-- MOBILE BOTTOM NAV -->
   <nav id="mobile-nav">
+    <button class="mnav-btn" id="mnav-today" onclick="_mnavGo('today')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+      TODAY
+    </button>
     <button class="mnav-btn active" id="mnav-agents" onclick="_mnavGo('agents')">
       <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
       AGENTS
@@ -8649,7 +8736,7 @@ function _mnavToggleLogs(force){
   if(btn) btn.classList.toggle('active', _mnavLogsOpen);
 }
 function _savePrefs(){
-  try{ localStorage.setItem('aoc_prefs',JSON.stringify({view:currentView,list:listMode,sf:statusFilter,muted:_soundMuted,theme:_theme,collapsed:[..._collapsedIds],pinned:[..._pinnedIds],bays:[..._collapsedBays],panelCollapsed:_panelCollapsed})); }catch(e){}
+  try{ localStorage.setItem('aoc_prefs',JSON.stringify({view:currentView,list:listMode,sf:statusFilter,muted:_soundMuted,theme:_theme,collapsed:[..._collapsedIds],pinned:[..._pinnedIds],bays:[..._collapsedBays],panelCollapsed:_panelCollapsed,today:1})); }catch(e){}
 }
 function _loadPrefs(){
   try{
@@ -8659,6 +8746,8 @@ function _loadPrefs(){
     // view at all and leave the main area blank for returning users.
     let v=p.view;
     if(v==='cards') v=(p.cardsTab==='cli')?'cli':'agents';
+    // TODAY is the home view: first run, and once for prefs saved before it existed
+    if(!v||!p.today) v='today';
     if(p.list)  listMode=p.list;
     if(p.sf && p.sf!=='all') statusFilter=p.sf;
     if(p.muted) { _soundMuted=true; _applyMuteUI(); }
@@ -8720,8 +8809,8 @@ function toggleTheme(){
 function setView(v){
   currentView=v;
   _savePrefs();
-  const areas = { timeline:'flex', summary:'flex', graph:'flex', heat:'flex', tree:'flex', history:'flex', term:'flex' };
-  ['timeline-area','summary-area','graph-area','heat-area','diag-area','tree-area','history-area','term-area'].forEach(id=>{
+  const areas = { today:'block', timeline:'flex', summary:'flex', graph:'flex', heat:'flex', tree:'flex', history:'flex', term:'flex' };
+  ['today-area','timeline-area','summary-area','graph-area','heat-area','diag-area','tree-area','history-area','term-area'].forEach(id=>{
     const key=id.replace('-area','');
     document.getElementById(id).style.display = v===key ? (areas[key]||'flex') : 'none';
   });
@@ -8730,8 +8819,12 @@ function setView(v){
      which reads currentView to decide which to draw into #agents. */
   const cardsAreaEl=document.getElementById('cards-area');
   if(cardsAreaEl) cardsAreaEl.style.display = (v==='agents'||v==='cli') ? 'flex' : 'none';
-  [['vt-agents','agents'],['vt-cli','cli'],['vt-tl','timeline'],['vt-summary','summary'],['vt-graph','graph'],['vt-heat','heat'],['vt-diag','diag'],['vt-tree','tree'],['vt-history','history'],['vt-term','term']].forEach(([id,val])=>{
+  [['vt-today','today'],['vt-agents','agents'],['vt-cli','cli'],['vt-tl','timeline'],['vt-summary','summary'],['vt-graph','graph'],['vt-heat','heat'],['vt-diag','diag'],['vt-tree','tree'],['vt-history','history'],['vt-term','term']].forEach(([id,val])=>{
     const el=document.getElementById(id); if(el) el.classList.toggle('active',v===val);
+  });
+  ['today','agents','summary','term'].forEach(x=>{
+    const b=document.getElementById('mnav-'+x);
+    if(b) b.classList.toggle('active', v===x||(x==='agents'&&v==='cli'));
   });
   /* KPI bar covers both AGENTS and CLI (same underlying live data) */
   const kpiEl=document.getElementById('kpi-bar');
@@ -8742,6 +8835,7 @@ function setView(v){
   if(v==='term') { _initTerm(); return; }
   if(!lastStatus) return;
   if(v==='agents'||v==='cli') renderAgents(lastStatus);
+  if(v==='today')    renderToday(lastStatus);
   if(v==='timeline') renderTimeline(lastStatus);
   if(v==='summary')  renderSummary(lastStatus);
   if(v==='graph')    renderGraph(lastStatus);
@@ -8754,6 +8848,103 @@ function setView(v){
      detail view -- both write the same element asynchronously, so without
      this ordering the list fetch resolving second would clobber it back. */
   if(v==='history')  return renderHistory();
+}
+
+/* ── TODAY: the home view ── */
+let _todayCommits=null, _todayCommitsAt=0;
+async function renderToday(sr){
+  const el=document.getElementById('today-area');
+  if(!el||!sr) return;
+  const now=Date.now();
+  if(now-_kpiLastFetch>30000){
+    _kpiLastFetch=now;
+    try{ _kpiAnalytics=await fetch('/analytics').then(r=>r.json()); }catch(e){}
+  }
+  if(now-_todayCommitsAt>60000){
+    _todayCommitsAt=now;
+    try{ _todayCommits=await fetch('/commit_costs?days=1').then(r=>r.json()); }catch(e){}
+  }
+  if(currentView!=='today') return;
+  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr());
+  if(el.innerHTML!==html) el.innerHTML=html;
+}
+/* Pure: the TODAY view. sr = /status, an = /analytics, cm = /commit_costs
+   stats for today (or null), nowS = epoch s, todayStr = local YYYY-MM-DD. */
+function _todayHtml(sr, an, cm, nowS, todayStr){
+  sr=sr||{}; an=an||{};
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const nameOf=s=>s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||String(s.id||'').slice(0,8);
+  const sessions=(sr.sessions_list||[]).filter(s=>s&&s.session_active!==false);
+  const waiting=_waitingSessions(sessions, 0);
+  const working=sessions.filter(s=>!s.waiting_on_you);
+  const agents=(sr.agents||[]).filter(a=>a.status==='running'||a.status==='waiting');
+  /* spend: today vs the average of the 7 days before */
+  const day=s=>Date.UTC(+s.slice(0,4),+s.slice(5,7)-1,+s.slice(8,10))/864e5;
+  const t0=/^\d{4}-\d\d-\d\d$/.test(todayStr||'')?day(todayStr):null;
+  let prev7=0;
+  (an.by_day||[]).forEach(r=>{ if(t0!=null&&/^\d{4}-\d\d-\d\d/.test(r.date||'')){ const age=t0-day(r.date); if(age>=1&&age<=7) prev7+=r.cost||0; } });
+  const todayCost=(an.today&&an.today.cost)||0, avg=prev7/7;
+  const vsAvg=avg>0?Math.round((todayCost-avg)/avg*100):null;
+  const commits=(cm&&cm.commits)||[];
+  const when=new Date(nowS*1000);
+  const dateStr=when.toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'long'});
+  const facts=[
+    `<b>${money(todayCost)}</b> spent today${vsAvg!=null?` <span class="td-delta ${vsAvg>0?'up':'down'}" title="Average of the 7 days before: ${money(avg)}">${vsAvg>0?'▲':'▼'} ${Math.abs(vsAvg)}% vs a usual day</span>`:''}`,
+    `<b>${sessions.length}</b> session${sessions.length===1?'':'s'} open`,
+    `<b>${commits.length}</b> commit${commits.length===1?'':'s'}${cm&&cm.total&&cm.total.cost?` for ${money(cm.total.cost)}`:''}`,
+  ];
+  const btn=(s,label)=>s._isLocal===false?'':`<button class="adp-btn td-btn" onclick="_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window">${label}</button>`;
+  const waitRows=waiting.map(s=>{
+    const wl=_waitLabel(s);
+    const info=_lastMessageInfo(s.last_message, 180);
+    const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
+    return `<div class="td-row${wl.blocked?' blocked':''}">
+      <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag${wl.blocked?' blocked':''}">${escHtml(wl.bay)} · ${escHtml(_fmtDurationDHM(Math.max(60,s.waiting_secs||0)))}</span></div>
+        ${text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:''}
+        ${_ctxMeterHtml(s, nowS)}</div>
+      ${btn(s,'Terminal')}</div>`;
+  }).join('');
+  const workRows=working.map(s=>{
+    const n=agents.filter(a=>a.session_id===s.id).length;
+    const model=s.model?String(s.model).replace(/^claude-/,'').replace(/-(\d+)-(\d+)$/,' $1.$2'):'';
+    return `<div class="td-row">
+      <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag run">Working${n?` · ${n} agent${n===1?'':'s'}`:''}</span></div>
+        <div class="td-sub">${[model, s.estimated_cost?money(s.estimated_cost):''].filter(Boolean).map(escHtml).join(' · ')}</div>
+        ${_ctxMeterHtml(s, nowS)}</div>
+      ${btn(s,'Terminal')}</div>`;
+  }).join('');
+  const lim=((sr.rate_limits||{}).windows||[]).filter(w=>w.status!=='reset'&&typeof w.pct==='number').map(w=>{
+    const left=Math.max(0,(w.resets_at||0)-nowS), h=Math.floor(left/3600), m=Math.floor(left%3600/60);
+    const lvl=w.status==='hit'||w.pct>=90?'high':w.status==='warn'||w.pct>=80?'warn':'ok';
+    return `<div class="td-lim ctx-${lvl}"><span class="td-lim-name">${w.kind==='five_hour'?'5-hour':'Weekly'}</span>
+      <span class="ctx-bar td-lim-bar"><span style="width:${Math.min(100,w.pct).toFixed(1)}%"></span></span>
+      <span class="td-lim-val">${w.status==='hit'?'LIMIT':Math.round(w.pct)+'%'}</span>
+      <span class="td-lim-reset">resets in ${h>=24?Math.floor(h/24)+'d '+(h%24)+'h':h?h+'h '+m+'m':m+'m'}${w.projected_pct!=null&&w.status!=='hit'?` · ~${Math.min(100,Math.round(w.projected_pct))}% by then`:''}</span></div>`;
+  }).join('');
+  const projRows=(an.by_day_project||[]).filter(r=>r.date===todayStr&&(r.cost||0)>0).sort((a,b)=>b.cost-a.cost);
+  const pmax=Math.max(...projRows.map(r=>r.cost),0.0001);
+  const projects=projRows.slice(0,6).map(r=>`<div class="td-proj"><span class="td-proj-name">${escHtml(r.project)}</span>
+      <span class="cc-bar td-proj-bar"><span style="width:${(r.cost/pmax*100).toFixed(1)}%"></span></span><span class="td-proj-val">${money(r.cost)}</span></div>`).join('');
+  const cmRows=commits.slice(0,8).map(x=>{
+    const tm=x.epoch?new Date(x.epoch*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}):'';
+    return `<div class="td-commit"><span class="td-c-time">${escHtml(tm)}</span><span class="cc-sha">${escHtml(String(x.sha||'').slice(0,7))}</span>
+      <span class="td-c-subj" title="${escHtml(x.subject||'')}">${escHtml(x.subject||'(no message)')}<span class="cc-repo">${escHtml(x.repo||'')}</span></span><span class="td-c-cost">${money(x.cost)}</span></div>`;
+  }).join('');
+  const sec=(title,body,empty,extra)=>`<section class="td-card"><h3>${title}${extra||''}</h3>${body||`<div class="td-empty">${empty}</div>`}</section>`;
+  return `<div class="td-wrap">
+    <header class="td-head"><h2>${escHtml(dateStr)}</h2><div class="td-facts">${facts.map(f=>`<span>${f}</span>`).join('')}</div></header>
+    <div class="td-grid">
+      <div class="td-col">
+        ${sec(`Needs you${waiting.length?` <span class="td-count">${waiting.length}</span>`:''}`, waitRows, 'Nothing is waiting on you.')}
+        ${sec('Working', workRows, sessions.length?'Every open session is waiting on you.':'No Claude Code session is open.')}
+      </div>
+      <div class="td-col">
+        ${lim?sec('Plan limits', lim, ''):''}
+        ${sec('Spend by project', projects, 'Nothing spent yet today.')}
+        ${sec('Commits today', cmRows, 'No commits yet today.', commits.length?` <button class="adp-btn td-more" onclick="_histTab='commits';setView('history')">All commits</button>`:'')}
+      </div>
+    </div>
+  </div>`;
 }
 
 /* ── timeline ── */
@@ -9864,7 +10055,7 @@ function _waitingStripHtml(list){
     const info=_lastMessageInfo(s.last_message, 140);
     const wl=_waitLabel(s);
     const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
-    const focus=s._isLocal===false||!s.host_pid?'':` onclick="_focusSession(${jsq(s.id)})"`;
+    const focus=s._isLocal===false?'':` onclick="_focusSession(${jsq(s.id)})"`;
     return `<button class="woy-item${wl.blocked?' blocked':''}"${focus||` onclick="setView('cli')"`} title="${escHtml((focus?'Switch to its terminal. ':'')+(wl.blocked?wl.tip:(info?info.full.slice(0,1500):'Open the CLI view')))}">
       <span class="woy-name">${escHtml(name)}</span><span class="woy-wait">${escHtml(_fmtDurationDHM(s.waiting_secs||0))}</span>
       ${text?`<span class="woy-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</span>`:''}</button>`;
@@ -9915,7 +10106,7 @@ function _sessionBayHtml(bay, stripsHtml){
   const counts=[n.run?`<b class="bc-run">${n.run} active</b>`:'', n.err?`<b class="bc-err">${n.err} failed</b>`:'', n.done?`<b class="bc-done">${n.done} done</b>`:''].filter(Boolean).join('');
   const collapsed=_collapsedBays.has(bay.key);
   const dismiss=active===false?`<button class="bay-btn" onclick="_dismissSession(${jsq(bay.sessionId)},${jsq(bay.machine)})" title="Dismiss closed session">Dismiss</button>`
-    : active&&!bay.isRemote&&s.host_pid?`<button class="bay-btn" onclick="_focusSession(${jsq(bay.sessionId)})" title="Switch to this session's terminal window">Terminal</button>`:'';
+    : active&&!bay.isRemote?`<button class="bay-btn" onclick="_focusSession(${jsq(bay.sessionId)})" title="Switch to this session's terminal window">Terminal</button>`:'';
   return `<section class="sbay${waiting?' waiting':''}${active===false?' closed':''}${collapsed?' collapsed':''}" data-bay="${escHtml(bay.key)}">
     <header class="sbay-head">
       <div class="sbay-title"><h2 title="${escHtml(s.cwd||title)}">${escHtml(title)}</h2><span class="sbay-meta">${meta}</span></div>
@@ -10423,7 +10614,7 @@ function renderAgents(data){
           </div>
           <div class="status-pill ${isActive?(waitingOnYou?'waiting'+(_waitLabel(s).blocked?' blocked':''):'running'):''}" ${waitingOnYou?`title="${escHtml(_waitLabel(s).tip)}"`:''}><span class="${isActive?'sdot':''}"></span>${isActive?(waitingOnYou?_waitLabel(s).word+waitingDurStr:'ACTIVE'):'CLOSED'}</div>
           ${!sIsRemote?`<button onclick="event.stopPropagation();openNotesPanel(${jsq(s.id)})" title="${s.note?'Edit note':'Add note'}" style="background:none;border:none;color:${s.note?'var(--c)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${s.note?'var(--c)':'var(--t3)'}'">📝</button>`:''}
-          ${isActive&&!sIsRemote&&s.host_pid?`<button onclick="event.stopPropagation();_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window" style="background:none;border:none;color:${waitingOnYou?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${waitingOnYou?'var(--o)':'var(--t3)'}'">⧉</button>`:''}
+          ${isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window" style="background:none;border:none;color:${waitingOnYou?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${waitingOnYou?'var(--o)':'var(--t3)'}'">⧉</button>`:''}
           <button onclick="event.stopPropagation();exportSessionDetail(${jsq(s.id)})" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
           <button onclick="toggleSessionCompare(${jsq(s.id)},event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
           ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession(${jsq(s.id)},${jsq(s.project||s.cwd||'this session')},${jsq(s.machine||'')})" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(240,164,151,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(240,164,151,.7)'">⛔</button>`:''}
@@ -11778,21 +11969,34 @@ function _topProjectsToday(byDayProject, todayStr, topN=3){
    this exact number, but only once a week in a toast/webhook -- this
    makes it visible live, at a glance, without waiting for that schedule
    or opening History -> Analytics. */
-function _computeWeekOverWeekCost(byDay){
-  const rows=byDay||[];
-  const last7=rows.slice(0,7);
-  const prev7=rows.slice(7,14);
-  const cost=last7.reduce((s,r)=>s+(r.cost||0),0);
-  const prevCost=prev7.reduce((s,r)=>s+(r.cost||0),0);
+/* Pure: cost of the last 7 calendar days (today included) vs the 7 before.
+   by_day only has rows for days with sessions, so windows go by date, not
+   by row count (7 rows could span a month). todayStr = local YYYY-MM-DD. */
+function _computeWeekOverWeekCost(byDay, todayStr){
+  const day=s=>Date.UTC(+s.slice(0,4),+s.slice(5,7)-1,+s.slice(8,10))/864e5;
+  let cost=0, prevCost=0;
+  if(/^\d{4}-\d\d-\d\d$/.test(todayStr||'')){
+    const t=day(todayStr);
+    (byDay||[]).forEach(r=>{
+      if(!r||!/^\d{4}-\d\d-\d\d/.test(r.date||'')) return;
+      const age=t-day(r.date);
+      if(age>=0&&age<7) cost+=r.cost||0;
+      else if(age>=7&&age<14) prevCost+=r.cost||0;
+    });
+  }
   const pctChange=prevCost>0?((cost-prevCost)/prevCost*100):null;
   return {cost, prevCost, pctChange};
+}
+function _localDateStr(d){
+  d=d||new Date();
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
 function _renderTopProjects(analytics){
   const bar=document.getElementById('top-projects-bar');
   if(!bar) return;
   const todayStr=new Date().toISOString().slice(0,10);
   const top=_topProjectsToday((analytics||{}).by_day_project, todayStr);
-  const wow=_computeWeekOverWeekCost((analytics||{}).by_day);
+  const wow=_computeWeekOverWeekCost((analytics||{}).by_day, _localDateStr());
   const wowHtml=wow.pctChange!=null
     ?`<span title="Last 7 days: $${wow.cost.toFixed(2)} — preceding 7 days: $${wow.prevCost.toFixed(2)}">7d cost <span style="color:${wow.pctChange>=0?'rgba(240,164,151,.9)':'rgba(76,194,133,.9)'}">${wow.pctChange>=0?'▲':'▼'} ${Math.abs(wow.pctChange).toFixed(0)}%</span> vs prior wk</span>`
     :'';
@@ -11826,6 +12030,7 @@ function _applyStatus(sr){
   _waitingStripUpdate(sr);
   _updateSweepButton(sr);
   if(_adpAgentId) _renderAdp();
+  if(currentView==='today')    renderToday(sr);
   if(currentView==='summary')  renderSummary(sr);
   if(currentView==='graph')    renderGraph(sr);
   if(currentView==='heat')     renderHeatmap(sr);
@@ -14233,7 +14438,7 @@ async function _fireCostSpikeWebhook(sess,cost,projectAvgCost){
 /* ── keyboard shortcuts ── */
 const _KB_GROUPS = [
   { title:'VIEWS', items:[
-    ['C','Agents'],['B','CLI'],['T','Timeline'],['S','Summary'],['G','Graph'],
+    ['Y','Today'],['C','Agents'],['B','CLI'],['T','Timeline'],['S','Summary'],['G','Graph'],
     ['X','Heatmap'],['W','Tree'],['V','History'],['K','Health'],['M','Term'],
   ]},
   { title:'RIGHT PANEL', items:[
@@ -14305,7 +14510,7 @@ function _paletteCandidates(){
    ['infra','Settings → Infra']].forEach(([pane,label])=>{
     out.push({ label, sub:'Settings', action:()=>{ openSettings(); setSettingsTab(pane); } });
   });
-  [['agents','View → Agents'],['cli','View → CLI'],['timeline','View → Timeline'],['summary','View → Summary'],
+  [['today','View → Today'],['agents','View → Agents'],['cli','View → CLI'],['timeline','View → Timeline'],['summary','View → Summary'],
    ['graph','View → Graph'],['heat','View → Heatmap'],['tree','View → Tree'],
    ['history','View → History'],['diag','View → Health'],['term','View → Terminal']].forEach(([v,label])=>{
     out.push({ label, sub:'View', action:()=>{ setView(v); } });
@@ -14365,6 +14570,7 @@ document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.metaKey||e.ctrlKey||e.altKey) return;
   if(e.key==='Escape'){ if(_kbOpen){ _toggleKbHelp(); return; } }
   switch(e.key.toUpperCase()){
+    case 'Y': setView('today');    log('View → TODAY','info');    break;
     case 'C': setView('agents');   log('View → AGENTS','info');   break;
     case 'B': setView('cli');      log('View → CLI','info');      break;
     case 'T': setView('timeline'); log('View → TIMELINE','info'); break;
@@ -14445,7 +14651,7 @@ document.addEventListener('keydown',e=>{
     next.click();
   }
 });
-log('Shortcuts: C B T S G X W I U = views · R = reset · F = search · Ctrl+K = palette · ? = help','info');
+log('Shortcuts: Y C B T S G X W I U = views · R = reset · F = search · Ctrl+K = palette · ? = help','info');
 </script>
 </body>
 </html>"""
