@@ -14,7 +14,7 @@ c = Checker()
 work = tempfile.mkdtemp(prefix="aoc_ts_")
 ns = exec_functions(
     ["_TRANSCRIPT_INDEX_MAX_TEXT", "_TRANSCRIPT_INDEX_BYTES_PER_TICK", "_transcript_index_connect",
-     "_transcript_line_messages", "_transcript_index_file", "_transcript_index_tick", "_fts_query",
+     "_transcript_line_messages", "_GIT_COMMIT_LINE_RE", "_GIT_SHORTSTAT_RE", "_GIT_COMMIT_CMD_RE", "_git_commit_calls", "_tool_result_ids", "_commit_from_line", "_index_commit_line", "_transcript_index_file", "_transcript_index_tick", "_fts_query",
      "_search_transcripts", "_TRANSCRIPT_INDEX_VERSION", "_COLD_IDLE_S", "_RECACHE_MIN_TOKENS",
      "_usage_line_sample", "_usage_add_samples", "_MODEL_PRICING", "_CACHE_WRITE_1H_MULT",
      "_model_pricing", "_calc_cost", "_iso_to_epoch"],

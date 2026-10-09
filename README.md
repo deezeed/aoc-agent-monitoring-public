@@ -590,6 +590,17 @@ switching windows. Sessions waiting 10+ minutes are also listed in a strip
 above every view, longest wait first (click one to jump to the CLI view).
 The text comes from the transcript scanner (`last_message` in `/status`).
 
+**History → COMMITS** shows what each git commit Claude Code made cost:
+the session's spend since its previous commit (or since it started), so the
+work that went into it. Per repository: commits, spend, cost per commit,
+lines added/removed; then every commit (newest or most expensive first) with
+an OPEN button into its session, and how much was spent in sessions that
+never committed. Commits are read from the Bash tool results in the
+transcripts (`[branch sha] subject` / Claude Code's `gitOperation`); a
+`git commit -q` prints no sha, so AOC looks it up in that repo's `git log`
+by the time of the call. Same 7 days / 30 days / all range as CACHE, and
+`GET /commit_costs?days=` returns the data.
+
 **Context meter.** Every active CLI card and session bay shows how full that
 session's context window is (`CTX 41% · 412k/1M`): green, amber from 70 %,
 red with *compact soon* from 85 % (Claude Code auto-compacts close to the

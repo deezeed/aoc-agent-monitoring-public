@@ -4642,7 +4642,7 @@ _transcript_index_progress = {"files": 0, "indexed": 0, "messages": 0, "building
 
 # Bump when the schema or what gets extracted changes: the index is derived
 # data, so an old one is simply dropped and rebuilt from the transcripts.
-_TRANSCRIPT_INDEX_VERSION = 2
+_TRANSCRIPT_INDEX_VERSION = 3
 
 
 def _transcript_index_connect(path=None):
@@ -4652,6 +4652,7 @@ def _transcript_index_connect(path=None):
         conn.executescript("""
             DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS sessions_meta;
             DROP TABLE IF EXISTS msgs; DROP TABLE IF EXISTS usage;
+            DROP TABLE IF EXISTS commits;
         """)
         conn.execute(f"PRAGMA user_version = {_TRANSCRIPT_INDEX_VERSION}")
     conn.executescript("""
@@ -4659,7 +4660,7 @@ def _transcript_index_connect(path=None):
                                           session_id TEXT NOT NULL, last_usage_key TEXT);
         CREATE TABLE IF NOT EXISTS sessions_meta (session_id TEXT PRIMARY KEY, project TEXT, cwd TEXT,
                                                   title TEXT, first_ts TEXT, last_ts TEXT,
-                                                  last_call_epoch REAL);
+                                                  last_call_epoch REAL, run_cost REAL DEFAULT 0);
         CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(
             text, session_id UNINDEXED, ts UNINDEXED, role UNINDEXED,
             tokenize = 'unicode61 remove_diacritics 2');
@@ -4675,6 +4676,18 @@ def _transcript_index_connect(path=None):
             cold_n INTEGER DEFAULT 0, cold_cw INTEGER DEFAULT 0, cold_cw1h INTEGER DEFAULT 0,
             cold_idle_n INTEGER DEFAULT 0,
             PRIMARY KEY (session_id, model, day));
+        -- git commits Claude made (from Bash tool calls/results). cost_at = the
+        -- session's main-conversation spend when the commit landed, so a
+        -- commit's own cost is the difference to the session's previous one.
+        -- A Bash call running `git commit` is stored first as sha 'tu:<tool
+        -- use id>', kind 'pending'; its result turns it into the real commit,
+        -- or into kind 'quiet' (git commit -q prints no sha) for
+        -- _resolve_quiet_commits to look up in git log, or 'none'.
+        CREATE TABLE IF NOT EXISTS commits (
+            session_id TEXT NOT NULL, sha TEXT NOT NULL, kind TEXT, branch TEXT, subject TEXT,
+            cwd TEXT, ts TEXT, epoch REAL, end_epoch REAL, day TEXT, cost_at REAL DEFAULT 0,
+            files INTEGER, ins INTEGER, dels INTEGER,
+            PRIMARY KEY (session_id, sha));
     """)
     return conn
 
@@ -4746,6 +4759,80 @@ def _usage_add_samples(conn, session_id, samples):
                      (session_id, model, day, *a))
 
 
+_GIT_COMMIT_LINE_RE = re.compile(r"^\[([^\s\]]+)(?: \(root-commit\))? ([0-9a-f]{7,40})\] (.+)$", re.M)
+_GIT_SHORTSTAT_RE = re.compile(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?")
+
+
+_GIT_COMMIT_CMD_RE = re.compile(r"\bgit(?:\s+-C\s+(\"[^\"]+\"|'[^']+'|\S+))?(?:\s+-c\s+\S+)*\s+commit(?![\w-])")
+
+
+def _git_commit_calls(obj):
+    """Pure: an assistant transcript line -> [(tool_use_id, repo dir or '')]
+    for each Bash call whose command runs `git commit` (the dir is the
+    `git -C <dir>` argument when there is one)."""
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return []
+    content = (obj.get("message") or {}).get("content")
+    out = []
+    for b in content if isinstance(content, list) else []:
+        if not (isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash" and b.get("id")):
+            continue
+        cmd = (b.get("input") or {}).get("command")
+        m = _GIT_COMMIT_CMD_RE.search(cmd) if isinstance(cmd, str) else None
+        if m:
+            out.append((str(b["id"])[:100], (m.group(1) or "").strip("\"'")))
+    return out
+
+
+def _tool_result_ids(obj):
+    """Pure: tool_use ids answered by a user transcript line."""
+    if not isinstance(obj, dict) or obj.get("type") != "user":
+        return []
+    content = (obj.get("message") or {}).get("content")
+    return [str(b["tool_use_id"])[:100] for b in (content if isinstance(content, list) else [])
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")]
+
+
+def _commit_from_line(obj):
+    """Pure: one transcript line -> the git commit its Bash tool result
+    reports, or None. Claude Code tags such results with
+    toolUseResult.gitOperation.commit {sha, kind}; older transcripts don't,
+    so a '[branch sha] subject' first line in the stdout counts too.
+    -> {sha, kind, branch, subject, files, ins, dels, cwd, ts}"""
+    if not isinstance(obj, dict) or obj.get("type") != "user":
+        return None
+    tr = obj.get("toolUseResult")
+    if not isinstance(tr, dict):
+        return None
+    stdout = tr.get("stdout")
+    stdout = stdout if isinstance(stdout, str) else ""
+    op = tr.get("gitOperation")
+    op = op.get("commit") if isinstance(op, dict) else None
+    sha = kind = None
+    if isinstance(op, dict) and isinstance(op.get("sha"), str) and re.fullmatch(r"[0-9a-f]{7,40}", op["sha"]):
+        sha, kind = op["sha"], str(op.get("kind") or "committed")[:20]
+    m = None
+    for cand in _GIT_COMMIT_LINE_RE.finditer(stdout):
+        if sha is None or cand.group(2).startswith(sha) or sha.startswith(cand.group(2)):
+            m = cand
+            break
+    if sha is None:
+        if not m:
+            return None
+        sha, kind = m.group(2), "committed"
+    st = _GIT_SHORTSTAT_RE.search(stdout)
+    return {
+        "sha": sha, "kind": kind,
+        "branch": m.group(1)[:200] if m else "",
+        "subject": m.group(3).strip()[:300] if m else "",
+        "files": int(st.group(1)) if st else None,
+        "ins": int(st.group(2) or 0) if st else None,
+        "dels": int(st.group(3) or 0) if st else None,
+        "cwd": obj.get("cwd") or "",
+        "ts": obj.get("timestamp") or "",
+    }
+
+
 def _transcript_line_messages(obj):
     """Pure: one parsed transcript line -> [(role, text)] worth indexing.
     User prompts (plain strings and text blocks) and assistant text blocks;
@@ -4771,6 +4858,113 @@ def _transcript_line_messages(obj):
     return [(r, txt[:_TRANSCRIPT_INDEX_MAX_TEXT]) for r, txt in out]
 
 
+def _index_commit_line(conn, session_id, obj, run_cost, pending):
+    """Record what one transcript line says about git commits: a Bash call
+    running `git commit` -> a 'pending' row; its result -> the real commit
+    (sha in the output) or 'quiet'/'none'. A result with a sha but no
+    recorded call (e.g. a commit made by a script) is stored directly.
+    `pending` = this session's open tool_use ids, kept current here."""
+    ts = obj.get("timestamp") or ""
+    ep = _iso_to_epoch(ts) if ts else None
+    day = time.strftime("%Y-%m-%d", time.localtime(ep)) if ep else ""
+    for tid, repo in _git_commit_calls(obj):
+        conn.execute("INSERT OR IGNORE INTO commits (session_id, sha, kind, cwd, ts, epoch, day, cost_at) "
+                     "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
+                     (session_id, "tu:" + tid, repo, ts, ep, day, round(run_cost, 6)))
+        pending.add(tid)
+    ids = [t for t in _tool_result_ids(obj) if t in pending]
+    cm = _commit_from_line(obj)
+    if not ids and not cm:
+        return
+    if cm and conn.execute("SELECT 1 FROM commits WHERE session_id = ? AND sha = ?", (session_id, cm["sha"])).fetchone():
+        cm = None  # already recorded (same result seen twice)
+    for tid in ids:
+        pending.discard(tid)
+        key = "tu:" + tid
+        if cm:
+            conn.execute("""UPDATE commits SET sha = ?, kind = ?, branch = ?, subject = ?, cwd = COALESCE(NULLIF(cwd, ''), ?),
+                                end_epoch = ?, files = ?, ins = ?, dels = ? WHERE session_id = ? AND sha = ?""",
+                         (cm["sha"], cm["kind"], cm["branch"], cm["subject"], cm["cwd"], ep,
+                          cm["files"], cm["ins"], cm["dels"], session_id, key))
+            cm = None
+        else:
+            # git commit -q (or a failed commit): no sha in the output
+            conn.execute("UPDATE commits SET kind = 'quiet', cwd = COALESCE(NULLIF(cwd, ''), ?), end_epoch = ? "
+                         "WHERE session_id = ? AND sha = ?", (obj.get("cwd") or "", ep, session_id, key))
+    if cm:
+        conn.execute("""INSERT OR IGNORE INTO commits (session_id, sha, kind, branch, subject, cwd, ts, epoch, end_epoch,
+                                                       day, cost_at, files, ins, dels)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     (session_id, cm["sha"], cm["kind"], cm["branch"], cm["subject"], cm["cwd"], ts, ep, ep, day,
+                      round(run_cost, 6), cm["files"], cm["ins"], cm["dels"]))
+
+
+def _parse_git_log_shortstat(out):
+    """Pure: `git log --format=%H%x1f%ct%x1f%D%x1f%s --shortstat` output ->
+    [{sha, ct, refs, subject, files, ins, dels}]."""
+    res = []
+    for line in (out or "").splitlines():
+        if "\x1f" in line:
+            p = line.split("\x1f")
+            if len(p) >= 4 and re.fullmatch(r"[0-9a-f]{40}", p[0]):
+                try:
+                    ct = int(p[1])
+                except ValueError:
+                    continue
+                res.append({"sha": p[0], "ct": ct, "refs": p[2], "subject": "\x1f".join(p[3:]).strip(),
+                            "files": None, "ins": None, "dels": None})
+        elif res and res[-1]["files"] is None:
+            st = _GIT_SHORTSTAT_RE.search(line)
+            if st:
+                res[-1].update(files=int(st.group(1)), ins=int(st.group(2) or 0), dels=int(st.group(3) or 0))
+    return res
+
+
+def _resolve_quiet_commits(conn, run_git, now, limit=40):
+    """Look up the sha of 'quiet' commit calls (no sha in the output) in git
+    log: commits in that repo whose committer time falls between the call
+    and its result (+-10 s), not yet recorded. None found -> kind 'none' (the
+    commit failed, nothing to commit, or the dir isn't a repo). Several -> the
+    first takes the row, the rest are added with the same cost_at.
+    run_git(cwd, args) -> stdout or None. Returns rows resolved."""
+    rows = conn.execute("""SELECT session_id, sha, cwd, epoch, end_epoch, day, ts, cost_at FROM commits
+                            WHERE kind = 'quiet' AND COALESCE(end_epoch, epoch, 0) < ? LIMIT ?""",
+                        (now - 30, limit)).fetchall()
+    done = 0
+    for sid, key, cwd, ep, end_ep, day, ts, cost_at in rows:
+        start, end = (ep or end_ep or 0) - 10, (end_ep or ep or 0) + 10
+        out = run_git(cwd, ["log", "--all", "--format=%H%x1f%ct%x1f%D%x1f%s", "--shortstat",
+                            "--since=" + time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start - 120)), "-n", "200"]) \
+            if cwd and start > 0 else None
+        hits = [c for c in _parse_git_log_shortstat(out) if start <= c["ct"] <= end]
+        hits = [c for c in sorted(hits, key=lambda c: c["ct"])
+                if not conn.execute("SELECT 1 FROM commits WHERE sha = ? OR sha = ?", (c["sha"][:7], c["sha"])).fetchone()]
+        if not hits:
+            conn.execute("UPDATE commits SET kind = 'none' WHERE session_id = ? AND sha = ?", (sid, key))
+        for i, c in enumerate(hits):
+            m = re.search(r"HEAD -> ([^,]+)", c["refs"] or "")
+            vals = (c["sha"][:7], m.group(1).strip() if m else "", c["subject"][:300], c["files"], c["ins"], c["dels"])
+            if i == 0:
+                conn.execute("UPDATE commits SET sha = ?, kind = 'committed', branch = ?, subject = ?, files = ?, ins = ?, "
+                             "dels = ? WHERE session_id = ? AND sha = ?", vals + (sid, key))
+            else:
+                conn.execute("""INSERT OR IGNORE INTO commits (session_id, sha, kind, branch, subject, files, ins, dels,
+                                                               cwd, ts, epoch, end_epoch, day, cost_at)
+                                VALUES (?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             (sid,) + vals + (cwd, ts, ep, end_ep, day, cost_at))
+        done += 1
+    return done
+
+
+def _run_git_quiet(cwd, args):
+    try:
+        r = subprocess.run(["git", "-C", cwd] + args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def _transcript_index_file(conn, path, session_id, project, offset, max_bytes):
     """Index the complete lines of one transcript from `offset` on (at most
     ~max_bytes). A file that shrank (rewritten) is re-indexed from 0.
@@ -4779,7 +4973,8 @@ def _transcript_index_file(conn, path, session_id, project, offset, max_bytes):
     if size < offset:
         conn.execute("DELETE FROM msgs WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM usage WHERE session_id = ?", (session_id,))
-        conn.execute("UPDATE sessions_meta SET last_call_epoch = NULL WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM commits WHERE session_id = ?", (session_id,))
+        conn.execute("UPDATE sessions_meta SET last_call_epoch = NULL, run_cost = 0 WHERE session_id = ?", (session_id,))
         conn.execute("UPDATE files SET last_usage_key = NULL WHERE path = ?", (path,))
         offset = 0
     if size == offset:
@@ -4800,10 +4995,13 @@ def _transcript_index_file(conn, path, session_id, project, offset, max_bytes):
             return offset, 0, 0
     chunk = data[:end + 1]
     rows, meta, samples = [], {}, []
+    pending = {sha[3:] for (sha,) in conn.execute(
+        "SELECT sha FROM commits WHERE session_id = ? AND kind = 'pending'", (session_id,))}
     r = conn.execute("SELECT last_usage_key FROM files WHERE path = ?", (path,)).fetchone()
     prev_key = r[0] if r else None
-    r = conn.execute("SELECT last_call_epoch FROM sessions_meta WHERE session_id = ?", (session_id,)).fetchone()
+    r = conn.execute("SELECT last_call_epoch, run_cost FROM sessions_meta WHERE session_id = ?", (session_id,)).fetchone()
     prev_call = r[0] if r else None
+    run_cost = (r[1] or 0.0) if r else 0.0
     for raw in chunk.splitlines():
         if not raw.strip():
             continue
@@ -4826,11 +5024,14 @@ def _transcript_index_file(conn, path, session_id, project, offset, max_bytes):
         sample, prev_key, prev_call = _usage_line_sample(obj, prev_key, prev_call)
         if sample:
             samples.append(sample)
+            run_cost += _calc_cost(sample["inp"], sample["out"], sample["cw"], sample["cr"], sample["model"], sample["cw1h"])
+        _index_commit_line(conn, session_id, obj, run_cost, pending)
     _usage_add_samples(conn, session_id, samples)
     if rows:
         conn.executemany("INSERT INTO msgs (text, session_id, ts, role) VALUES (?, ?, ?, ?)", rows)
     conn.execute("INSERT OR IGNORE INTO sessions_meta (session_id, project) VALUES (?, ?)", (session_id, project))
-    conn.execute("UPDATE sessions_meta SET last_call_epoch = ? WHERE session_id = ?", (prev_call, session_id))
+    conn.execute("UPDATE sessions_meta SET last_call_epoch = ?, run_cost = ? WHERE session_id = ?",
+                 (prev_call, run_cost, session_id))
     if meta:
         conn.execute("""UPDATE sessions_meta SET
                             title = COALESCE(?, title), cwd = COALESCE(cwd, ?),
@@ -5000,6 +5201,75 @@ def _cache_stats(conn, since_day, top=12):
     }
 
 
+def _commit_stats(conn, since_day, limit=300):
+    """Cost per commit (History -> COMMITS) over commits with day >= since_day.
+    A commit's cost is the session's main-conversation spend since its
+    previous commit (or since the session started): the work that went into
+    it. Earlier commits outside the period still count as the starting point.
+      commits  newest first: sha, kind, branch, subject, repo, cwd, ts,
+               session_id, title, cost, files, ins, dels
+      by_repo  most spend first: repo, commits, cost, per_commit, ins, dels, sessions
+      total    commits, cost, median, ins, dels, sessions, spend (all usage
+               in the period), no_commit_spend (sessions that never committed)"""
+    rows = conn.execute("""
+        SELECT session_id, sha, kind, branch, subject, cwd, ts, epoch, day, cost_at, files, ins, dels
+        FROM commits WHERE sha NOT LIKE 'tu:%' AND session_id IN (
+            SELECT DISTINCT session_id FROM commits WHERE day >= ? AND sha NOT LIKE 'tu:%')
+        ORDER BY session_id, COALESCE(epoch, 0), rowid""", (since_day,)).fetchall()
+    meta = {}
+    sids = sorted({r[0] for r in rows})
+    for i in range(0, len(sids), 500):
+        part = sids[i:i + 500]
+        for sid, project, title in conn.execute(
+                f"SELECT session_id, project, title FROM sessions_meta WHERE session_id IN ({','.join('?' * len(part))})", part):
+            meta[sid] = (project or "", title or "")
+    commits, prev_sid, prev_at = [], None, 0.0
+    for sid, sha, kind, branch, subject, cwd, ts, epoch, day, cost_at, files, ins, dels in rows:
+        if sid != prev_sid:
+            prev_sid, prev_at = sid, 0.0
+        cost = max(0.0, (cost_at or 0.0) - prev_at)
+        prev_at = max(prev_at, cost_at or 0.0)
+        if (day or "") < since_day:
+            continue
+        repo = (cwd or "").replace("\\", "/").rstrip("/").split("/")[-1] or meta.get(sid, ("", ""))[0]
+        commits.append({"sha": sha, "kind": kind or "committed", "branch": branch or "", "subject": subject or "",
+                        "repo": repo, "cwd": cwd or "", "ts": ts or "", "epoch": epoch, "session_id": sid,
+                        "title": meta.get(sid, ("", ""))[1], "cost": round(cost, 4),
+                        "files": files, "ins": ins, "dels": dels})
+    commits.sort(key=lambda x: x["epoch"] or 0, reverse=True)
+    by_repo = {}
+    for cm in commits:
+        b = by_repo.setdefault(cm["repo"], {"repo": cm["repo"], "commits": 0, "cost": 0.0, "ins": 0, "dels": 0, "_s": set()})
+        b["commits"] += 1
+        b["cost"] += cm["cost"]
+        b["ins"] += cm["ins"] or 0
+        b["dels"] += cm["dels"] or 0
+        b["_s"].add(cm["session_id"])
+    repos = []
+    for b in by_repo.values():
+        b["sessions"] = len(b.pop("_s"))
+        b["cost"] = round(b["cost"], 4)
+        b["per_commit"] = round(b["cost"] / b["commits"], 4) if b["commits"] else 0
+        repos.append(b)
+    repos.sort(key=lambda x: x["cost"], reverse=True)
+    costs = sorted(cm["cost"] for cm in commits)
+    n = len(costs)
+    median = (costs[n // 2] if n % 2 else (costs[n // 2 - 1] + costs[n // 2]) / 2) if n else 0
+    spend = conn.execute("SELECT COALESCE(SUM(cost), 0) FROM usage WHERE day >= ?", (since_day,)).fetchone()[0]
+    no_commit = conn.execute("""SELECT COALESCE(SUM(cost), 0) FROM usage WHERE day >= ?
+                                AND session_id NOT IN (SELECT session_id FROM commits WHERE sha NOT LIKE 'tu:%')""",
+                             (since_day,)).fetchone()[0]
+    return {
+        "since": since_day,
+        "total": {"commits": n, "cost": round(sum(costs), 4), "median": round(median, 4),
+                  "ins": sum(cm["ins"] or 0 for cm in commits), "dels": sum(cm["dels"] or 0 for cm in commits),
+                  "sessions": len({cm["session_id"] for cm in commits}),
+                  "spend": round(spend, 4), "no_commit_spend": round(no_commit, 4)},
+        "by_repo": repos,
+        "commits": commits[:limit],
+    }
+
+
 def _db_repair_transcript_costs(hist_conn, index_conn):
     """History rows for CLI sessions (no subagents) were written by the
     transcript scanner, which until 2026-10-06 counted every transcript line
@@ -5036,6 +5306,8 @@ def _transcript_index_worker():
                 conn = _transcript_index_connect()
             _transcript_index_progress["building"] = True
             seen, current, _spent = _transcript_index_tick(conn, projects_base)
+            if _resolve_quiet_commits(conn, _run_git_quiet, time.time()):
+                conn.commit()
             msgs = conn.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
             _transcript_index_progress.update(files=seen, indexed=current, messages=msgs,
                                               building=current < seen, updated_at=time.time())
@@ -6332,6 +6604,19 @@ button.le-tag { cursor:pointer; }
 .cache-leg-p { color:var(--t3);font-family:var(--font2);font-size:10px; }
 .cache-insight { display:flex;gap:8px;font-size:12px;line-height:1.5;color:var(--t2);padding:7px 10px;margin-bottom:6px;border-radius:8px;background:rgba(var(--c-rgb),.05);border:1px solid rgba(var(--c-rgb),.14); }
 .cache-table-wrap { overflow-x:auto;max-width:100%; }
+.cc-ins { color:var(--g); }
+.cc-del { color:var(--r); }
+.cc-sha { font:400 11px var(--font2);color:var(--c); }
+.cc-when { color:var(--t3); }
+.cc-repo { display:block;font:400 9px var(--font2);color:var(--t3);letter-spacing:.04em; }
+.cc-subj { max-width:420px; }
+.cc-subj > span:first-child { display:block;overflow:hidden;text-overflow:ellipsis; }
+.cc-cost { display:flex;align-items:center;justify-content:flex-end;gap:8px; }
+.cc-bar { width:60px;height:5px;border-radius:3px;background:rgba(var(--c-rgb),.12);overflow:hidden; }
+.cc-bar > span { display:block;height:100%;background:rgba(var(--c-rgb),.75);border-radius:3px; }
+.cc-head { display:flex;align-items:center;gap:12px; }
+.cc-sort { border:none; }
+@media (max-width: 600px) { .cc-bar, .cc-when { display:none; } .cc-subj { max-width:150px; } }
 .cache-table { width:100%;border-collapse:collapse;font-size:12px;color:var(--t2); }
 .cache-table th { font:600 9px var(--font2);letter-spacing:.08em;text-transform:uppercase;color:var(--t3);text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);white-space:nowrap; }
 .cache-table td { padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap; }
@@ -10352,7 +10637,9 @@ function _formatHookReliability(hmc){
 }
 
 /* ── history view ── */
-let _histTab='sessions'; // 'sessions' | 'analytics' | 'search' | 'cache'
+let _histTab='sessions'; // 'sessions' | 'analytics' | 'search' | 'cache' | 'commits'
+let _commitSort='new';    // History -> COMMITS ledger: 'new' | 'cost'
+let _commitShowAll=false;
 let _cacheDays=30;
 let _selectedProjectTrend=''; // project name whose own cost trend is pinned open in Analytics, '' = none
 function _selectProjectTrend(project){
@@ -10395,8 +10682,9 @@ async function renderHistory(){
         <div class="adp-tab ${_histTab==='analytics'?'active':''}" onclick="_histTab='analytics';renderHistory()">ANALYTICS</div>
         <div class="adp-tab ${_histTab==='search'?'active':''}" onclick="_histTab='search';renderHistory()" title="Search what you and Claude wrote in past conversations">CONVERSATIONS</div>
         <div class="adp-tab ${_histTab==='cache'?'active':''}" onclick="_histTab='cache';renderHistory()" title="Where the token spend goes and how well the prompt cache works">CACHE</div>
+        <div class="adp-tab ${_histTab==='commits'?'active':''}" onclick="_histTab='commits';renderHistory()" title="What each git commit Claude made cost">COMMITS</div>
       </div>
-      ${_histTab==='cache'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
+      ${_histTab==='cache'||_histTab==='commits'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='search'?`<input type="search" id="conv-search-input" class="conv-input" placeholder="Search past conversations…" value="${escHtml(_convQuery)}" oninput="setConvSearch(this.value)" autocomplete="off">`:''}
       ${_histTab==='sessions'?`<input type="text" id="hist-search-input" placeholder="Filter by name, project, id, or tag..." value="${escHtml(_histSearchQuery)}" oninput="setHistSearch(this.value)" style="font-family:var(--font2);font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:10px;width:150px">
       <input type="date" id="hist-search-from" value="${escHtml(_histSearchFrom)}" oninput="setHistDateFrom(this.value)" title="From date" style="font-family:var(--font2);font-size:11px;padding:4px 8px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:6px">
@@ -10431,6 +10719,13 @@ async function renderHistory(){
   </div>`;
 
   const body=document.getElementById('hist-body');
+  if(_histTab==='commits'){
+    try{
+      const d=await fetch('/commit_costs?days='+_cacheDays).then(r=>r.json());
+      if(gen===_histRenderGen){ _lastCommitData=d; body.innerHTML=_commitReportHtml(d, _commitSort, _commitShowAll); }
+    }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the commit report.</div>'; }
+    return;
+  }
   if(_histTab==='cache'){
     try{
       const d=await fetch('/cache_stats?days='+_cacheDays).then(r=>r.json());
@@ -10928,6 +11223,76 @@ function _cacheReportHtml(d){
   </div>`;
 }
 
+/* ── cost per commit (History → COMMITS) ── */
+let _lastCommitData=null;
+function _setCommitView(sort, all){
+  if(sort) _commitSort=sort;
+  if(all!==undefined) _commitShowAll=all;
+  const body=document.getElementById('hist-body');
+  if(body&&_lastCommitData) body.innerHTML=_commitReportHtml(_lastCommitData, _commitSort, _commitShowAll);
+}
+/* Pure: /commit_costs response -> report HTML. */
+function _commitReportHtml(d, sort, showAll){
+  d=d||{};
+  const idx=d.index||{};
+  if(d.error) return `<div class="conv-empty">The commit report failed — see Health → background errors.</div>`;
+  const st=d.stats, t=st&&st.total;
+  if(!t||!t.commits){
+    return `<div class="conv-empty">${idx.building||!idx.updated_at
+      ?'Still reading your Claude Code transcripts — commits appear once the index is built (a few minutes after AOC starts).'
+      :'No commits made by Claude Code in this period.'}</div>`;
+  }
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const kpi=(v,l,tip)=>`<div class="hist-kpi" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const lines=n=>Number(n||0).toLocaleString();
+  const kpis=[
+    kpi(String(t.commits),'Commits',`Commits Claude Code made in ${t.sessions} session${t.sessions===1?'':'s'}`),
+    kpi(money(t.cost),'Spent on them','Main-conversation spend (API prices) between each commit and the previous one in its session'),
+    kpi(money(t.median),'Median commit','Half the commits cost less than this'),
+    kpi(`<span class="cc-ins">+${lines(t.ins)}</span> <span class="cc-del">−${lines(t.dels)}</span>`,'Lines','Lines added / removed by these commits'),
+    kpi(money(t.no_commit_spend),'No-commit spend','Spend in sessions that never committed: questions, research, abandoned work'),
+  ].join('');
+  const share=t.spend?Math.round(t.cost/t.spend*100):0;
+  const insight=t.spend?`<div class="cache-insight"><span>⎇</span><span>${share}% of the ${money(t.spend)} spent in this period went into work that ended in a commit — ${money(t.cost/t.commits)} per commit on average.${t.no_commit_spend>0?` ${money(t.no_commit_spend)} went to sessions that never committed.`:''}</span></div>`:'';
+  const repos=(st.by_repo||[]).map(r=>`<tr>
+      <td class="cache-name">${escHtml(r.repo||'?')}</td><td class="num">${r.commits}</td><td class="num">${money(r.cost)}</td>
+      <td class="num">${money(r.per_commit)}</td>
+      <td class="num cache-opt"><span class="cc-ins">+${lines(r.ins)}</span> <span class="cc-del">−${lines(r.dels)}</span></td>
+      <td class="num cache-opt">${r.sessions}</td></tr>`).join('');
+  let list=(st.commits||[]).slice();
+  if(sort==='cost') list.sort((a,b)=>b.cost-a.cost);
+  const max=Math.max(...list.map(x=>x.cost),0.0001);
+  const shown=showAll?list:list.slice(0,50);
+  const rows=shown.map(x=>{
+    const when=x.epoch?new Date(x.epoch*1000):null;
+    const whenStr=when?when.toLocaleDateString(undefined,{day:'numeric',month:'short'})+' '+when.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}):'';
+    const stat=x.ins!=null?`<span class="cc-ins">+${lines(x.ins)}</span> <span class="cc-del">−${lines(x.dels)}</span>`:'';
+    return `<tr>
+      <td class="num cc-when">${escHtml(whenStr)}</td>
+      <td class="cc-sha" title="${escHtml((x.branch?x.branch+' · ':'')+x.sha+(x.kind&&x.kind!=='committed'?' ('+x.kind+')':''))}">${escHtml(x.sha.slice(0,7))}</td>
+      <td class="cache-name cc-subj"><span title="${escHtml(x.subject)}">${escHtml(x.subject||'(no message)')}</span><span class="cc-repo">${escHtml(x.repo||'')}</span></td>
+      <td class="num cache-opt">${stat}</td>
+      <td class="num cc-cost"><span class="cc-bar"><span style="width:${(x.cost/max*100).toFixed(1)}%"></span></span>${money(x.cost)}</td>
+      <td><button class="adp-btn conv-btn" onclick="showHistoryDetail(${jsq(x.session_id)})" title="${escHtml(x.title||'Open the session')}">OPEN</button></td>
+    </tr>`;
+  }).join('');
+  const more=list.length>shown.length?`<button class="adp-btn" onclick="_setCommitView(null,true)">Show all ${list.length}</button>`:'';
+  return `<div class="cache-report">
+    <div class="hist-analytics">${kpis}</div>
+    ${insight}
+    <div class="hist-section">BY REPOSITORY</div>
+    <div class="cache-table-wrap"><table class="cache-table">
+      <thead><tr><th>Repository</th><th class="num">Commits</th><th class="num">Spend</th><th class="num">Per commit</th><th class="num cache-opt">Lines</th><th class="num cache-opt">Sessions</th></tr></thead>
+      <tbody>${repos}</tbody></table></div>
+    <div class="hist-section cc-head">COMMITS <span class="adp-tabs cc-sort">${[['new','NEWEST'],['cost','MOST EXPENSIVE']].map(([k,l])=>`<span class="adp-tab ${sort===k?'active':''}" onclick="_setCommitView(${jsq(k)})">${l}</span>`).join('')}</span></div>
+    <div class="cache-table-wrap"><table class="cache-table">
+      <thead><tr><th class="num cc-when">When</th><th>Commit</th><th>Message</th><th class="num cache-opt">Lines</th><th class="num">Cost</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${more}
+    <div class="conv-status" style="margin-top:6px">A commit's cost is what its session spent since the previous commit (or since it started), estimated at API prices from the Claude Code transcripts on this machine — subagent work not included. Commits made with <code>git commit -q</code> are matched through <code>git log</code>. ${idx.building?'Still indexing — numbers will grow.':''}</div>
+  </div>`;
+}
+
 /* ── conversation search (History → CONVERSATIONS) ── */
 let _convQuery='';
 let _convTimer=null;
@@ -11314,7 +11679,7 @@ function _applyStatus(sr){
   if(currentView==='heat')     renderHeatmap(sr);
   if(currentView==='tree')     renderTree(sr);
   if(currentView==='timeline') renderTimeline(sr);
-  if(currentView==='history'&&_histTab!=='search'&&_histTab!=='cache'&&Date.now()-_histLastRender>10000){ _histLastRender=Date.now(); renderHistory(); }
+  if(currentView==='history'&&_histTab!=='search'&&_histTab!=='cache'&&_histTab!=='commits'&&Date.now()-_histLastRender>10000){ _histLastRender=Date.now(); renderHistory(); }
   if(currentView==='diag'&&Date.now()-_diagLastRender>10000){ _diagLastRender=Date.now(); renderDiag(); }
   if(_rightTab==='files') _renderRpFiles(sr);
   if(_rightTab==='audit') _renderRpAudit();
@@ -14117,6 +14482,29 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
         self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode())
 
+    def _get_commit_costs(self):
+        """Cost per commit (History -> COMMITS) from transcript_index.db.
+        ?days=7|30|0 (0 = everything indexed)."""
+        from urllib.parse import urlparse, parse_qs
+        try:
+            days = max(0, min(int((parse_qs(urlparse(self.path).query).get("days") or ["30"])[0]), 3650))
+        except ValueError:
+            days = 30
+        since = "0000-00-00" if days == 0 else time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
+        out = {"days": days, "index": dict(_transcript_index_progress), "stats": None}
+        if os.path.exists(TRANSCRIPT_INDEX_DB):
+            conn = None
+            try:
+                conn = _transcript_index_connect()
+                out["stats"] = _commit_stats(conn, since)
+            except Exception as e:
+                _log_bg_error("_get_commit_costs", e)
+                out["error"] = "commit costs failed"
+            finally:
+                if conn is not None:
+                    conn.close()
+        self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode())
+
     def _get_search_transcripts(self):
         """Full-text search over past conversations (transcript_index.db,
         kept current by _transcript_index_worker). Always returns the index
@@ -14353,6 +14741,8 @@ class Handler(BaseHTTPRequestHandler):
             self._get_search_transcripts()
         elif path_no_qs == "/cache_stats":
             self._get_cache_stats()
+        elif path_no_qs == "/commit_costs":
+            self._get_commit_costs()
         elif self.path.startswith("/diff"):
             self._get_diff()
         elif self.path.startswith("/git"):

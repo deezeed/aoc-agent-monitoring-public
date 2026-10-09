@@ -15,7 +15,7 @@ work = tempfile.mkdtemp(prefix="aoc_cs_")
 ns = exec_functions(
     ["_TRANSCRIPT_INDEX_MAX_TEXT", "_TRANSCRIPT_INDEX_BYTES_PER_TICK", "_TRANSCRIPT_INDEX_VERSION",
      "_transcript_index_connect", "_COLD_IDLE_S", "_RECACHE_MIN_TOKENS", "_usage_line_sample",
-     "_usage_add_samples", "_transcript_line_messages", "_transcript_index_file", "_transcript_index_tick",
+     "_usage_add_samples", "_transcript_line_messages", "_GIT_COMMIT_LINE_RE", "_GIT_SHORTSTAT_RE", "_GIT_COMMIT_CMD_RE", "_git_commit_calls", "_tool_result_ids", "_commit_from_line", "_index_commit_line", "_transcript_index_file", "_transcript_index_tick",
      "_cache_stats", "_MODEL_PRICING", "_CACHE_WRITE_1H_MULT", "_model_pricing", "_calc_cost", "_iso_to_epoch"],
     {"os": os, "json": json, "re": re, "sqlite3": sqlite3, "time": time, "calendar": calendar,
      "datetime": datetime, "TRANSCRIPT_INDEX_DB": "", "_decode_project_name": lambda e: "proj"})
