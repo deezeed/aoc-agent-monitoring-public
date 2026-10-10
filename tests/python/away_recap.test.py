@@ -152,6 +152,58 @@ c.check("summarizer failure -> error text, cache kept", not r["ok"] and "not fou
         and ns["_recap_cached"]("sess")["text"].startswith("- Fixed"))
 c.check("busy flag cleared after failure", "sess" not in ns["_recap_busy"])
 
+# ── _run_haiku against a fake `claude` (Windows: a .cmd running python) ──
+if os.name == "nt":
+    import subprocess
+    fake_py = os.path.join(tdir, "fake_claude.py")
+    with open(fake_py, "w", encoding="utf-8") as f:
+        f.write("import sys, json, time, os\n"
+                "args = sys.argv[1:]\n"
+                "data = sys.stdin.buffer.read().decode('utf-8')\n"
+                "mode = os.environ.get('FAKE_MODE', 'ok')\n"
+                "if mode == 'slow': time.sleep(1.5)\n"
+                "if mode == 'garbage': print('not json'); sys.stderr.write('auth failed'); sys.exit(1)\n"
+                "ok = args[:4] == ['-p', '--model', 'haiku', '--no-session-persistence'] and 'disableAllHooks' in ' '.join(args)\n"
+                "print(json.dumps({'result': ('- got ' + str(len(data)) + ' chars') if ok else 'bad args ' + repr(args),"
+                " 'total_cost_usd': 0.0042, 'is_error': not ok}))\n")
+    fake_cmd = os.path.join(tdir, "claude.cmd")
+    with open(fake_cmd, "w", encoding="utf-8") as f:
+        f.write(f'@"{sys.executable}" "{fake_py}" %*\n')
+    pids = set()
+    rh = exec_functions(["_run_haiku"], {"os": os, "json": json, "subprocess": subprocess, "AOC_DATA_DIR": data,
+                                         "_find_claude_exe": lambda: fake_cmd, "_recap_run_lock": threading.Lock(),
+                                         "_own_claude_pids": pids})["_run_haiku"]
+    os.environ["FAKE_MODE"] = "slow"
+    seen = []
+    th = threading.Thread(target=lambda: seen.append(rh("Summarize", "héllo wörld")))
+    th.start()
+    time.sleep(0.6)
+    during = set(pids)
+    th.join(30)
+    c.check("run: stdin passed (utf-8), args right, cost parsed", seen and seen[0] == ("- got 11 chars", 0.0042))
+    c.check("run: its pid is excluded from the CLI count while it runs, then dropped", len(during) == 1 and not pids)
+    os.environ["FAKE_MODE"] = "garbage"
+    try:
+        rh("x", "y")
+        c.check("run: bad output raises", False)
+    except RuntimeError as e:
+        c.check("run: bad output raises with stderr text", "auth failed" in str(e))
+    os.environ["FAKE_MODE"] = "slow"
+    try:
+        rh("x", "y", timeout=0.3)
+        c.check("run: timeout raises", False)
+    except RuntimeError as e:
+        c.check("run: timeout raises, pid dropped", "too long" in str(e) and not pids)
+    os.environ.pop("FAKE_MODE", None)
+    no = exec_functions(["_run_haiku"], {"os": os, "json": json, "subprocess": subprocess, "AOC_DATA_DIR": data,
+                                         "_find_claude_exe": lambda: None, "_recap_run_lock": threading.Lock(),
+                                         "_own_claude_pids": set()})["_run_haiku"]
+    try:
+        no("x", "y")
+        c.check("run: no claude -> clear error", False)
+    except RuntimeError as e:
+        c.check("run: no claude -> clear error", "not found" in str(e))
+
 shutil.rmtree(tdir, ignore_errors=True)
 shutil.rmtree(data, ignore_errors=True)
 c.finish()

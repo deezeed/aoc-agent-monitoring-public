@@ -4145,6 +4145,9 @@ _threading.Thread(target=_digest_worker, daemon=True).start()
 
 _claude_proc_count = [0]  # cached count of running claude.exe processes
 
+_own_claude_pids = set()  # `claude -p` recaps AOC runs itself (_run_haiku): not CLI sessions
+
+
 def _claude_proc_worker():
     """Background thread: count running claude.exe processes every 2 seconds
     (via _snapshot_processes; tasklist only as a fallback).
@@ -4168,7 +4171,8 @@ def _claude_proc_worker():
             # failed snapshot only.
             procs = _snapshot_processes()
             if procs is not None:
-                new_count = sum(1 for _, exe in procs if exe == "claude.exe")
+                # minus the `claude -p` recaps AOC itself is running
+                new_count = sum(1 for pid, exe in procs if exe == "claude.exe" and pid not in _own_claude_pids)
             else:
                 r = _sp.run(
                     ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
@@ -4673,6 +4677,7 @@ _RECAP_REFRESH_S = 10 * 60      # don't re-summarize one session more often
 _RECAP_DIGEST_MAX = 12000
 _recap_lock = threading.Lock()
 _recap_busy = set()             # session ids being summarized right now
+_recap_run_lock = threading.Lock()  # one `claude -p` at a time, however many dashboards ask
 
 
 def _human_text(obj):
@@ -4807,16 +4812,26 @@ def _run_haiku(prompt, stdin_text, timeout=120):
     exe = _find_claude_exe()
     if not exe:
         raise RuntimeError("Claude Code (claude) not found")
-    r = subprocess.run(
-        [exe, "-p", "--model", "haiku", "--no-session-persistence", "--tools", "",
-         "--settings", '{"disableAllHooks": true}', "--output-format", "json", prompt],
-        input=stdin_text.encode("utf-8"), capture_output=True, timeout=timeout,
-        cwd=AOC_DATA_DIR if os.path.isdir(AOC_DATA_DIR) else None,
-        creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW
+    with _recap_run_lock:
+        p = subprocess.Popen(
+            [exe, "-p", "--model", "haiku", "--no-session-persistence", "--tools", "",
+             "--settings", '{"disableAllHooks": true}', "--output-format", "json", prompt],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=AOC_DATA_DIR if os.path.isdir(AOC_DATA_DIR) else None,
+            creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW
+        _own_claude_pids.add(p.pid)
+        try:
+            out, err = p.communicate(stdin_text.encode("utf-8"), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            raise RuntimeError("Claude Code took too long to answer")
+        finally:
+            _own_claude_pids.discard(p.pid)
     try:
-        d = json.loads(r.stdout.decode("utf-8", "replace"))
+        d = json.loads(out.decode("utf-8", "replace"))
     except ValueError:
-        raise RuntimeError((r.stderr.decode("utf-8", "replace") or "no output").strip()[:200])
+        raise RuntimeError((err.decode("utf-8", "replace") or "no output").strip()[:200])
     if d.get("is_error") or not (d.get("result") or "").strip():
         raise RuntimeError(str(d.get("result") or "empty answer")[:200])
     return d["result"].strip(), float(d.get("total_cost_usd") or 0)
@@ -5943,6 +5958,179 @@ def _commit_stats(conn, since_day, limit=300):
         "by_repo": repos,
         "commits": commits[:limit],
     }
+
+
+# ── Clients & billing (History -> CLIENTS) ────────────────────────────────
+# Each client is a name, keywords and an optional markup %. A session
+# belongs to the first client whose keyword appears in its title, project,
+# working directory or the repos it committed to -- the title matters most
+# for anyone who starts Claude Code from their home folder, where project
+# is the same for everything. A session can also be assigned by hand.
+# Costs come from transcript_index.db's per-day usage, so a session that
+# runs past midnight on the last day of a month is split between months.
+CLIENTS_FILE = os.path.join(AOC_DATA_DIR, "clients.json")
+_CLIENT_NONE = "-"  # override: "no client" on purpose
+
+
+def _sanitize_clients(data) -> dict:
+    data = data if isinstance(data, dict) else {}
+    clients, seen = [], set()
+    for c in (data.get("clients") or [])[:100]:
+        if not isinstance(c, dict):
+            continue
+        name = " ".join(str(c.get("name") or "").split())[:80]
+        if not name or name == _CLIENT_NONE or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        match = []
+        for m in (c.get("match") or [])[:30]:
+            m = " ".join(str(m).split()).lower()[:80]
+            if m and m not in match:
+                match.append(m)
+        try:
+            markup = max(0.0, min(float(c.get("markup") or 0), 500.0))
+        except (TypeError, ValueError):
+            markup = 0.0
+        clients.append({"name": name, "match": match, "markup": round(markup, 2)})
+    names = {c["name"] for c in clients} | {_CLIENT_NONE}
+    overrides = {}
+    raw = data.get("overrides") if isinstance(data.get("overrides"), dict) else {}
+    for sid, v in list(raw.items())[:5000]:
+        if isinstance(v, str) and v in names:
+            overrides[str(sid)[:80]] = v
+    return {"clients": clients, "overrides": overrides}
+
+
+def _load_clients() -> dict:
+    return _sanitize_clients(_load_json_file(CLIENTS_FILE, {}))
+
+
+def _save_clients(data) -> dict:
+    cfg = _sanitize_clients(data)
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = CLIENTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, CLIENTS_FILE)
+    return cfg
+
+
+def _client_for(sid, haystack, cfg):
+    """Pure: -> (client name or "", how: "manual" | "keyword: x" | "")."""
+    ov = cfg["overrides"].get(sid)
+    if ov is not None:
+        return ("" if ov == _CLIENT_NONE else ov), "manual"
+    hay = [str(h).lower() for h in haystack if h]
+    for c in cfg["clients"]:
+        for m in c["match"]:
+            if any(m in h for h in hay):
+                return c["name"], f"keyword: {m}"
+    return "", ""
+
+
+def _client_report(conn, month, cfg):
+    """Month (YYYY-MM) of Claude Code spend per client, from the transcript
+    index: {"month", "months", "total", "clients": [{name, markup, cost,
+    billed, tokens, commits, sessions: [...]}, ... , unassigned last]}."""
+    like = month + "-%"
+    rows = conn.execute("""SELECT session_id, SUM(cost), SUM(inp + out + cw + cr), MIN(day), MAX(day)
+                           FROM usage WHERE day LIKE ? GROUP BY session_id""", (like,)).fetchall()
+    sids = [r[0] for r in rows]
+    meta, commits = {}, {}
+    for i in range(0, len(sids), 500):
+        part = sids[i:i + 500]
+        qs = ",".join("?" * len(part))
+        for sid, project, cwd, title in conn.execute(
+                f"SELECT session_id, project, cwd, title FROM sessions_meta WHERE session_id IN ({qs})", part):
+            meta[sid] = (project or "", cwd or "", title or "")
+        for sid, cwd in conn.execute(
+                f"""SELECT session_id, cwd FROM commits WHERE sha NOT LIKE 'tu:%' AND day LIKE ?
+                    AND session_id IN ({qs})""", [like] + part):
+            c = commits.setdefault(sid, {"n": 0, "repos": []})
+            c["n"] += 1
+            repo = (cwd or "").replace("\\", "/").rstrip("/").split("/")[-1]
+            if repo and repo not in c["repos"]:
+                c["repos"].append(repo)
+    groups = {c["name"]: {"name": c["name"], "markup": c["markup"], "cost": 0.0, "tokens": 0, "commits": 0, "sessions": []}
+              for c in cfg["clients"]}
+    unassigned = {"name": "", "markup": 0.0, "cost": 0.0, "tokens": 0, "commits": 0, "sessions": []}
+    for sid, cost, tokens, d0, d1 in rows:
+        project, cwd, title = meta.get(sid, ("", "", ""))
+        cm = commits.get(sid, {"n": 0, "repos": []})
+        name, how = _client_for(sid, [title, project, cwd] + cm["repos"], cfg)
+        g = groups.get(name, unassigned)
+        g["sessions"].append({"id": sid, "title": title or project or sid[:8], "project": project,
+                              "cost": round(cost or 0, 4), "tokens": int(tokens or 0), "first_day": d0, "last_day": d1,
+                              "commits": cm["n"], "repos": cm["repos"], "how": how})
+        g["cost"] += cost or 0
+        g["tokens"] += int(tokens or 0)
+        g["commits"] += cm["n"]
+    out = []
+    for g in list(groups.values()) + [unassigned]:
+        g["sessions"].sort(key=lambda s: s["cost"], reverse=True)
+        g["cost"] = round(g["cost"], 4)
+        g["billed"] = round(g["cost"] * (1 + g["markup"] / 100), 2)
+        out.append(g)
+    months = [r[0] for r in conn.execute(
+        "SELECT DISTINCT substr(day, 1, 7) FROM usage WHERE day >= '2000' ORDER BY 1 DESC LIMIT 36")]
+    return {"month": month, "months": months, "clients": out,
+            "total": round(sum(g["cost"] for g in out), 4)}
+
+
+def _client_report_csv(report, client=None):
+    """CSV for invoicing: one line per session, then a total per client.
+    client=None -> every client (and the unassigned sessions)."""
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["month", "client", "session", "session_id", "first_day", "last_day", "commits", "repos",
+                "tokens", "cost_usd", "markup_pct", "billed_usd"])
+    for g in report["clients"]:
+        if client is not None and g["name"] != client:
+            continue
+        if not g["sessions"]:
+            continue
+        name = g["name"] or "(unassigned)"
+        for s in g["sessions"]:
+            w.writerow([report["month"], name, s["title"], s["id"], s["first_day"], s["last_day"], s["commits"],
+                        " ".join(s["repos"]), s["tokens"], f'{s["cost"]:.2f}', f'{g["markup"]:g}',
+                        f'{s["cost"] * (1 + g["markup"] / 100):.2f}'])
+        w.writerow([report["month"], name, "TOTAL", "", "", "", g["commits"], "", g["tokens"],
+                    f'{g["cost"]:.2f}', f'{g["markup"]:g}', f'{g["billed"]:.2f}'])
+    return buf.getvalue()
+
+
+def _client_report_print_html(report, client):
+    """A plain, printable page (browser -> Save as PDF) for one client's month."""
+    import html as _html
+    esc = lambda v: _html.escape(str(v), quote=True)
+    g = next((x for x in report["clients"] if x["name"] == client), None)
+    try:
+        title_month = datetime.strptime(report["month"], "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        title_month = report["month"]
+    if g is None:
+        return f"<!doctype html><meta charset=utf-8><title>Not found</title><p>No client named {esc(client)}.</p>"
+    rows = "".join(
+        f"<tr><td>{esc(s['title'])}</td><td>{esc(s['first_day'])}"
+        f"{'' if s['last_day'] == s['first_day'] else ' – ' + esc(s['last_day'])}</td>"
+        f"<td class=n>{s['commits'] or ''}</td><td>{esc(', '.join(s['repos']))}</td>"
+        f"<td class=n>{s['tokens']:,}</td><td class=n>${s['cost']:.2f}</td></tr>" for s in g["sessions"])
+    markup = (f"<tr><td colspan=5>Markup {g['markup']:g} %</td><td class=n>${g['billed'] - g['cost']:.2f}</td></tr>"
+              f"<tr class=t><td colspan=5>Total</td><td class=n>${g['billed']:.2f}</td></tr>") if g["markup"] else \
+             f"<tr class=t><td colspan=5>Total</td><td class=n>${g['cost']:.2f}</td></tr>"
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{esc(g['name'] or 'Unassigned')} - AI usage {esc(report['month'])}</title>
+<style>body{{font:14px/1.45 system-ui,Segoe UI,sans-serif;color:#111;max-width:860px;margin:32px auto;padding:0 20px}}
+h1{{font-size:22px;margin:0 0 4px}}.sub{{color:#555;margin:0 0 22px}}table{{width:100%;border-collapse:collapse}}
+th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #ddd;vertical-align:top}}th{{font-size:12px;color:#555;text-transform:uppercase;letter-spacing:.04em}}
+.n{{text-align:right;white-space:nowrap}}tr.t td{{font-weight:700;border-top:2px solid #111;border-bottom:none}}
+.foot{{margin-top:26px;color:#777;font-size:12px}}button{{float:right;padding:6px 14px;cursor:pointer}}@media print{{button{{display:none}}body{{margin:0}}}}</style></head>
+<body><button onclick="print()">Print / Save as PDF</button>
+<h1>{esc(g['name'] or 'Unassigned sessions')}</h1><p class="sub">AI coding assistant usage (Claude Code) · {esc(title_month)}</p>
+<table><thead><tr><th>Work session</th><th>Date</th><th class=n>Commits</th><th>Repositories</th><th class=n>Tokens</th><th class=n>Cost</th></tr></thead>
+<tbody>{rows}</tbody><tfoot><tr><td colspan=5>Subtotal</td><td class=n>${g['cost']:.2f}</td></tr>{markup}</tfoot></table>
+<p class="foot">Costs at Anthropic API list prices, from Claude Code's own session records. Generated by AOC on {esc(datetime.now().strftime('%Y-%m-%d'))}.</p>
+</body></html>"""
 
 
 def _db_repair_transcript_costs(hist_conn, index_conn):
@@ -7283,6 +7471,29 @@ button.le-tag { cursor:pointer; }
 .perm-btn.deny { border-color:var(--r);color:var(--r); }
 .perm-btn.term { color:var(--t2); }
 .perm-btn:hover { filter:brightness(1.12); }
+.cl-wrap { display:flex;flex-direction:column;gap:12px;padding:4px 0 20px; }
+.cl-bar { display:flex;align-items:center;gap:12px;flex-wrap:wrap; }
+.cl-month { font:400 12px var(--font2);padding:4px 8px;border-radius:7px;border:1px solid rgba(var(--c-rgb),.25);background:var(--bay,transparent);color:var(--t); }
+.cl-sum { font-size:12px;color:var(--t2); }
+.cl-sum b, .cl-nums b { color:var(--t); }
+.cl-card { border:1px solid rgba(var(--c-rgb),.16);border-radius:10px;padding:10px 12px;background:rgba(var(--c-rgb),.03);min-width:0; }
+.cl-head { display:flex;align-items:center;gap:6px 14px;flex-wrap:wrap;margin-bottom:6px; }
+.cl-name { font-size:14px;font-weight:700;color:var(--t); }
+.cl-nums { display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--t2); }
+.cl-actions { margin-left:auto;display:flex;gap:6px;align-items:center; }
+.cl-btn { text-decoration:none;font-size:9px;padding:3px 10px; }
+.cl-lock { font:400 9px var(--font2);color:var(--t3); }
+.cl-table { width:100%; }
+.cl-card { overflow-x:auto; }
+.cl-assign { font:400 10px var(--font2);padding:2px 4px;border-radius:5px;border:1px solid rgba(var(--c-rgb),.2);background:transparent;color:var(--t2);max-width:130px; }
+.cl-none, .cl-help { font-size:11px;color:var(--t3);margin:2px 0 8px; }
+.cl-row { display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap; }
+.cl-in-name { flex:0 1 180px;min-width:120px; }
+.cl-in-match { flex:1 1 220px;min-width:140px; }
+.cl-mk { display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--t3); }
+.cl-in-markup { width:58px; }
+.cl-ed-actions { display:flex;gap:6px;margin-top:6px; }
+.cl-save { border-color:var(--c);color:var(--c); }
 .td-away { margin-top:6px;padding:6px 9px;border-left:2px solid rgba(var(--c-rgb),.45);background:rgba(var(--c-rgb),.05);border-radius:0 6px 6px 0; }
 .td-away-head { display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px;font:400 10px var(--font2);color:var(--t2); }
 .td-away-lbl { font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:9px;color:var(--c); }
@@ -11746,6 +11957,7 @@ async function renderHistory(){
         <div class="adp-tab ${_histTab==='search'?'active':''}" onclick="_histTab='search';renderHistory()" title="Search what you and Claude wrote in past conversations">CONVERSATIONS</div>
         <div class="adp-tab ${_histTab==='cache'?'active':''}" onclick="_histTab='cache';renderHistory()" title="Where the token spend goes and how well the prompt cache works">CACHE</div>
         <div class="adp-tab ${_histTab==='commits'?'active':''}" onclick="_histTab='commits';renderHistory()" title="What each git commit Claude made cost">COMMITS</div>
+        <div class="adp-tab ${_histTab==='clients'?'active':''}" onclick="_histTab='clients';renderHistory()" title="Monthly Claude Code spend per client, for invoicing">CLIENTS</div>
       </div>
       ${_histTab==='cache'||_histTab==='commits'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='search'?`<input type="search" id="conv-search-input" class="conv-input" placeholder="Search past conversations…" value="${escHtml(_convQuery)}" oninput="setConvSearch(this.value)" autocomplete="off">`:''}
@@ -11782,6 +11994,13 @@ async function renderHistory(){
   </div>`;
 
   const body=document.getElementById('hist-body');
+  if(_histTab==='clients'){
+    try{
+      const d=await fetch('/clients'+(_clientsMonth?'?month='+_clientsMonth:'')).then(r=>r.json());
+      if(gen===_histRenderGen){ _clientsData=d; _clientsMonth=d.month; body.innerHTML=_clientsHtml(d, _clientsEdit, !!window._AOC_IS_PRO, window._AOC_TOKEN||''); }
+    }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the client report.</div>'; }
+    return;
+  }
   if(_histTab==='commits'){
     try{
       const d=await fetch('/commit_costs?days='+_cacheDays).then(r=>r.json());
@@ -12295,6 +12514,89 @@ function _setCommitView(sort, all){
   if(body&&_lastCommitData) body.innerHTML=_commitReportHtml(_lastCommitData, _commitSort, _commitShowAll);
 }
 /* Pure: /commit_costs response -> report HTML. */
+/* ── History -> CLIENTS ── */
+let _clientsMonth='', _clientsData=null, _clientsEdit=false;
+/* Pure: the CLIENTS tab. d = GET /clients, edit = editor open, isPro =
+   CSV export allowed, tok = auth token for download links (tunnel). */
+function _clientsHtml(d, edit, isPro, tok){
+  d=d||{};
+  const rep=d.report, cfg=d.config||{clients:[],overrides:{}};
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const q=u=>tok?u+(u.includes('?')?'&':'?')+'token='+encodeURIComponent(tok):u;
+  if(d.error) return `<div class="conv-empty">The client report failed — see Health → background errors.</div>`;
+  if(!rep) return `<div class="conv-empty">Still reading your Claude Code transcripts — the report appears once the index is built.</div>`;
+  const monthName=m=>{ const [y,mo]=m.split('-').map(Number); return new Date(y,mo-1,1).toLocaleDateString(undefined,{month:'long',year:'numeric'}); };
+  const months=(rep.months&&rep.months.length?rep.months:[rep.month]);
+  if(!months.includes(rep.month)) months.unshift(rep.month);
+  const named=rep.clients.filter(g=>g.name), un=rep.clients.find(g=>!g.name)||{sessions:[],cost:0};
+  const assigned=named.reduce((a,g)=>a+g.cost,0);
+  const opts=(cur)=>`<option value="">Auto (keywords)</option>${cfg.clients.map(c=>`<option value="${escHtml(c.name)}"${cur===c.name?' selected':''}>${escHtml(c.name)}</option>`).join('')}<option value="-"${cur==='-'?' selected':''}>No client</option>`;
+  const sessRows=(g)=>g.sessions.map(x=>{
+    const ov=cfg.overrides[x.id];
+    const when=x.first_day===x.last_day?x.first_day.slice(5):x.first_day.slice(5)+' – '+x.last_day.slice(5);
+    return `<tr><td class="cache-name"><span title="${escHtml(x.id)}">${escHtml(x.title)}</span>${x.repos.length?`<span class="cc-repo">${escHtml(x.repos.join(', '))}</span>`:''}</td>
+      <td class="num cc-when">${escHtml(when)}</td><td class="num cache-opt">${x.commits||''}</td>
+      <td class="num">${money(x.cost)}</td>
+      <td><select class="cl-assign" onchange="_clientAssign(${jsq(x.id)},this.value)" title="${escHtml(x.how?'Matched by '+x.how:'Not matched')}">${opts(ov===undefined?'':ov)}</select></td></tr>`;
+  }).join('');
+  const table=(g)=>g.sessions.length?`<table class="cache-table cl-table"><thead><tr><th>Session</th><th class="num cc-when">Dates</th><th class="num cache-opt">Commits</th><th class="num">Cost</th><th>Client</th></tr></thead><tbody>${sessRows(g)}</tbody></table>`:'<div class="cl-none">No sessions this month.</div>';
+  const exportBtns=(name)=>{
+    const qs=`month=${encodeURIComponent(rep.month)}&client=${encodeURIComponent(name)}`;
+    const csv=isPro?`<a class="adp-btn cl-btn" href="${escHtml(q('/clients/export.csv?'+qs))}" title="One line per session, for your invoice">⬇ CSV</a>`
+      :`<span class="cl-lock" title="CSV export is a Pro feature -- Settings -> LICENSE to upgrade">🔒 CSV (PRO)</span>`;
+    return `<a class="adp-btn cl-btn" href="${escHtml(q('/clients/print?'+qs))}" target="_blank" rel="noopener" title="Printable report -- Save as PDF from the print dialog">⎙ Report</a>${csv}`;
+  };
+  const card=(g)=>`<section class="cl-card">
+      <div class="cl-head"><div class="cl-name">${escHtml(g.name||'Unassigned')}</div>
+        <div class="cl-nums"><span><b>${money(g.cost)}</b> cost</span>${g.markup?`<span>+${g.markup}% → <b>${money(g.billed)}</b> to bill</span>`:''}<span>${g.sessions.length} session${g.sessions.length===1?'':'s'}</span>${g.commits?`<span>${g.commits} commit${g.commits===1?'':'s'}</span>`:''}</div>
+        <div class="cl-actions">${g.sessions.length?exportBtns(g.name):''}</div></div>
+      ${table(g)}</section>`;
+  const editor=edit?`<section class="cl-card cl-editor"><div class="cl-head"><div class="cl-name">Clients</div></div>
+      <div class="cl-help">A session goes to the first client with a keyword in its title, project, folder or the repos it committed to. Pick a client on a session row to override.</div>
+      <div id="cl-rows">${(cfg.clients.length?cfg.clients:[{name:'',match:[],markup:0}]).map((c,i)=>_clientEditRow(c,i)).join('')}</div>
+      <div class="cl-ed-actions"><button class="adp-btn" onclick="_clientAddRow()">+ Client</button><span style="flex:1"></span>
+        <button class="adp-btn" onclick="_clientsEdit=false;renderHistory()">Cancel</button><button class="adp-btn cl-save" onclick="_clientsSave()">Save</button></div></section>`:'';
+  return `<div class="cl-wrap">
+    <div class="cl-bar"><select class="cl-month" onchange="_clientsMonth=this.value;renderHistory()">${months.map(m=>`<option value="${m}"${m===rep.month?' selected':''}>${escHtml(monthName(m))}</option>`).join('')}</select>
+      <span class="cl-sum"><b>${money(rep.total)}</b> spent · <b>${money(assigned)}</b> assigned to ${named.length} client${named.length===1?'':'s'}${un.cost?` · <b>${money(un.cost)}</b> unassigned`:''}</span>
+      <span style="flex:1"></span>${edit?'':`<button class="adp-btn" onclick="_clientsEdit=true;renderHistory()">${cfg.clients.length?'Edit clients':'+ Add clients'}</button>`}</div>
+    ${editor}
+    ${!cfg.clients.length&&!edit?`<div class="cache-insight"><span>◎</span><span>Add your clients with a few keywords each (for example <b>omnisocial</b>) and AOC sorts every session's cost under the right client, ready to export for an invoice.</span></div>`:''}
+    ${named.map(card).join('')}
+    ${un.sessions.length?card(un):''}
+  </div>`;
+}
+function _clientEditRow(c, i){
+  return `<div class="cl-row" data-i="${i}">
+    <input class="settings-input cl-in-name" placeholder="Client name" value="${escHtml(c.name||'')}">
+    <input class="settings-input cl-in-match" placeholder="keywords, comma separated" value="${escHtml((c.match||[]).join(', '))}">
+    <span class="cl-mk"><input class="settings-input cl-in-markup" type="number" min="0" max="500" step="1" value="${Number(c.markup)||0}" title="Markup % added on top of the cost when you bill">%</span>
+    <button class="adp-btn cl-del" onclick="this.parentNode.remove()" title="Remove">✕</button></div>`;
+}
+function _clientAddRow(){
+  const box=document.getElementById('cl-rows');
+  if(box) box.insertAdjacentHTML('beforeend', _clientEditRow({name:'',match:[],markup:0}, box.children.length));
+}
+async function _clientsPost(cfg){
+  try{
+    const r=await fetch('/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
+    if(!r.ok) throw new Error();
+    return await r.json();
+  }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); return null; }
+}
+async function _clientsSave(){
+  const cfg=(_clientsData&&_clientsData.config)||{clients:[],overrides:{}};
+  const clients=[...document.querySelectorAll('#cl-rows .cl-row')].map(r=>({
+    name:r.querySelector('.cl-in-name').value.trim(),
+    match:r.querySelector('.cl-in-match').value.split(',').map(x=>x.trim()).filter(Boolean),
+    markup:parseFloat(r.querySelector('.cl-in-markup').value)||0})).filter(c=>c.name);
+  if(await _clientsPost({clients, overrides:cfg.overrides||{}})){ _clientsEdit=false; renderHistory(); }
+}
+async function _clientAssign(sid, value){
+  const cfg=JSON.parse(JSON.stringify((_clientsData&&_clientsData.config)||{clients:[],overrides:{}}));
+  if(value) cfg.overrides[sid]=value; else delete cfg.overrides[sid];
+  if(await _clientsPost(cfg)) renderHistory();
+}
 function _commitReportHtml(d, sort, showAll){
   d=d||{};
   const idx=d.index||{};
@@ -15567,6 +15869,43 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
         self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode())
 
+    def _get_clients(self, path):
+        """History -> CLIENTS. /clients?month=YYYY-MM -> {config, report};
+        /clients/export.csv?month&client (Pro, like every CSV export);
+        /clients/print?month&client -> printable page (Save as PDF)."""
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        month = (qs.get("month") or [""])[0]
+        if not re.fullmatch(r"\d{4}-\d{2}", month):
+            month = time.strftime("%Y-%m")
+        client = (qs.get("client") or [None])[0]
+        cfg = _load_clients()
+        report, error = None, None
+        if os.path.exists(TRANSCRIPT_INDEX_DB):
+            conn = None
+            try:
+                conn = _transcript_index_connect()
+                report = _client_report(conn, month, cfg)
+            except Exception as e:
+                _log_bg_error("_get_clients", e)
+                error = "client report failed"
+            finally:
+                if conn is not None:
+                    conn.close()
+        if path == "/clients":
+            out = {"month": month, "config": cfg, "report": report, "index": dict(_transcript_index_progress)}
+            if error:
+                out["error"] = error
+            self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode(), no_cache=True)
+        elif report is None:
+            self._serve(503, "text/plain", b"The transcript index is not ready yet.")
+        elif path == "/clients/export.csv":
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", client or "all").strip("-") or "client"
+            self._serve_csv_download(_client_report_csv(report, client), f"aoc-{safe}-{month}.csv")
+        else:
+            self._serve(200, "text/html; charset=utf-8", _client_report_print_html(report, client or "").encode("utf-8"),
+                        no_cache=True)
+
     def _get_commit_costs(self):
         """Cost per commit (History -> COMMITS) from transcript_index.db.
         ?days=7|30|0 (0 = everything indexed)."""
@@ -15851,6 +16190,8 @@ class Handler(BaseHTTPRequestHandler):
             self._get_cache_stats()
         elif path_no_qs == "/commit_costs":
             self._get_commit_costs()
+        elif path_no_qs in ("/clients", "/clients/export.csv", "/clients/print"):
+            self._get_clients(path_no_qs)
         elif self.path.startswith("/diff"):
             self._get_diff()
         elif self.path.startswith("/git"):
@@ -16174,6 +16515,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("focus_session", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs == "/clients":
+            try:
+                reply = _save_clients(json.loads(body or b"{}"))
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("save clients", e)
+                self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
 
         elif path_no_qs == "/recap/settings":
             try:
