@@ -2326,6 +2326,7 @@ def _webhook_notify_worker():
     _token_history = {}  # session_id -> [(epoch, cumulative_tokens), ...], trimmed to last 10 min
     _burn_notified = set()
     _waiting_notified = set()
+    _loop_notified = {}  # session_id -> loop kind already alerted
     _cost_spike_notified = set()
     _project_avg_cost_cache = {}
     # first _db_analytics() refresh (below, every 300 s) lands once the
@@ -2485,6 +2486,7 @@ def _webhook_notify_worker():
                     _burn_notified.discard(sid)
                     _waiting_notified.discard(sid)
                     _cost_spike_notified.discard(sid)
+                    _loop_notified.pop(sid, None)
                     continue
                 suppressed = _notification_suppressed(sess.get("project", ""))
 
@@ -2521,6 +2523,28 @@ def _webhook_notify_worker():
                                 pass
                 else:
                     _waiting_notified.discard(sid)
+
+                # Loop: the session's recent tool calls look like it's going
+                # round in circles (_loop_signal). Once per session and kind,
+                # re-armed when the signal clears. Shares the "stuck" toggle.
+                loop = sess.get("loop")
+                if loop and _loop_notified.get(sid) != loop.get("kind"):
+                    _loop_notified[sid] = loop.get("kind")
+                    if not suppressed:
+                        name = sess.get("display_name") or sess.get("project") or "Session"
+                        if events.get("stuck"):
+                            _fire_webhook(url, {
+                                "event": "session_loop",
+                                "session": {"id": sid, "project": sess.get("project"), "display_name": name,
+                                            "kind": loop.get("kind"), "detail": loop.get("text"),
+                                            "cost": round(sess.get("estimated_cost") or 0, 4)},
+                            })
+                        try:
+                            _show_native_toast(f"⟳ {name[:40]} looks stuck", (loop.get("text") or "")[:120])
+                        except Exception:
+                            pass
+                elif not loop:
+                    _loop_notified.pop(sid, None)
 
                 # Cost-spike: a session's *total* cost so far vs. its
                 # project's historical per-session average (see
@@ -4528,6 +4552,99 @@ def _assistant_text(obj, limit=1500):
     return text if len(text) <= limit else "…" + text[-limit:]
 
 
+# ── Loop detection: a CLI session going round in circles ──────────────────
+# The transcript scanner keeps the main thread's last _LOOP_RING_MAX tool
+# calls (since your last message or Claude's last successful git commit,
+# both of which count as progress) and _loop_signal looks for the two
+# patterns that rarely happen in healthy work: a run of failures, and the
+# fix -> run -> fail cycle on one file.
+_LOOP_RING_MAX = 40
+_LOOP_ERROR_STREAK = 5    # this many failed tool calls in a row
+_LOOP_SAME_FAIL = 3       # the same call failing this many times
+_LOOP_FILE_EDITS = 6      # one file edited this many times...
+_LOOP_FILE_ERRORS = 4     # ...with at least this many failures in the window
+_LOOP_EDIT_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
+
+
+def _loop_tool_key(name, inp):
+    """Pure: (key identifying 'the same call', file path or '')."""
+    inp = inp if isinstance(inp, dict) else {}
+    name = str(name or "?")
+    if name == "Bash":
+        return "Bash: " + " ".join(str(inp.get("command") or "").split())[:200], ""
+    path = str(inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or "")
+    if name in _LOOP_EDIT_TOOLS or name == "Read":
+        return f"{name}: {path}"[:220], path if name in _LOOP_EDIT_TOOLS else ""
+    try:
+        args = json.dumps(inp, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        args = str(inp)
+    return f"{name}: {args}"[:220], ""
+
+
+def _loop_track(stats, obj):
+    """Feed one transcript line into stats["loop_ring"] (main thread only)."""
+    if not isinstance(obj, dict) or obj.get("isSidechain"):
+        return
+    t = obj.get("type")
+    content = (obj.get("message") or {}).get("content")
+    ring = stats.setdefault("loop_ring", [])
+    if t == "assistant" and isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") not in ("Agent", "Task"):
+                key, path = _loop_tool_key(b.get("name"), b.get("input"))
+                ring.append({"id": b.get("id", ""), "key": key, "file": path, "err": None})
+        del ring[:-_LOOP_RING_MAX]
+    elif t == "user":
+        results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
+            if isinstance(content, list) else []
+        if not results:
+            if not obj.get("isMeta"):
+                ring.clear()  # you wrote something: a fresh start
+            return
+        for r in results:
+            for e in reversed(ring):
+                if e["id"] and e["id"] == r.get("tool_use_id"):
+                    e["err"] = bool(r.get("is_error"))
+                    if not e["err"] and e["key"].startswith("Bash: ") and "git commit" in e["key"]:
+                        ring.clear()  # committed: progress
+                    break
+
+
+def _loop_signal(ring):
+    """Pure: {"kind", "text", "count"} if the recent tool calls look like a
+    loop, else None."""
+    done = [e for e in ring or [] if e.get("err") is not None]
+    if not done:
+        return None
+    streak = 0
+    for e in reversed(done):
+        if not e["err"]:
+            break
+        streak += 1
+    if streak >= _LOOP_ERROR_STREAK:
+        return {"kind": "errors", "count": streak,
+                "text": f"{streak} tool calls failed in a row (last: {done[-1]['key'][:80]})"}
+    fails = {}
+    for e in done:
+        if e["err"]:
+            fails[e["key"]] = fails.get(e["key"], 0) + 1
+    key, n = max(fails.items(), key=lambda kv: kv[1], default=("", 0))
+    if n >= _LOOP_SAME_FAIL:
+        return {"kind": "same_fail", "count": n, "text": f"The same call failed {n}×: {key[:80]}"}
+    edits = {}
+    for e in ring:
+        if e.get("file"):
+            edits[e["file"]] = edits.get(e["file"], 0) + 1
+    path, n = max(edits.items(), key=lambda kv: kv[1], default=("", 0))
+    errors = sum(1 for e in done if e["err"])
+    if n >= _LOOP_FILE_EDITS and errors >= _LOOP_FILE_ERRORS:
+        name = path.replace("\\", "/").rstrip("/").split("/")[-1]
+        return {"kind": "edit_loop", "count": n,
+                "text": f"{name} edited {n}× with {errors} failures in between, no commit"}
+    return None
+
+
 def _usage_first_sighting(stats: dict, msg_id, request_id) -> bool:
     """True the first time a (message id, request id) pair is seen in this
     session's transcript. Lines without either id are counted (old formats)."""
@@ -4634,6 +4751,7 @@ def _transcript_scanner_worker():
                         except Exception:
                             continue
                         t = obj.get("type")
+                        _loop_track(stats, obj)
                         _ql = obj.get("quotaLimits")
                         if isinstance(_ql, dict) and _ql.get("status") == "rejected":
                             _record_rate_limit_hit(_ql.get("rateLimitType"), _ql.get("resetsAt"),
@@ -4810,6 +4928,7 @@ def _transcript_scanner_worker():
 
                     # per-message cost, summed in _accumulate_usage
                     stats["estimated_cost"] = stats.get("cost_acc", 0.0)
+                    stats["loop"] = _loop_signal(stats.get("loop_ring"))
 
                     # Save updated cursor
                     with _transcript_cursors_lock:
@@ -4856,6 +4975,7 @@ def _transcript_scanner_worker():
                             sess["waiting_on_you"] = stats["waiting_on_you"]
                         if stats.get("last_message"):
                             sess["last_message"] = stats["last_message"]
+                        sess["loop"] = stats.get("loop")
                         if ai_title:
                             # Self-heals an already-corrupted stored value, not
                             # just "set if missing" -- the previous version of
@@ -6900,6 +7020,11 @@ button.le-tag { cursor:pointer; }
 .perm-btn.deny { border-color:var(--r);color:var(--r); }
 .perm-btn.term { color:var(--t2); }
 .perm-btn:hover { filter:brightness(1.12); }
+.loop-flag { display:flex;align-items:baseline;gap:7px;margin-top:5px;padding:3px 8px;border-radius:5px;min-width:0;
+  background:rgba(224,161,58,.09);border:1px solid rgba(224,161,58,.35);font-size:11px;color:var(--t); }
+.loop-lbl { flex-shrink:0;font:700 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o); }
+.loop-text { min-width:0;overflow:hidden;color:var(--t2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical; }
+.sbay > .loop-flag { margin:0 12px 8px; }
 .ctx-meter { display:flex;align-items:center;gap:7px;margin-top:5px;font:400 10px var(--font2);color:var(--t2);min-width:0;flex-wrap:wrap; }
 .ctx-lbl { font:700 8px var(--font2);letter-spacing:.08em;color:var(--t3); }
 .ctx-bar { flex:0 0 72px;height:5px;border-radius:3px;background:rgba(var(--c-rgb),.14);overflow:hidden; }
@@ -8024,7 +8149,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
         <div class="settings-row" style="gap:16px;flex-wrap:wrap">
           <label class="settings-toggle"><input type="checkbox" id="st-wh-done" checked> Agent done</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-error" checked> Agent error</label>
-          <label class="settings-toggle"><input type="checkbox" id="st-wh-stuck"> Agent stuck</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-stuck"> Agent stuck / session looping</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-burn"> Token burn spike</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-digest"> Weekly digest</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-waiting"> Waiting too long</label>
@@ -9076,7 +9201,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr){
     return `<div class="td-row${wl.blocked?' blocked':''}">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag${wl.blocked?' blocked':''}">${escHtml(wl.bay)} · ${escHtml(_fmtDurationDHM(Math.max(60,s.waiting_secs||0)))}</span></div>
         ${_permAskHtml(s)||(text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:'')}
-        ${_ctxMeterHtml(s, nowS)}</div>
+        ${_loopBadgeHtml(s)}${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
   const workRows=working.map(s=>{
@@ -9085,7 +9210,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr){
     return `<div class="td-row">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag run">Working${n?` · ${n} agent${n===1?'':'s'}`:''}</span></div>
         <div class="td-sub">${[model, s.estimated_cost?money(s.estimated_cost):''].filter(Boolean).map(escHtml).join(' · ')}</div>
-        ${_ctxMeterHtml(s, nowS)}</div>
+        ${_loopBadgeHtml(s)}${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
   const lim=((sr.rate_limits||{}).windows||[]).filter(w=>w.status!=='reset'&&typeof w.pct==='number').map(w=>{
@@ -10260,6 +10385,14 @@ function _woyQuoteHtml(s){
    statusline, see _context_snapshot). While the session waits on you it
    also says when the prompt cache goes cold -- after that, the next
    message re-caches the whole context at the cache-write price. */
+/* Pure: "looks stuck in a loop" flag for a CLI session (s.loop comes from
+   the transcript scanner, see _loop_signal). '' when it looks healthy. */
+function _loopBadgeHtml(s){
+  const l=s&&s.loop;
+  if(!l||!l.text) return '';
+  const tip=l.text+'. Your next message or a successful commit clears this. If it keeps going, check its terminal or force-stop it.';
+  return `<div class="loop-flag" title="${escHtml(tip)}"><span class="loop-lbl">⟳ Looks stuck</span><span class="loop-text">${escHtml(l.text)}</span></div>`;
+}
 function _ctxMeterHtml(s, nowSec){
   const c=s&&s.context;
   if(!c||typeof c.pct!=='number'||!c.window) return '';
@@ -10344,7 +10477,7 @@ function _sessionBayHtml(bay, stripsHtml){
       <div class="sbay-right"><span class="sbay-counts">${counts}</span>${state}${dismiss}
         <button class="bay-btn" onclick="toggleBay(${jsq(bay.key)})" aria-expanded="${!collapsed}" title="${collapsed?'Show':'Hide'} this session's agents">${collapsed?'▼':'▲'}</button></div>
     </header>
-    ${active?_ctxMeterHtml(s, Date.now()/1000):''}
+    ${active?_loopBadgeHtml(s)+_ctxMeterHtml(s, Date.now()/1000):''}
     ${waiting?_woyQuoteHtml(s):''}
     ${collapsed?'':`<div class="sbay-slots">${stripsHtml}</div>`}
   </section>`;
@@ -10837,7 +10970,7 @@ function renderAgents(data){
             </div>
             ${metaLine}
             ${statsLine}
-            ${isActive?_ctxMeterHtml(s, Date.now()/1000):''}
+            ${isActive?_loopBadgeHtml(s)+_ctxMeterHtml(s, Date.now()/1000):''}
             ${waitingOnYou?_woyQuoteHtml(s):''}
             ${noteLine}
             ${burnBadge}
@@ -14956,6 +15089,7 @@ def _build_status_payload_uncached() -> dict:
          "waiting_kind": (v.get("waiting_kind") or "turn") if v.get("waiting_on_you") else "",
          "waiting_message": v.get("waiting_message", "") if v.get("waiting_on_you") else "",
          "last_message": v.get("last_message", ""),
+         "loop": v.get("loop") if _session_really_active(v, now_epoch) else None,
          "note": v.get("note", ""),
          "pr_url": _pr_link_cache_snapshot.get(v.get("git_branch", ""), {}).get("url"),
          "waiting_secs": _compute_waiting_secs(v, now_epoch)}
