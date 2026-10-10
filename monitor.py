@@ -4988,7 +4988,8 @@ def _git_root_for(path, cache):
         return None
     if d not in cache:
         out = _git_out(["rev-parse", "--show-toplevel"], d)
-        cache[d] = os.path.normpath(out.strip()) if out and out.strip() else None
+        # realpath: a short 8.3 temp path (C:\Users\RUNNER~1) and git's long one must compare equal
+        cache[d] = os.path.realpath(out.strip()) if out and out.strip() else None
     return cache[d]
 
 
@@ -5013,7 +5014,7 @@ def _session_changes(files):
         rels = {}
         for f in fs:
             try:
-                rels[os.path.relpath(f, root).replace("\\", "/")] = f
+                rels[os.path.relpath(os.path.realpath(f), root).replace("\\", "/")] = f
             except ValueError:  # other drive
                 outside += 1
         if not rels:
@@ -5049,7 +5050,7 @@ def _session_file_diff(path):
     root = _git_root_for(path, {})
     if not root:
         return ""
-    rel = os.path.relpath(path, root).replace("\\", "/")
+    rel = os.path.relpath(os.path.realpath(path), root).replace("\\", "/")
     out = _git_out(["diff", "HEAD", "--", rel], root) or ""
     if not out.strip() and os.path.isfile(path):
         if (_git_out(["status", "--porcelain=v1", "-z", "--", rel], root) or "").startswith("??"):

@@ -37,9 +37,17 @@ ns["_activity_track"](stats, {"type": "user", "message": {"content": "next pleas
 c.check("edited survives your next message", stats["activity"]["edited"] == ["C:/r/b.py", "C:/r/a.py"])
 
 # ── real repo ──
-base = tempfile.mkdtemp(prefix="aoc_chg_")
+base = tempfile.mkdtemp(prefix="aoc_chg_long_folder_name_")
 repo = os.path.join(base, "Počítač repo")
 os.makedirs(os.path.join(repo, "src"))
+if os.name == "nt":
+    # the session may know a path by its short 8.3 name (CI's temp dir is
+    # C:\Users\RUNNER~1\...) while git reports the long one
+    import ctypes
+    buf = ctypes.create_unicode_buffer(1024)
+    if ctypes.windll.kernel32.GetShortPathNameW(repo, buf, 1024):
+        repo = buf.value
+    print("repo path used:", repo.encode("ascii", "backslashreplace").decode())
 git = lambda *a: subprocess.run(["git", "-C", repo, *a], capture_output=True, check=True)
 git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t")
 P = lambda *x: os.path.join(repo, *x)
