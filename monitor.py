@@ -4695,6 +4695,9 @@ def _human_text(obj):
     return None
 
 
+_SESSION_EDITED_MAX = 300  # files remembered per session for its Changes view
+
+
 def _activity_track(stats, obj, now):
     """Feed one transcript line into stats["activity"]: counters since your
     last message to this session."""
@@ -4716,6 +4719,9 @@ def _activity_track(stats, obj, now):
             key, path = _loop_tool_key(b.get("name"), b.get("input"))
             if path and path not in act["files"]:
                 act["files"] = (act["files"] + [path])[-50:]
+            if path:  # every file the session ever edited (not reset by your messages)
+                edited = [f for f in act.get("edited", []) if f != path] + [path]
+                act["edited"] = edited[-_SESSION_EDITED_MAX:]
             if _is_commit_call(b.get("name"), b.get("input")):
                 act["pending"][b.get("id", "")] = "commit"
         elif obj.get("type") == "user" and b.get("type") == "tool_result":
@@ -4917,6 +4923,140 @@ def _recap_get(sid, force=False, run=None, now=None):
     finally:
         with _recap_lock:
             _recap_busy.discard(sid)
+
+
+# ── Session changes: uncommitted edits of the files a session touched ─────
+# Only files the session itself edited (from its transcript, see
+# _activity_track's "edited") are ever looked at, so the endpoint can't be
+# used to read anything else on disk. Grouped by git repo.
+
+
+def _git_out(args, cwd, timeout=8):
+    """git output decoded as UTF-8 (paths like C:/Users/x/Počítač survive;
+    _run would decode with the ANSI code page). None on failure."""
+    try:
+        r = subprocess.run(["git", "-c", "core.quotepath=off"] + args, cwd=cwd, capture_output=True,
+                           timeout=timeout, creationflags=_NO_WINDOW)
+    except Exception:
+        return None
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+def _parse_porcelain_z(out):
+    """Pure: `git status --porcelain=v1 -z` -> {repo-relative path: XY code}."""
+    res, parts, i = {}, (out or "").split("\0"), 0
+    while i < len(parts):
+        e = parts[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        code, path = e[:2], e[3:]
+        if "R" in code or "C" in code:
+            i += 1  # the rename source follows as its own entry
+        res[path] = code
+    return res
+
+
+def _parse_numstat(out):
+    """Pure: `git diff --numstat` -> {path: (ins, dels)}; binary -> (None, None)."""
+    res = {}
+    for line in (out or "").splitlines():
+        p = line.split("\t", 2)
+        if len(p) == 3:
+            res[p[2]] = (int(p[0]) if p[0].isdigit() else None, int(p[1]) if p[1].isdigit() else None)
+    return res
+
+
+def _change_kind(code):
+    """Pure: porcelain XY -> added | deleted | renamed | untracked | modified."""
+    if code == "??":
+        return "untracked"
+    for ch, kind in (("D", "deleted"), ("A", "added"), ("R", "renamed")):
+        if ch in code:
+            return kind
+    return "modified"
+
+
+def _git_root_for(path, cache):
+    d = os.path.dirname(path)
+    while d and not os.path.isdir(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    if not d:
+        return None
+    if d not in cache:
+        out = _git_out(["rev-parse", "--show-toplevel"], d)
+        cache[d] = os.path.normpath(out.strip()) if out and out.strip() else None
+    return cache[d]
+
+
+def _session_edited(sid):
+    with _transcript_cursors_lock:
+        cur = _transcript_cursors.get(sid) or {}
+        return list(((cur.get("stats") or {}).get("activity") or {}).get("edited") or [])
+
+
+def _session_changes(files):
+    """Uncommitted changes in `files` (absolute paths) -> {"repos": [{root,
+    name, branch, files: [{path, rel, kind, ins, dels}]}], "clean", "outside"}."""
+    cache, by_root, outside = {}, {}, 0
+    for f in files:
+        root = _git_root_for(f, cache)
+        if not root:
+            outside += 1
+            continue
+        by_root.setdefault(root, []).append(f)
+    repos, clean = [], 0
+    for root, fs in by_root.items():
+        rels = {}
+        for f in fs:
+            try:
+                rels[os.path.relpath(f, root).replace("\\", "/")] = f
+            except ValueError:  # other drive
+                outside += 1
+        if not rels:
+            continue
+        status = _parse_porcelain_z(_git_out(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--"]
+                                             + list(rels), root) or "")
+        nums = _parse_numstat(_git_out(["diff", "HEAD", "--numstat", "--"] + list(rels), root) or "")
+        key = {os.path.normcase(r): r for r in rels}
+        changed = []
+        for rel, code in status.items():
+            own = key.get(os.path.normcase(rel))
+            if not own:
+                continue
+            ins, dels = nums.get(rel, (None, None))
+            if code == "??":
+                try:
+                    with open(rels[own], "rb") as fh:
+                        ins, dels = fh.read(2_000_000).count(b"\n"), 0
+                except OSError:
+                    pass
+            changed.append({"path": rels[own], "rel": rel, "kind": _change_kind(code), "ins": ins, "dels": dels})
+        clean += len(rels) - len(changed)
+        if changed:
+            changed.sort(key=lambda x: x["rel"])
+            branch = (_git_out(["rev-parse", "--abbrev-ref", "HEAD"], root) or "").strip()
+            repos.append({"root": root, "name": os.path.basename(root), "branch": branch, "files": changed})
+    repos.sort(key=lambda r: r["name"].lower())
+    return {"repos": repos, "clean": clean, "outside": outside}
+
+
+def _session_file_diff(path):
+    """Unified diff of one file vs HEAD (untracked -> whole file as added)."""
+    root = _git_root_for(path, {})
+    if not root:
+        return ""
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    out = _git_out(["diff", "HEAD", "--", rel], root) or ""
+    if not out.strip() and os.path.isfile(path):
+        if (_git_out(["status", "--porcelain=v1", "-z", "--", rel], root) or "").startswith("??"):
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read(500_000).splitlines()
+            out = f"--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + l for l in lines)
+    return out[:1_000_000]
 
 
 def _usage_first_sighting(stats: dict, msg_id, request_id) -> bool:
@@ -5254,6 +5394,7 @@ def _transcript_scanner_worker():
                         _act = stats.get("activity") or {}
                         sess["activity_raw"] = {k: _act.get(k, 0) for k in ("since", "tools", "errors", "commits")}
                         sess["activity_raw"]["files"] = list(_act.get("files") or [])
+                        sess["edited_count"] = len(_act.get("edited") or [])
                         if ai_title:
                             # Self-heals an already-corrupted stored value, not
                             # just "set if missing" -- the previous version of
@@ -7494,6 +7635,25 @@ button.le-tag { cursor:pointer; }
 .cl-in-markup { width:58px; }
 .cl-ed-actions { display:flex;gap:6px;margin-top:6px; }
 .cl-save { border-color:var(--c);color:var(--c); }
+.chg-btn { background:none;border:1px solid rgba(var(--c-rgb),.25);color:var(--c);cursor:pointer;font:700 10px var(--font2);
+  padding:2px 7px;margin-left:4px;border-radius:5px;line-height:1.4; }
+.chg-btn:hover { background:rgba(var(--c-rgb),.08); }
+.td-btns { display:flex;flex-direction:column;gap:5px;align-items:flex-end; }
+.chg-box { max-width:760px; }
+.diff-box .diff-body.chg-body { white-space:normal; }
+.chg-repo { margin-bottom:12px; }
+.chg-repo-head { display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:4px;font-size:12px;color:var(--t); }
+.chg-branch { font:400 10px var(--font2);color:var(--t2); }
+.chg-root { font:400 9px var(--font2);color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1; }
+.chg-file { display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:none;border:none;border-bottom:1px solid rgba(var(--c-rgb),.08);
+  padding:5px 4px;cursor:pointer;color:var(--t);font:400 11px var(--font2); }
+.chg-file:hover { background:rgba(var(--c-rgb),.06); }
+.chg-kind { flex:0 0 30px;text-align:center;font-weight:700;font-size:9px;border-radius:4px;padding:1px 0;background:rgba(var(--c-rgb),.12);color:var(--c); }
+.chg-kind.k-added, .chg-kind.k-untracked { background:rgba(76,194,133,.14);color:var(--g); }
+.chg-kind.k-deleted { background:rgba(239,106,87,.14);color:var(--r); }
+.chg-rel { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.chg-num { flex-shrink:0; }
+.chg-empty, .chg-foot { font-size:11px;color:var(--t3);padding:8px 2px; }
 .td-away { margin-top:6px;padding:6px 9px;border-left:2px solid rgba(var(--c-rgb),.45);background:rgba(var(--c-rgb),.05);border-radius:0 6px 6px 0; }
 .td-away-head { display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px;font:400 10px var(--font2);color:var(--t2); }
 .td-away-lbl { font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:9px;color:var(--c); }
@@ -9752,7 +9912,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
     `<b>${sessions.length}</b> session${sessions.length===1?'':'s'} open`,
     `<b>${commits.length}</b> commit${commits.length===1?'':'s'}${cm&&cm.total&&cm.total.cost?` for ${money(cm.total.cost)}`:''}`,
   ];
-  const btn=(s,label)=>s._isLocal===false?'':`<button class="adp-btn td-btn" onclick="_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window">${label}</button>`;
+  const btn=(s,label)=>`<div class="td-btns">${s._isLocal===false?'':`<button class="adp-btn td-btn" onclick="_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window">${label}</button>`}${_changesBtnHtml(s)}</div>`;
   const waitRows=waiting.map(s=>{
     const wl=_waitLabel(s);
     const info=_lastMessageInfo(s.last_message, 180);
@@ -10255,18 +10415,63 @@ function renderConflicts(agents){
   el.innerHTML='<b style="font-family:var(--font2);font-size:10px;letter-spacing:.06em;color:var(--o)">⚠ CONFLICT</b> '+conflicts.map(c=>`<span style="font-family:var(--font2)">${c.path.split('/').pop()}</span> edited by ${c.units.join(' + ')}`).join(' &nbsp;·&nbsp; ');
 }
 
+/* Pure: unified diff text -> coloured, escaped lines. */
+function _diffLinesHtml(text){
+  return String(text||'').split('\n').map(line=>{
+    const s=escHtml(line);
+    if(line.startsWith('+++') || line.startsWith('---')) return `<span class="diff-meta">${s}</span>`;
+    if(line.startsWith('+')) return `<span class="diff-add">${s}</span>`;
+    if(line.startsWith('-')) return `<span class="diff-del">${s}</span>`;
+    if(line.startsWith('@@')) return `<span class="diff-hunk">${s}</span>`;
+    if(line.startsWith('diff')||line.startsWith('index')) return `<span class="diff-meta">${s}</span>`;
+    return s;
+  }).join('\n');
+}
+/* Pure: "Δ n" button for a session that edited files. */
+function _changesBtnHtml(s){
+  if(!s||!s.edited_count) return '';
+  const label=s.display_name||s.project||'this session';
+  return `<button class="chg-btn" onclick="event.stopPropagation();openSessionChanges(${jsq(s.id)},${jsq(s.machine||'')},${jsq(label)})" title="Uncommitted changes in the ${s.edited_count} file${s.edited_count===1?'':'s'} this session edited">Δ ${s.edited_count}</button>`;
+}
+/* Pure: the Changes panel body from GET /session_changes. */
+function _sessionChangesHtml(d, sid, machine){
+  if(!d||!d.ok) return `<div class="chg-empty">${escHtml((d&&d.error)||'Could not load the changes.')}</div>`;
+  const kindTag={modified:'M',added:'A',deleted:'D',renamed:'R',untracked:'NEW'};
+  const repos=(d.repos||[]).map(r=>`<div class="chg-repo"><div class="chg-repo-head"><b>${escHtml(r.name)}</b>${r.branch?`<span class="chg-branch">⎇ ${escHtml(r.branch)}</span>`:''}<span class="chg-root">${escHtml(r.root)}</span></div>
+    ${r.files.map(f=>`<button class="chg-file" onclick="_showSessionFileDiff(${jsq(sid)},${jsq(machine)},${jsq(f.path)},${jsq(f.rel)})">
+      <span class="chg-kind k-${f.kind}">${kindTag[f.kind]||'M'}</span><span class="chg-rel">${escHtml(f.rel)}</span>
+      <span class="chg-num">${f.ins!=null?`<span class="cc-ins">+${f.ins}</span>`:''} ${f.dels?`<span class="cc-del">−${f.dels}</span>`:''}</span></button>`).join('')}</div>`).join('');
+  const n=(d.repos||[]).reduce((a,r)=>a+r.files.length,0);
+  const foot=[d.clean?`${d.clean} edited file${d.clean===1?' is':'s are'} committed or unchanged`:'', d.outside?`${d.outside} outside any git repo`:''].filter(Boolean).join(' · ');
+  return `${n?repos:'<div class="chg-empty">Nothing uncommitted — everything this session edited is committed.</div>'}${foot?`<div class="chg-foot">${escHtml(foot)}</div>`:''}`;
+}
+function _overlay(title, bodyHtml, cls){
+  const o=document.createElement('div');
+  o.className='diff-overlay';
+  o.innerHTML=`<div class="diff-box ${cls||''}"><div class="diff-hdr"><div class="diff-hdr-name">${escHtml(title)}</div>
+    <button class="diff-close" onclick="this.closest('.diff-overlay').remove()">✕</button></div><div class="diff-body chg-body">${bodyHtml}</div></div>`;
+  o.addEventListener('click',e=>{ if(e.target===o) o.remove(); });
+  document.body.appendChild(o);
+  return o;
+}
+async function openSessionChanges(sid, machine, label){
+  const o=_overlay('Changes · '+label, '<div class="chg-empty">Loading…</div>', 'chg-box');
+  try{
+    const d=await fetch(_apiUrl(_machineFor(machine),'/session_changes?session_id='+encodeURIComponent(sid))).then(r=>r.json());
+    o.querySelector('.chg-body').innerHTML=_sessionChangesHtml(d, sid, machine);
+  }catch(e){ o.querySelector('.chg-body').innerHTML=_sessionChangesHtml(null); }
+}
+async function _showSessionFileDiff(sid, machine, path, rel){
+  const o=_overlay('// '+rel, '<span style="color:var(--t3)">Loading…</span>');
+  try{
+    const d=await fetch(_apiUrl(_machineFor(machine),'/session_changes/diff?session_id='+encodeURIComponent(sid)+'&file='+encodeURIComponent(path))).then(r=>r.json());
+    o.querySelector('.diff-body').innerHTML=d.ok?(_diffLinesHtml(d.diff)||'<span style="color:var(--t3)">(no uncommitted change)</span>'):escHtml(d.error||'failed');
+  }catch(e){ o.querySelector('.diff-body').textContent='Could not load the diff.'; }
+}
 async function showDiff(filepath){
   try{
     const d=await fetch('/diff?file='+encodeURIComponent(filepath)).then(r=>r.json());
-    const html=d.diff.split('\n').map(line=>{
-      const s=escHtml(line);
-      if(line.startsWith('+++') || line.startsWith('---')) return `<span class="diff-meta">${s}</span>`;
-      if(line.startsWith('+')) return `<span class="diff-add">${s}</span>`;
-      if(line.startsWith('-')) return `<span class="diff-del">${s}</span>`;
-      if(line.startsWith('@@')) return `<span class="diff-hunk">${s}</span>`;
-      if(line.startsWith('diff')||line.startsWith('index')) return `<span class="diff-meta">${s}</span>`;
-      return s;
-    }).join('\n');
+    const html=_diffLinesHtml(d.diff);
     const overlay=document.createElement('div');
     overlay.className='diff-overlay';
     overlay.innerHTML=`
@@ -11548,6 +11753,7 @@ function renderAgents(data){
           ${isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window" style="background:none;border:none;color:${waitingOnYou?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${waitingOnYou?'var(--o)':'var(--t3)'}'">⧉</button>`:''}
           <button onclick="event.stopPropagation();exportSessionDetail(${jsq(s.id)})" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
           <button onclick="toggleSessionCompare(${jsq(s.id)},event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
+          ${_changesBtnHtml(s)}
           ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession(${jsq(s.id)},${jsq(s.project||s.cwd||'this session')},${jsq(s.machine||'')})" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(240,164,151,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(240,164,151,.7)'">⛔</button>`:''}
           ${!isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_copyResumeCmd(${jsq(s.id)})" title="Copy resume command to clipboard" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⟲</button>`:''}
           ${!isActive?` <button onclick="event.stopPropagation();_dismissSession(${jsq(s.id)},${jsq(s.machine||'')})" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
@@ -15749,6 +15955,7 @@ def _build_status_payload_uncached() -> dict:
          "last_message": v.get("last_message", ""),
          "loop": v.get("loop") if _session_really_active(v, now_epoch) else None,
          "away": _activity_view(v.get("activity_raw"), now_epoch),
+         "edited_count": v.get("edited_count", 0),
          "note": v.get("note", ""),
          "pr_url": _pr_link_cache_snapshot.get(v.get("git_branch", ""), {}).get("url"),
          "waiting_secs": _compute_waiting_secs(v, now_epoch)}
@@ -16113,6 +16320,23 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/recap/settings":
             self._serve(200, "application/json", json.dumps(_load_recap_settings()).encode(), no_cache=True)
+        elif path_no_qs in ("/session_changes", "/session_changes/diff"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            edited = _session_edited((qs.get("session_id") or [""])[0])
+            try:
+                if path_no_qs == "/session_changes":
+                    reply = {"ok": True, "edited": len(edited), **_session_changes(edited)}
+                else:
+                    want = os.path.normcase(os.path.normpath((qs.get("file") or [""])[0]))
+                    own = next((f for f in edited if os.path.normcase(os.path.normpath(f)) == want), None)
+                    # only a file this session edited -- never an arbitrary path
+                    reply = {"ok": True, "diff": _session_file_diff(own)} if own else \
+                        {"ok": False, "error": "not a file this session edited"}
+            except Exception as e:
+                _log_bg_error("session_changes", e)
+                reply = {"ok": False, "error": "failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/status":
             try:
                 data = _build_status_payload()

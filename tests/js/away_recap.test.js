@@ -10,7 +10,7 @@ const { Checker } = require('./lib/check');
 const src = readMonitorSource();
 
 for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_lastMessageInfo', '_waitLabel', '_waitingSessions', '_ctxMeterHtml',
-                 '_permAskHtml', '_loopBadgeHtml', '_awayBlockHtml', '_todayHtml'])
+                 '_permAskHtml', '_loopBadgeHtml', '_awayBlockHtml', '_changesBtnHtml', '_todayHtml'])
   eval(extractFunction(src, f));
 
 const c = new Checker();

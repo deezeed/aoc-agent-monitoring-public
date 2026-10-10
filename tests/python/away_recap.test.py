@@ -13,7 +13,7 @@ c = Checker()
 data = tempfile.mkdtemp(prefix="aoc_recap_")
 ns = exec_functions(
     ["_load_json_file", "_iso_to_epoch", "_assistant_text", "_LOOP_EDIT_TOOLS", "_loop_tool_key", "_GIT_COMMIT_RE", "_is_commit_call",
-     "RECAP_SETTINGS_FILE", "RECAP_CACHE_FILE", "_RECAP_MODES", "_RECAP_MIN_AWAY_S", "_RECAP_MIN_TOOLS",
+     "_SESSION_EDITED_MAX", "RECAP_SETTINGS_FILE", "RECAP_CACHE_FILE", "_RECAP_MODES", "_RECAP_MIN_AWAY_S", "_RECAP_MIN_TOOLS",
      "_RECAP_REFRESH_S", "_RECAP_DIGEST_MAX", "_recap_lock", "_recap_busy", "_human_text", "_activity_track",
      "_activity_view", "_recap_digest", "_RECAP_INSTRUCTION", "_load_recap_settings", "_save_recap_settings",
      "_recap_cached", "_recap_store", "_recap_needs_refresh", "_recap_get"],
