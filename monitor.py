@@ -6241,6 +6241,162 @@ def _client_report_csv(report, client=None):
     return buf.getvalue()
 
 
+# ── Model advice (History -> MODELS) ──────────────────────────────────────
+# Every API call in the transcripts is sorted by the work it did (the tools
+# it called: only reading/searching, editing, running commands, delegating
+# to a subagent, or just writing text) and re-priced on Sonnet and Haiku
+# with the same tokens. That's an estimate -- another model would use a
+# different number of tokens -- but it shows where a cheaper model would
+# matter and how much, on your own usage. Cache reads dominate long
+# sessions and cost the same on Opus 5.5 and Sonnet 5, so switching saves
+# much less than the list prices suggest; the report says so.
+_ADVICE_READ_ONLY = {"Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch", "TodoWrite", "ToolSearch",
+                     "TaskOutput", "NotebookRead"}
+_ADVICE_EDIT = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+_ADVICE_SHELL = {"Bash", "PowerShell", "BashOutput", "KillShell", "Monitor"}
+_ADVICE_CHEAP = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+_advice_cache = {}  # days -> (computed_at, report)
+_ADVICE_CACHE_S = 15 * 60
+
+
+def _advice_kind(tools):
+    """Pure: tool names one API call used -> explore | edit | shell | delegate | text | other."""
+    tools = set(tools or ())
+    if not tools:
+        return "text"
+    if tools & _ADVICE_EDIT:
+        return "edit"
+    if tools & {"Agent", "Task"}:
+        return "delegate"
+    if tools & _ADVICE_SHELL:
+        return "shell"
+    if tools <= _ADVICE_READ_ONLY:
+        return "explore"
+    return "other"
+
+
+def _advice_scan_file(path, since_iso, agg):
+    """Add one transcript's API calls (each counted once, like the usage
+    index) to agg[(where, model, kind)] = [calls, cost, on_sonnet, on_haiku]."""
+    where = "subagent" if "subagents" in path.replace("\\", "/").split("/") else "main"
+    msgs = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if '"assistant"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict) or o.get("type") != "assistant" or str(o.get("timestamp") or "") < since_iso:
+                continue
+            m = o.get("message") or {}
+            key = (m.get("id") or "") + "|" + (o.get("requestId") or "")
+            e = msgs.setdefault(key, [m.get("model") or "", m.get("usage") or {}, set()])
+            for b in m.get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    e[2].add(b.get("name"))
+    for model, u, tools in msgs.values():
+        if not u or not model or model.startswith("<"):
+            continue
+        tok = (u.get("input_tokens") or 0, u.get("output_tokens") or 0,
+               u.get("cache_creation_input_tokens") or 0, u.get("cache_read_input_tokens") or 0)
+        cw1 = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
+        a = agg.setdefault((where, model, _advice_kind(tools)), [0, 0.0, 0.0, 0.0])
+        a[0] += 1
+        a[1] += _calc_cost(*tok, model, cw1)
+        a[2] += _calc_cost(*tok, _ADVICE_CHEAP["sonnet"], cw1)
+        a[3] += _calc_cost(*tok, _ADVICE_CHEAP["haiku"], cw1)
+
+
+def _model_label(model):
+    """Pure: claude-opus-5-5 -> Opus 5.5."""
+    m = re.match(r"claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-|$)", model or "")
+    if not m:
+        return model or "?"
+    return m.group(1).capitalize() + " " + m.group(2) + ("." + m.group(3) if m.group(3) else "")
+
+
+def _advice_report(agg, days):
+    """Pure: agg -> {"total", "monthly_factor", "rows", "by_model", "tips"}."""
+    rows = [{"where": w, "model": m, "label": _model_label(m), "kind": k, "calls": v[0], "cost": round(v[1], 4),
+             "on_sonnet": round(v[2], 4), "on_haiku": round(v[3], 4)} for (w, m, k), v in agg.items()]
+    rows.sort(key=lambda r: r["cost"], reverse=True)
+    total = sum(r["cost"] for r in rows)
+    month = 30.0 / max(days, 1)
+    by_model = {}
+    for r in rows:
+        b = by_model.setdefault(r["label"], {"label": r["label"], "cost": 0.0, "calls": 0})
+        b["cost"] += r["cost"]
+        b["calls"] += r["calls"]
+    by_model = sorted(by_model.values(), key=lambda b: b["cost"], reverse=True)
+    for b in by_model:
+        b["share"] = round(b["cost"] / total * 100, 1) if total else 0
+    pricey = lambda r: r["label"].startswith("Opus")
+    tips = []
+    explore = [r for r in rows if r["where"] == "main" and pricey(r) and r["kind"] == "explore"]
+    e_cost = sum(r["cost"] for r in explore)
+    if e_cost * month >= 5:
+        save = e_cost - sum(r["on_haiku"] for r in explore)
+        tips.append({"id": "explore", "saving_month": round(save * month, 2),
+                     "title": "Hand searching and reading to a cheaper subagent",
+                     "detail": f"Opus spent ${e_cost:.2f} on calls that only read or searched files "
+                               f"({sum(r['calls'] for r in explore):,} calls). Asking Claude to use the Explore "
+                               "subagent (or a custom agent with `model: haiku`) for that part would cost about "
+                               f"${e_cost - save:.2f} instead."})
+    subs = [r for r in rows if r["where"] == "subagent" and pricey(r)]
+    s_cost = sum(r["cost"] for r in subs)
+    if s_cost * month >= 2:
+        save = s_cost - sum(r["on_sonnet"] for r in subs)
+        tips.append({"id": "subagents", "saving_month": round(save * month, 2),
+                     "title": "Run subagents on Sonnet",
+                     "detail": f"Subagents ran on Opus for ${s_cost:.2f}. Set `model: sonnet` in your agent "
+                               f"definitions (or CLAUDE_CODE_SUBAGENT_MODEL) to pay about ${s_cost - save:.2f}."})
+    # without the reading/searching calls the tip above already covers, so the
+    # savings of the tips add up
+    main_opus = [r for r in rows if r["where"] == "main" and pricey(r) and r["kind"] != "explore"]
+    m_cost = sum(r["cost"] for r in main_opus)
+    if m_cost * month >= 5:
+        sonnet = sum(r["on_sonnet"] for r in main_opus)
+        pct = round((1 - sonnet / m_cost) * 100) if m_cost else 0
+        tips.append({"id": "main", "saving_month": round((m_cost - sonnet) * month, 2),
+                     "title": f"Sonnet for routine sessions saves {pct}% here, not half",
+                     "detail": f"The rest of your Opus work cost ${m_cost:.2f}; the same tokens on Sonnet would be ${sonnet:.2f}. "
+                               "Most of it is re-reading the cached conversation, which costs the same on both, so "
+                               "keeping conversations short (/clear between tasks, /compact) saves more than switching. "
+                               "Use Sonnet (/model sonnet) for routine runs and keep Opus for hard problems."})
+    if total and not tips:
+        tips.append({"id": "fine", "saving_month": 0, "title": "Your model mix already looks lean",
+                     "detail": "No big spend on an expensive model for cheap work in this period."})
+    tips.sort(key=lambda t: t["saving_month"], reverse=True)
+    return {"total": round(total, 4), "days": days, "monthly_factor": round(month, 3),
+            "rows": rows, "by_model": by_model, "tips": tips}
+
+
+def _model_advice(days, now=None):
+    """GET /model_advice: scan the last `days` of transcripts (cached 15 min)."""
+    now = now or time.time()
+    hit = _advice_cache.get(days)
+    if hit and now - hit[0] < _ADVICE_CACHE_S:
+        return hit[1]
+    base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    since = now - days * 86400
+    since_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(since))
+    agg = {}
+    for pattern in ("*/*.jsonl", "*/*/subagents/*.jsonl"):
+        for f in glob.glob(os.path.join(base, pattern)):
+            try:
+                if os.path.getmtime(f) < since:
+                    continue
+                _advice_scan_file(f, since_iso, agg)
+            except OSError:
+                continue
+    report = _advice_report(agg, days)
+    report["computed_at"] = now
+    _advice_cache[days] = (now, report)
+    return report
+
+
 def _client_report_print_html(report, client):
     """A plain, printable page (browser -> Save as PDF) for one client's month."""
     import html as _html
@@ -7612,6 +7768,14 @@ button.le-tag { cursor:pointer; }
 .perm-btn.deny { border-color:var(--r);color:var(--r); }
 .perm-btn.term { color:var(--t2); }
 .perm-btn:hover { filter:brightness(1.12); }
+.adv-tips { display:flex;flex-direction:column;gap:8px;margin:10px 0 14px; }
+.adv-tip { border:1px solid rgba(var(--c-rgb),.18);border-left:3px solid var(--c);border-radius:0 8px 8px 0;padding:8px 11px;background:rgba(var(--c-rgb),.04); }
+.adv-tip-head { display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--t); }
+.adv-save { margin-left:auto;font:700 11px var(--font2);color:var(--g); }
+.adv-tip-body { margin-top:3px;font-size:11px;line-height:1.5;color:var(--t2); }
+.adv-tip-body code { font:400 10px var(--font2);background:rgba(var(--c-rgb),.1);padding:0 3px;border-radius:3px; }
+.adv-dim { color:var(--t3); }
+.adv-table { overflow-x:auto; }
 .cl-wrap { display:flex;flex-direction:column;gap:12px;padding:4px 0 20px; }
 .cl-bar { display:flex;align-items:center;gap:12px;flex-wrap:wrap; }
 .cl-month { font:400 12px var(--font2);padding:4px 8px;border-radius:7px;border:1px solid rgba(var(--c-rgb),.25);background:var(--bay,transparent);color:var(--t); }
@@ -12164,7 +12328,9 @@ async function renderHistory(){
         <div class="adp-tab ${_histTab==='cache'?'active':''}" onclick="_histTab='cache';renderHistory()" title="Where the token spend goes and how well the prompt cache works">CACHE</div>
         <div class="adp-tab ${_histTab==='commits'?'active':''}" onclick="_histTab='commits';renderHistory()" title="What each git commit Claude made cost">COMMITS</div>
         <div class="adp-tab ${_histTab==='clients'?'active':''}" onclick="_histTab='clients';renderHistory()" title="Monthly Claude Code spend per client, for invoicing">CLIENTS</div>
+        <div class="adp-tab ${_histTab==='models'?'active':''}" onclick="_histTab='models';renderHistory()" title="Which work each model's spend went to, and what a cheaper model would save">MODELS</div>
       </div>
+      ${_histTab==='models'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_adviceDays===d?'active':''}" onclick="_adviceDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='cache'||_histTab==='commits'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='search'?`<input type="search" id="conv-search-input" class="conv-input" placeholder="Search past conversations…" value="${escHtml(_convQuery)}" oninput="setConvSearch(this.value)" autocomplete="off">`:''}
       ${_histTab==='sessions'?`<input type="text" id="hist-search-input" placeholder="Filter by name, project, id, or tag..." value="${escHtml(_histSearchQuery)}" oninput="setHistSearch(this.value)" style="font-family:var(--font2);font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:10px;width:150px">
@@ -12200,6 +12366,14 @@ async function renderHistory(){
   </div>`;
 
   const body=document.getElementById('hist-body');
+  if(_histTab==='models'){
+    body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
+    try{
+      const d=await fetch('/model_advice?days='+_adviceDays).then(r=>r.json());
+      if(gen===_histRenderGen) body.innerHTML=_modelAdviceHtml(d);
+    }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the model report.</div>'; }
+    return;
+  }
   if(_histTab==='clients'){
     try{
       const d=await fetch('/clients'+(_clientsMonth?'?month='+_clientsMonth:'')).then(r=>r.json());
@@ -12720,6 +12894,40 @@ function _setCommitView(sort, all){
   if(body&&_lastCommitData) body.innerHTML=_commitReportHtml(_lastCommitData, _commitSort, _commitShowAll);
 }
 /* Pure: /commit_costs response -> report HTML. */
+/* ── History -> MODELS ── */
+let _adviceDays=30;
+/* Pure: the MODELS tab from GET /model_advice. */
+function _modelAdviceHtml(d){
+  d=d||{};
+  if(d.error) return `<div class="conv-empty">The model report failed — see Health → background errors.</div>`;
+  if(!d.total) return `<div class="conv-empty">No Claude Code usage in this period.</div>`;
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const kpi=(v,l,tip)=>`<div class="hist-kpi" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const best=(d.tips||[]).reduce((a,t)=>a+(t.saving_month||0),0);
+  const top=(d.by_model||[])[0]||{};
+  const kpis=[
+    kpi(money(d.total),'Spent',`Claude Code API-price spend in the last ${d.days} days`),
+    kpi(`${escHtml(top.label||'—')} ${Math.round(top.share||0)}%`,'Main model','Model with the biggest share of the spend'),
+    kpi(best?'~'+money(best):'—','Could save / month','Sum of the suggestions below, scaled to 30 days. An estimate: same tokens, cheaper prices.'),
+  ].join('');
+  const md=t=>escHtml(t).replace(/`([^`]+)`/g,'<code>$1</code>');
+  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(t.title)}</b>${t.saving_month?`<span class="adv-save">~${money(t.saving_month)} / month</span>`:''}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
+  const kindLabel={explore:'Reading & searching',edit:'Editing files',shell:'Running commands',delegate:'Delegating to subagents',text:'Writing answers',other:'Other tools'};
+  const max=Math.max(...d.rows.map(r=>r.cost),0.0001);
+  const rows=d.rows.filter(r=>r.cost>=0.01).map(r=>{
+    const cheap=r.label.startsWith('Haiku');
+    const same=r.label.startsWith('Sonnet');
+    return `<tr><td class="cache-name">${escHtml(kindLabel[r.kind]||r.kind)}${r.where==='subagent'?'<span class="cc-repo">subagent</span>':''}</td>
+      <td>${escHtml(r.label)}</td><td class="num cache-opt">${r.calls.toLocaleString()}</td>
+      <td class="num cc-cost"><span class="cc-bar"><span style="width:${(r.cost/max*100).toFixed(1)}%"></span></span>${money(r.cost)}</td>
+      <td class="num">${same||cheap?'<span class="adv-dim">—</span>':money(r.on_sonnet)}</td>
+      <td class="num cache-opt">${cheap?'<span class="adv-dim">—</span>':money(r.on_haiku)}</td></tr>`;
+  }).join('');
+  return `<div class="hist-analytics">${kpis}</div>
+    <div class="adv-tips">${tips}</div>
+    <div class="adv-table"><table class="cache-table"><thead><tr><th>Work</th><th>Model</th><th class="num cache-opt">Calls</th><th class="num">Cost</th><th class="num">On Sonnet</th><th class="num cache-opt">On Haiku</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="cl-help" style="margin-top:8px">Each API call is sorted by the tools it used and re-priced with the same tokens. Another model would use a different number of tokens, so treat these as estimates.</div>`;
+}
 /* ── History -> CLIENTS ── */
 let _clientsMonth='', _clientsData=null, _clientsEdit=false;
 /* Pure: the CLIENTS tab. d = GET /clients, edit = editor open, isPro =
@@ -16410,6 +16618,19 @@ class Handler(BaseHTTPRequestHandler):
             self._get_auditlog()
         elif path_no_qs == "/search_transcripts":
             self._get_search_transcripts()
+        elif path_no_qs == "/model_advice":
+            from urllib.parse import urlparse, parse_qs
+            try:
+                days = int((parse_qs(urlparse(self.path).query).get("days") or ["30"])[0])
+            except ValueError:
+                days = 30
+            days = 30 if days not in (7, 30, 90) else days
+            try:
+                reply = _model_advice(days)
+            except Exception as e:
+                _log_bg_error("model_advice", e)
+                reply = {"error": "model advice failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/cache_stats":
             self._get_cache_stats()
         elif path_no_qs == "/commit_costs":
