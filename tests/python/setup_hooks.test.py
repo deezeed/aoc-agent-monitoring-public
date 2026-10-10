@@ -18,7 +18,8 @@ c = Checker()
 
 def ns_for(aoc_dir="C:\\nowhere"):
     return exec_functions(
-        ["_hook_command", "_is_aoc_hook", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes"],
+        ["_hook_command", "_is_aoc_hook", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes",
+         "PERMISSION_SCRIPT", "PERMISSION_EVENT", "PERMISSION_TIMEOUT_S", "_permission_command", "_merge_permission_hook"],
         {"os": os, "subprocess": subprocess, "HOOK_SPECS": HOOK_SPECS, "HOOKS_DST_DIR": HOOKS_DST_DIR,
          "AOC_DIR": aoc_dir, "TASK_NAME": r"\AOC-test-nonexistent\A",
          "SENTINEL_TASK_NAME": r"\AOC-test-nonexistent\B"},
@@ -111,5 +112,23 @@ finally:
             p.kill()
             p.wait()
     shutil.rmtree(SCRATCH, ignore_errors=True)
+
+# ── PermissionRequest hook (remote approve): own command + timeout ──
+pns = ns_for()
+pcmd = pns["_permission_command"]("C:\\Program Files\\Py\\python.exe")
+c.check("permission command quoted, forward slashes, console python",
+        pcmd == '"C:/Program Files/Py/python.exe" "C:/Users/John Smith/.claude/hooks/aoc_permission.py"')
+s = {"hooks": {"PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine.sh"}]}]}}
+c.check("permission hook added", pns["_merge_permission_hook"](s, pcmd) == "added")
+entries = s["hooks"]["PermissionRequest"]
+c.check("user's own PermissionRequest hook kept", entries[0]["hooks"][0]["command"] == "mine.sh")
+c.check("AOC entry has the long timeout", entries[1]["hooks"][0] == {"type": "command", "command": pcmd, "timeout": 1800})
+c.check("re-run -> unchanged", pns["_merge_permission_hook"](s, pcmd) == "unchanged" and len(entries) == 2)
+c.check("new python -> updated in place",
+        pns["_merge_permission_hook"](s, pcmd.replace("Py", "Py2")) == "updated" and len(entries) == 2)
+c.check("recognized as an AOC hook", pns["_is_aoc_hook"]({"command": pcmd}))
+removed = pns["_remove_hook_entries"](s)
+c.check("uninstall removes only AOC's permission hook",
+        removed == 1 and s["hooks"]["PermissionRequest"] == [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine.sh"}]}])
 
 c.finish()

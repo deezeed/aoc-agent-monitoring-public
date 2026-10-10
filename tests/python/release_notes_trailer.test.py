@@ -31,6 +31,7 @@ git("commit", "-q", "--allow-empty", "-m", "Plain subject only")
 git("commit", "-q", "--allow-empty", "-m", "Refactor _foo internals\n\nBody text.\n\nRelease-note: Faster startup on slow disks")
 git("commit", "-q", "--allow-empty", "-m", "Test-only tweak\n\nRelease-note: skip")
 git("commit", "-q", "--allow-empty", "-m", "Fix a thing\n\nRelease-note: Dashboard: names no longer cut off on phones\nCo-Authored-By: X <x@y>")
+git("commit", "-q", "--allow-empty", "-m", "Two features\n\nRelease-note: First feature\nRelease-note: Second feature")
 raw_file = os.path.join(repo, "raw.txt")
 with open(raw_file, "w", encoding="utf-8") as f:
     f.write(git("log", "--no-merges", f"--format={fmt}", f"{base}..HEAD"))
@@ -44,7 +45,8 @@ lines = [l[5:] for l in out.stdout.splitlines() if l.startswith("LINE:")]
 
 c.check("script ran cleanly", out.returncode == 0)
 c.check("one line per non-skipped commit, newest first",
-        lines == ["Dashboard: names no longer cut off on phones", "Faster startup on slow disks", "Plain subject only"])
+        lines == ["First feature", "Second feature", "Dashboard: names no longer cut off on phones", "Faster startup on slow disks", "Plain subject only"])
+c.check("two trailers = two lines, subject dropped", "Two features" not in lines)
 c.check("trailer replaces the subject", "Refactor _foo internals" not in lines)
 c.check("'skip' drops the commit", "Test-only tweak" not in lines)
 c.check("other trailers (Co-Authored-By) don't leak in", not any("Co-Authored" in l for l in lines))

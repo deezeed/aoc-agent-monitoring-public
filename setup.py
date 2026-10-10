@@ -88,6 +88,12 @@ HOOKS_DST_DIR = os.path.join(os.path.expanduser("~"), ".claude", "hooks")
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 STATUSLINE_SCRIPT = "aoc_statusline.py"
 STATUSLINE_CHAIN_FILE = os.path.join(HOOKS_DST_DIR, "aoc_statusline_chain.json")
+# PermissionRequest hook: holds a permission prompt for the dashboard while
+# you're away (remote approve). Prints its decision on stdout, so like the
+# statusline it runs under python.exe, not via run_hook.pyw/pythonw.
+PERMISSION_SCRIPT = "aoc_permission.py"
+PERMISSION_EVENT = "PermissionRequest"
+PERMISSION_TIMEOUT_S = 1800  # aoc_permission.py gives up holding after 25 min
 
 TASK_NAME = r"\AOC\AOC Watchdog"
 SENTINEL_TASK_NAME = r"\AOC\AOC Sentinel"
@@ -117,7 +123,7 @@ def deploy_hook_scripts(pythonw: str) -> None:
     if not DRY_RUN:
         os.makedirs(HOOKS_DST_DIR, exist_ok=True)
 
-    for src_name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT):
+    for src_name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, PERMISSION_SCRIPT):
         with open(os.path.join(HOOKS_SRC_DIR, src_name), encoding="utf-8") as f:
             content = f.read()
         content = content.replace("__MONITOR_SCRIPT__", MONITOR_SCRIPT.replace("\\", "/"))
@@ -140,7 +146,7 @@ def deploy_hook_scripts(pythonw: str) -> None:
                 f.write(content)
 
     if not DRY_RUN:
-        print(f"[ok] deployed aoc_hook.py + run_hook.pyw + {STATUSLINE_SCRIPT} -> {HOOKS_DST_DIR}")
+        print(f"[ok] deployed aoc_hook.py + run_hook.pyw + {STATUSLINE_SCRIPT} + {PERMISSION_SCRIPT} -> {HOOKS_DST_DIR}")
 
 
 def deploy_cloud_config() -> None:
@@ -245,7 +251,30 @@ def _hook_command(pythonw: str) -> str:
 
 
 def _is_aoc_hook(h: dict) -> bool:
-    return h.get("command", "").replace("\\", "/").rstrip('"').endswith("run_hook.pyw")
+    cmd = h.get("command", "").replace("\\", "/").rstrip('"')
+    return cmd.endswith("run_hook.pyw") or cmd.endswith(PERMISSION_SCRIPT)
+
+
+def _permission_command(python: str) -> str:
+    script = os.path.join(HOOKS_DST_DIR, PERMISSION_SCRIPT).replace("\\", "/")
+    return f'"{python.replace(chr(92), "/")}" "{script}"'
+
+
+def _merge_permission_hook(settings: dict, command: str) -> str:
+    """Pure core: AOC's PermissionRequest entry (own command + timeout).
+    Returns "added", "updated" or "unchanged"."""
+    entries = settings.setdefault("hooks", {}).setdefault(PERMISSION_EVENT, [])
+    for entry in entries:
+        for h in entry.get("hooks", []):
+            if _is_aoc_hook(h):
+                if h.get("command") == command and h.get("timeout") == PERMISSION_TIMEOUT_S:
+                    return "unchanged"
+                h["command"] = command
+                h["timeout"] = PERMISSION_TIMEOUT_S
+                return "updated"
+    entries.append({"matcher": "", "hooks": [{"type": "command", "command": command,
+                                              "timeout": PERMISSION_TIMEOUT_S}]})
+    return "added"
 
 
 def _merge_hook_entries(settings: dict, command: str):
@@ -319,12 +348,17 @@ def _fmt_specs(specs) -> str:
 
 
 def merge_hook_settings(pythonw: str) -> None:
-    """Adds AOC's 4 hook entries to ~/.claude/settings.json without
+    """Adds AOC's hook entries to ~/.claude/settings.json without
     disturbing anything else already there (other hooks, enabledPlugins,
     theme, etc.). Idempotent: re-running never duplicates entries, and
     brings an existing entry's command up to date."""
     settings = _load_settings()
     added, updated = _merge_hook_entries(settings, _hook_command(pythonw))
+    perm = _merge_permission_hook(settings, _permission_command(_find_python_console(pythonw)))
+    if perm == "added":
+        added.append((PERMISSION_EVENT, ""))
+    elif perm == "updated":
+        updated.append((PERMISSION_EVENT, ""))
 
     if DRY_RUN:
         if added:
@@ -414,18 +448,19 @@ def validate() -> None:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             settings = json.load(f)
         events = settings.get("hooks", {})
-        missing = [e for e, _ in HOOK_SPECS if e not in events]
+        missing = [e for e, _ in HOOK_SPECS if e not in events] + \
+                  ([] if PERMISSION_EVENT in events else [PERMISSION_EVENT])
         if missing:
             print(f"[WARN] settings.json missing hook events: {missing}")
         else:
-            print(f"[ok] settings.json has all {len(HOOK_SPECS)} AOC hook events")
+            print(f"[ok] settings.json has all {len(HOOK_SPECS) + 1} AOC hook events")
         sl = settings.get("statusLine")
         print(f"[{'ok' if _is_aoc_statusline(sl) else 'WARN'}] statusLine "
               + ("runs the AOC plan-limit recorder" if _is_aoc_statusline(sl) else "is not AOC's -- the plan-limit meter stays empty"))
     except Exception as e:
         print(f"[FAIL] could not read back settings.json: {e}")
 
-    for fname in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT):
+    for fname in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, PERMISSION_SCRIPT):
         p = os.path.join(HOOKS_DST_DIR, fname)
         print(f"[{'ok' if os.path.exists(p) else 'FAIL'}] {p}")
 
@@ -502,7 +537,7 @@ def uninstall() -> None:
     if sl_changed:
         print("[ok] " + ("restored your previous statusLine" if chain else "removed the AOC statusLine"))
 
-    for name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, os.path.basename(STATUSLINE_CHAIN_FILE)):
+    for name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, PERMISSION_SCRIPT, os.path.basename(STATUSLINE_CHAIN_FILE)):
         try:
             os.remove(os.path.join(HOOKS_DST_DIR, name))
             print(f"[ok] deleted {os.path.join(HOOKS_DST_DIR, name)}")

@@ -3170,6 +3170,143 @@ def _focus_session_terminal(session_id):
     return 200, {"ok": _focus_window(hwnd), "matched": how}
 
 
+# ── Remote approve: answer permission prompts from the dashboard ──────────
+# hooks/aoc_permission.py (a PermissionRequest hook) asks POST
+# /permission/request whether to hold a prompt for the dashboard. Claude
+# Code shows its own terminal dialog only after that hook returns, so the
+# hook holds only while you're away from this PC (mode "away": no keyboard
+# or mouse input for idle_min minutes) or in mode "always"; otherwise it
+# returns at once and the terminal dialog works exactly as before. While it
+# holds, it polls GET /permission/poll -- touching the PC again releases the
+# prompt back to the terminal dialog.
+REMOTE_APPROVE_FILE = os.path.join(AOC_DATA_DIR, "remote_approve.json")
+_PERM_MODES = ("off", "away", "always")
+_PERM_POLL_STALE_S = 15   # no poll for this long = the hook is gone (Esc, session closed)
+_PERM_BACK_IDLE_S = 5     # input this recent while held in "away" mode = you're back
+_perm_lock = threading.Lock()
+_perm_requests = {}       # id -> request dict (see _perm_open)
+
+
+def _sanitize_remote_approve(data) -> dict:
+    data = data if isinstance(data, dict) else {}
+    mode = data.get("mode") if data.get("mode") in _PERM_MODES else "away"
+    try:
+        idle_min = int(data.get("idle_min", 5))
+    except (TypeError, ValueError):
+        idle_min = 5
+    return {"mode": mode, "idle_min": max(1, min(idle_min, 120))}
+
+
+def _load_remote_approve() -> dict:
+    return _sanitize_remote_approve(_load_json_file(REMOTE_APPROVE_FILE, {}))
+
+
+def _save_remote_approve(data) -> dict:
+    cfg = _sanitize_remote_approve(data)
+    os.makedirs(os.path.dirname(REMOTE_APPROVE_FILE), exist_ok=True)
+    with open(REMOTE_APPROVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    return cfg
+
+
+def _perm_should_hold(cfg, idle_s) -> bool:
+    """Pure: hold a new permission prompt for the dashboard?"""
+    if cfg["mode"] == "always":
+        return True
+    if cfg["mode"] == "off" or idle_s is None:
+        return False
+    return idle_s >= cfg["idle_min"] * 60
+
+
+def _perm_summary(tool_name, tool_input):
+    """Pure: (one-line summary, longer detail) of what a tool wants to do."""
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    tool_name = str(tool_name or "?")
+    if tool_name == "Bash":
+        summary = str(ti.get("command") or "")
+        detail = str(ti.get("description") or "")
+    elif tool_name in ("Edit", "MultiEdit", "Write", "Read", "NotebookEdit"):
+        summary = str(ti.get("file_path") or ti.get("notebook_path") or "")
+        if tool_name == "Edit":
+            detail = "- " + str(ti.get("old_string") or "") + "\n+ " + str(ti.get("new_string") or "")
+        elif tool_name == "Write":
+            detail = str(ti.get("content") or "")
+        else:
+            detail = ""
+    elif tool_name in ("WebFetch", "WebSearch"):
+        summary = str(ti.get("url") or ti.get("query") or "")
+        detail = str(ti.get("prompt") or "")
+    else:
+        summary = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)[:60]}" for k, v in list(ti.items())[:3])
+        detail = json.dumps(ti, ensure_ascii=False, indent=1)
+    return f"{tool_name}: {summary}".strip()[:300], detail[:2000]
+
+
+def _perm_expire(now):
+    """Drop requests whose hook stopped polling. Caller holds _perm_lock."""
+    for rid in [r for r, q in _perm_requests.items() if now - q["last_poll"] > _PERM_POLL_STALE_S]:
+        del _perm_requests[rid]
+
+
+def _perm_open(data, cfg, now) -> dict:
+    """POST /permission/request body from the hook -> its reply:
+    {"hold": false} (show the terminal dialog now) or {"hold": true, "id"}."""
+    if not _perm_should_hold(cfg, data.get("idle_s")):
+        return {"hold": False}
+    summary, detail = _perm_summary(data.get("tool_name"), data.get("tool_input"))
+    rid = _secrets.token_hex(8)
+    with _perm_lock:
+        _perm_expire(now)
+        _perm_requests[rid] = {
+            "id": rid, "session_id": str(data.get("session_id") or ""),
+            "tool_name": str(data.get("tool_name") or ""), "summary": summary, "detail": detail,
+            "created": now, "last_poll": now, "state": "pending", "message": "",
+        }
+    return {"hold": True, "id": rid, "summary": summary}
+
+
+def _perm_poll(rid, idle_s, cfg, now) -> dict:
+    """GET /permission/poll from the holding hook -> {"state": pending|allow|
+    deny|release, "message"}. A decided request is handed out once, then gone."""
+    with _perm_lock:
+        req = _perm_requests.get(rid)
+        if not req:
+            return {"state": "release"}
+        req["last_poll"] = now
+        if req["state"] == "pending":
+            if cfg["mode"] == "off" or (cfg["mode"] == "away" and idle_s is not None and idle_s < _PERM_BACK_IDLE_S):
+                req["state"] = "release"
+            else:
+                return {"state": "pending"}
+        del _perm_requests[rid]
+        return {"state": req["state"], "message": req["message"]}
+
+
+def _perm_decide(rid, decision, message="") -> bool:
+    """POST /permission/decide from the dashboard: allow | deny | terminal."""
+    state = {"allow": "allow", "deny": "deny", "terminal": "release"}.get(decision)
+    with _perm_lock:
+        req = _perm_requests.get(rid)
+        if not state or not req or req["state"] != "pending":
+            return False
+        req["state"] = state
+        req["message"] = str(message or "")[:500]
+        return True
+
+
+def _perm_pending_by_session(now) -> dict:
+    """{session_id: [pending requests, oldest first]} for the sessions list."""
+    out = {}
+    with _perm_lock:
+        _perm_expire(now)
+        for q in sorted(_perm_requests.values(), key=lambda q: q["created"]):
+            if q["state"] == "pending":
+                out.setdefault(q["session_id"], []).append(
+                    {"id": q["id"], "tool_name": q["tool_name"], "summary": q["summary"],
+                     "detail": q["detail"], "age_s": int(now - q["created"])})
+    return out
+
+
 def _pid_exe_name(pid) -> str:
     """Return the lowercase exe filename for a live PID ("" if gone) --
     see _snapshot_processes. Runs on every /status computation, hence no
@@ -6744,6 +6881,25 @@ button.le-tag { cursor:pointer; }
 .woy-quote.asked { color:var(--t); }
 .woy-lbl { font:700 8px var(--font2);letter-spacing:.08em;text-transform:uppercase;color:var(--o);margin-right:6px; }
 .sbay > .woy-quote { margin:0 12px 8px; }
+.perm-ask { margin-top:6px;padding:7px 9px;border:1px solid rgba(229,83,75,.45);border-left:3px solid var(--r);
+  background:rgba(229,83,75,.07);border-radius:0 7px 7px 0;font-size:11px;color:var(--t);min-width:0; }
+.sbay > .perm-ask { margin:0 12px 8px; }
+.perm-head { display:flex;align-items:center;gap:8px; }
+.perm-head .woy-lbl { color:var(--r); }
+.perm-more { font:400 9px var(--font2);color:var(--t3); }
+.perm-sum { margin-top:3px;font:400 11px var(--font2);color:var(--t);word-break:break-all;
+  display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden; }
+.perm-detail { margin-top:4px; }
+.perm-detail summary { cursor:pointer;font:400 9px var(--font2);color:var(--t3); }
+.perm-detail pre { margin:4px 0 0;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+  font:400 10px var(--font2);color:var(--t2);background:rgba(0,0,0,.18);padding:6px;border-radius:5px; }
+.perm-btns { display:flex;gap:6px;flex-wrap:wrap;margin-top:7px; }
+.perm-btn { font:700 10px var(--font2);letter-spacing:.04em;padding:6px 12px;min-height:30px;border-radius:6px;cursor:pointer;
+  border:1px solid rgba(var(--c-rgb),.3);background:transparent;color:var(--t); }
+.perm-btn.allow { background:var(--g);border-color:var(--g);color:#0b1a10; }
+.perm-btn.deny { border-color:var(--r);color:var(--r); }
+.perm-btn.term { color:var(--t2); }
+.perm-btn:hover { filter:brightness(1.12); }
 .ctx-meter { display:flex;align-items:center;gap:7px;margin-top:5px;font:400 10px var(--font2);color:var(--t2);min-width:0;flex-wrap:wrap; }
 .ctx-lbl { font:700 8px var(--font2);letter-spacing:.08em;color:var(--t3); }
 .ctx-bar { flex:0 0 72px;height:5px;border-radius:3px;background:rgba(var(--c-rgb),.14);overflow:hidden; }
@@ -7841,6 +7997,25 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
         </div>
 
         <div class="settings-pane" data-pane="notify" style="display:none">
+        <div class="settings-section">REMOTE APPROVE</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Permission prompts</label>
+          <select class="settings-input" id="st-ra-mode" style="width:auto" onchange="_raSave()"
+            title="Where Claude Code's 'Allow this?' prompts go. Claude Code shows its terminal dialog only after AOC lets go of the prompt, so AOC holds it only while you're away.">
+            <option value="away">Dashboard while I'm away</option>
+            <option value="always">Always dashboard first</option>
+            <option value="off">Terminal only</option>
+          </select>
+          <span id="st-ra-idle-wrap" style="display:inline-flex;align-items:center;gap:6px">
+            <span style="color:var(--t3);font-size:11px">away after</span>
+            <input class="settings-input" id="st-ra-idle" type="number" min="1" max="120" style="width:64px" onchange="_raSave()">
+            <span style="color:var(--t3);font-size:11px">min without keyboard or mouse</span>
+          </span>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          Held prompts show <b>Allow</b> / <b>Deny</b> on the session, here and on your phone (remote access).
+          Touch the PC again and the prompt goes back to the terminal dialog.
+        </div>
         <div class="settings-section">NOTIFICATIONS</div>
         <div class="settings-row">
           <label class="settings-lbl">Webhook URL</label>
@@ -8900,7 +9075,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr){
     const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
     return `<div class="td-row${wl.blocked?' blocked':''}">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag${wl.blocked?' blocked':''}">${escHtml(wl.bay)} · ${escHtml(_fmtDurationDHM(Math.max(60,s.waiting_secs||0)))}</span></div>
-        ${text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:''}
+        ${_permAskHtml(s)||(text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:'')}
         ${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
@@ -10017,7 +10192,63 @@ function _waitingSessions(list, minSecs){
       &&(s.waiting_secs||0)>=(_waitLabel(s).blocked?Math.min(minSecs,30):minSecs))
     .sort((a,b)=>(_waitLabel(b).blocked-_waitLabel(a).blocked)||((b.waiting_secs||0)-(a.waiting_secs||0)));
 }
+/* Pure: Allow / Deny for a permission prompt AOC is holding for the
+   dashboard (remote approve: s.perm_requests, see _perm_open). '' if none. */
+function _permAskHtml(s){
+  const reqs=(s&&s.perm_requests)||[];
+  if(!reqs.length) return '';
+  const q=reqs[0];
+  const call=(d)=>`_permDecide(${jsq(s.machine||'')},${jsq(q.id)},'${d}')`;
+  const more=reqs.length>1?`<span class="perm-more">+${reqs.length-1} more after this</span>`:'';
+  const detail=q.detail?`<details class="perm-detail"><summary>Details</summary><pre>${escHtml(q.detail)}</pre></details>`:'';
+  return `<div class="perm-ask" onclick="event.stopPropagation()">
+    <div class="perm-head"><span class="woy-lbl">🔐 Needs your OK</span>${more}</div>
+    <div class="perm-sum">${escHtml(q.summary)}</div>${detail}
+    <div class="perm-btns">
+      <button class="perm-btn allow" onclick="${call('allow')}">Allow</button>
+      <button class="perm-btn deny" onclick="${call('deny')}">Deny…</button>
+      <button class="perm-btn term" onclick="${call('terminal')}" title="Let go of the prompt: Claude Code shows its normal dialog in the terminal">Answer in terminal</button>
+    </div></div>`;
+}
+async function _permDecide(machineName,id,decision){
+  let message='';
+  if(decision==='deny'){
+    const m=prompt('Deny. Tell Claude why, or what to do instead (optional):','');
+    if(m===null) return;
+    message=m;
+  }
+  try{
+    const r=await fetch(_apiUrl(_machineFor(machineName),'/permission/decide'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,decision,message})});
+    const d=await r.json().catch(()=>({}));
+    if(d.ok) showToast('done',decision==='allow'?'Allowed':decision==='deny'?'Denied':'Sent to the terminal','');
+    else showToast('warning','Already answered','This prompt is no longer waiting.');
+  }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
+}
+async function _raLoad(){
+  try{
+    const d=await (await fetch('/permission/settings')).json();
+    const m=document.getElementById('st-ra-mode'), i=document.getElementById('st-ra-idle');
+    if(m) m.value=d.mode||'away';
+    if(i) i.value=d.idle_min||5;
+    _raSyncIdle();
+  }catch(e){}
+}
+function _raSyncIdle(){
+  const m=document.getElementById('st-ra-mode'), w=document.getElementById('st-ra-idle-wrap');
+  if(m&&w) w.style.display=m.value==='away'?'inline-flex':'none';
+}
+async function _raSave(){
+  _raSyncIdle();
+  const mode=document.getElementById('st-ra-mode').value;
+  const idle_min=parseInt(document.getElementById('st-ra-idle').value,10)||5;
+  try{
+    const d=await (await fetch('/permission/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,idle_min})})).json();
+    document.getElementById('st-ra-idle').value=d.idle_min;
+  }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
+}
 function _woyQuoteHtml(s){
+  const ask=_permAskHtml(s);
+  if(ask) return ask;
   const wl=_waitLabel(s);
   if(wl.blocked&&s.waiting_message)
     return `<div class="woy-quote asked blocked" title="${escHtml(wl.tip)}"><div class="woy-q"><span class="woy-lbl">${escHtml(wl.bay)}</span>${escHtml(s.waiting_message)}</div></div>`;
@@ -13820,6 +14051,7 @@ function openSettings(){
   setSettingsTab('cost');  // always reset to the first tab -- simpler than persisting last-used tab
   _authRefresh();
   _renderLicenseUI();
+  _raLoad();
   /* populate inputs */
   const v=n=>document.getElementById(n);
   if(v('st-cost-rate')) v('st-cost-rate').value=_costRate;
@@ -14730,8 +14962,10 @@ def _build_status_payload_uncached() -> dict:
         for k, v in sessions_from_dict.items()
     ]
     _ctx = _context_snapshot([s["id"] for s in active_sessions])
+    _perms = _perm_pending_by_session(time.time())
     for s in active_sessions:
         s["context"] = _ctx.get(s["id"])
+        s["perm_requests"] = _perms.get(s["id"], [])
     # sessions_count: floor at the real claude.exe process count (background
     # scanner, _claude_proc_worker, counts claude.exe processes every 2s). Hook-tracked
     # sessions can under-count — a CLI sitting idle with no fresh heartbeat,
@@ -15026,6 +15260,17 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(_auth_info(), ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/license":
             self._serve(200, "application/json", json.dumps(_license_info(), ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/permission/poll":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                idle_s = float((qs.get("idle") or [""])[0])
+            except ValueError:
+                idle_s = None
+            reply = _perm_poll((qs.get("id") or [""])[0], idle_s, _load_remote_approve(), time.time())
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/permission/settings":
+            self._serve(200, "application/json", json.dumps(_load_remote_approve()).encode(), no_cache=True)
         elif path_no_qs == "/status":
             try:
                 data = _build_status_payload()
@@ -15426,6 +15671,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("focus_session", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs in ("/permission/request", "/permission/decide", "/permission/settings"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/permission/request":
+                    reply = _perm_open(data, _load_remote_approve(), time.time())
+                elif path_no_qs == "/permission/decide":
+                    ok = _perm_decide(str(data.get("id") or ""), data.get("decision"), data.get("message"))
+                    reply = {"ok": ok} if ok else {"ok": False, "error": "no longer waiting"}
+                else:
+                    reply = _save_remote_approve(data)
+                self._serve(200, "application/json", json.dumps(reply).encode())
+            except Exception as e:
+                _log_bg_error("permission", e)
+                self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
 
         elif path_no_qs == "/remove":
             try:
