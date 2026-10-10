@@ -5059,6 +5059,114 @@ def _session_file_diff(path):
     return out[:1_000_000]
 
 
+# ── Launch: start a new Claude Code session from the dashboard ────────────
+# claude.exe is started directly in a new console window (no shell, so a
+# prompt with quotes, & or ; reaches Claude exactly as typed), in a folder
+# you picked, with your prompt as its first message. Its hooks then report
+# it like any session you started yourself. Through the tunnel this works
+# from the phone too -- the same token-protected power as the TERM tab.
+_LAUNCH_MODELS = ("", "opus", "sonnet", "haiku")
+_LAUNCH_MIN_GAP_S = 5
+_launch_last = [0.0]
+
+
+def _launch_validate(data, isdir=os.path.isdir):
+    """Pure-ish: request body -> (args dict, None) or (None, error text)."""
+    if not isinstance(data, dict):
+        return None, "bad request"
+    folder = os.path.normpath(os.path.expanduser(str(data.get("cwd") or "").strip().strip('"'))) \
+        if str(data.get("cwd") or "").strip() else ""
+    if not folder or not os.path.isabs(folder) or not isdir(folder):
+        return None, "pick an existing folder (full path)"
+    prompt = str(data.get("prompt") or "").strip()
+    if len(prompt) > 20000:
+        return None, "prompt too long (20,000 characters max)"
+    model = str(data.get("model") or "").strip().lower()
+    if model not in _LAUNCH_MODELS:
+        return None, "unknown model"
+    return {"cwd": folder, "prompt": prompt, "model": model}, None
+
+
+def _launch_argv(exe, args):
+    """Pure: the claude command line (a list -- never through a shell)."""
+    argv = [exe]
+    if args.get("model"):
+        argv += ["--model", args["model"]]
+    if args.get("prompt"):
+        argv.append(args["prompt"])
+    return argv
+
+
+def _launch_dirs(rows, isdir=os.path.isdir, limit=30):
+    """Pure-ish: [(folder, last_epoch)] -> folders that still exist, newest
+    first, each once (case-insensitive), with a display name."""
+    seen, out = set(), []
+    for folder, epoch in sorted((r for r in rows if r[0]), key=lambda r: -(r[1] or 0)):
+        key = os.path.normcase(os.path.normpath(folder))
+        if key in seen or not isdir(folder):
+            continue
+        seen.add(key)
+        out.append({"path": folder, "name": os.path.basename(folder.rstrip("\\/")) or folder, "last": epoch})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _launch_known_dirs():
+    """Folders Claude Code worked in lately: repos it committed to, session
+    folders, and the AOC dashboard's current project dir."""
+    rows = []
+    if os.path.exists(TRANSCRIPT_INDEX_DB):
+        conn = None
+        try:
+            conn = _transcript_index_connect()
+            rows += conn.execute("""SELECT cwd, MAX(epoch) FROM commits WHERE sha NOT LIKE 'tu:%'
+                                    GROUP BY cwd ORDER BY 2 DESC LIMIT 60""").fetchall()
+            rows += conn.execute("SELECT cwd, MAX(last_call_epoch) FROM sessions_meta GROUP BY cwd ORDER BY 2 DESC LIMIT 60").fetchall()
+        except Exception as e:
+            _log_bg_error("launch dirs", e)
+        finally:
+            if conn is not None:
+                conn.close()
+    return _launch_dirs(rows)
+
+
+def _folder_trusted(folder, config=None):
+    """Did you already accept Claude Code's "trust this folder" dialog for
+    this folder (or a parent)? Read from ~/.claude.json; unknown -> False."""
+    if config is None:
+        config = _load_json_file(os.path.join(os.path.expanduser("~"), ".claude.json"), {})
+    trusted = {k.replace("\\", "/").rstrip("/").casefold()
+               for k, v in ((config or {}).get("projects") or {}).items()
+               if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
+    f = os.path.normpath(folder).replace("\\", "/").rstrip("/").casefold()
+    while f:
+        if f in trusted:
+            return True
+        parent = f.rsplit("/", 1)[0] if "/" in f else ""
+        if parent == f or not parent or parent.endswith(":"):
+            return False
+        f = parent
+    return False
+
+
+def _launch_session(data, now=None, popen=None):
+    """POST /launch -> {"ok", "pid"} or {"ok": False, "error"}."""
+    now = now or time.time()
+    args, err = _launch_validate(data)
+    if err:
+        return {"ok": False, "error": err}
+    if now - _launch_last[0] < _LAUNCH_MIN_GAP_S:
+        return {"ok": False, "error": "one launch every few seconds, please"}
+    exe = _find_claude_exe()
+    if not exe:
+        return {"ok": False, "error": "Claude Code (claude) not found on this PC"}
+    _launch_last[0] = now
+    p = (popen or subprocess.Popen)(_launch_argv(exe, args), cwd=args["cwd"],
+                                    creationflags=0x00000010 if os.name == "nt" else 0)  # CREATE_NEW_CONSOLE
+    return {"ok": True, "pid": p.pid, "cwd": args["cwd"], "trusted": _folder_trusted(args["cwd"])}
+
+
 def _usage_first_sighting(stats: dict, msg_id, request_id) -> bool:
     """True the first time a (message id, request id) pair is seen in this
     session's transcript. Lines without either id are counted (old formats)."""
@@ -7768,6 +7876,26 @@ button.le-tag { cursor:pointer; }
 .perm-btn.deny { border-color:var(--r);color:var(--r); }
 .perm-btn.term { color:var(--t2); }
 .perm-btn:hover { filter:brightness(1.12); }
+.td-head { position:relative; }
+.td-launch { position:absolute;right:0;top:4px;font-size:10px;padding:4px 12px; }
+.ln-box { max-width:620px; }
+.ln-form { display:flex;flex-direction:column;gap:6px; }
+.ln-lbl { font:700 9px var(--font2);letter-spacing:.07em;text-transform:uppercase;color:var(--t3);margin-top:4px; }
+.ln-form .settings-input { width:100%;box-sizing:border-box; }
+.ln-form textarea { resize:vertical;font:400 12px var(--font);line-height:1.45; }
+.ln-chips { display:flex;flex-wrap:wrap;gap:5px; }
+.ln-chip { font:400 10px var(--font2);padding:3px 9px;border-radius:12px;cursor:pointer;background:rgba(var(--c-rgb),.06);
+  border:1px solid rgba(var(--c-rgb),.22);color:var(--t2); }
+.ln-chip.on, .ln-chip:hover { border-color:var(--c);color:var(--c); }
+.ln-none { font-size:10px;color:var(--t3); }
+.ln-row { display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px; }
+.ln-row .ln-lbl { margin:0; }
+.ln-row select { width:auto !important; }
+.ln-err { font-size:11px;color:var(--r); }
+.ln-go { border-color:var(--c);color:var(--c);padding:6px 16px; }
+.ln-go:disabled { opacity:.5; }
+.ln-note { font-size:10px;color:var(--t3);line-height:1.5;margin-top:4px; }
+@media (max-width: 600px) { .td-launch { position:static;margin-top:8px; } }
 .adv-tips { display:flex;flex-direction:column;gap:8px;margin:10px 0 14px; }
 .adv-tip { border:1px solid rgba(var(--c-rgb),.18);border-left:3px solid var(--c);border-radius:0 8px 8px 0;padding:8px 11px;background:rgba(var(--c-rgb),.04); }
 .adv-tip-head { display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--t); }
@@ -10115,7 +10243,8 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
   }).join('');
   const sec=(title,body,empty,extra)=>`<section class="td-card"><h3>${title}${extra||''}</h3>${body||`<div class="td-empty">${empty}</div>`}</section>`;
   return `<div class="td-wrap">
-    <header class="td-head"><h2>${escHtml(dateStr)}</h2><div class="td-facts">${facts.map(f=>`<span>${f}</span>`).join('')}</div></header>
+    <header class="td-head"><h2>${escHtml(dateStr)}</h2><div class="td-facts">${facts.map(f=>`<span>${f}</span>`).join('')}</div>
+      <button class="adp-btn td-launch" onclick="openLaunch()" title="Start a new Claude Code session in a folder, with your first message">+ New session</button></header>
     <div class="td-grid">
       <div class="td-col">
         ${sec(`Needs you${waiting.length?` <span class="td-count">${waiting.length}</span>`:''}`, waitRows, 'Nothing is waiting on you.')}
@@ -12894,6 +13023,63 @@ function _setCommitView(sort, all){
   if(body&&_lastCommitData) body.innerHTML=_commitReportHtml(_lastCommitData, _commitSort, _commitShowAll);
 }
 /* Pure: /commit_costs response -> report HTML. */
+/* ── Launch a new Claude Code session ── */
+/* Pure: the New session form. dirs = /launch/dirs, machines = [{name,label}]. */
+function _launchFormHtml(dirs, machines, machine){
+  const chips=(dirs||[]).slice(0,8).map(d=>`<button type="button" class="ln-chip" onclick="_launchPick(this)" data-path="${escHtml(d.path)}" title="${escHtml(d.path)}">${escHtml(d.name)}</button>`).join('');
+  const machineSel=(machines||[]).length>1?`<label class="ln-lbl">Run on</label>
+    <select id="ln-machine" class="settings-input" onchange="_launchLoadDirs(this.closest('.diff-overlay'), this.value)">${machines.map(m=>`<option value="${escHtml(m.name)}"${m.name===machine?' selected':''}>${escHtml(m.label)}</option>`).join('')}</select>`:'';
+  return `<form class="ln-form" onsubmit="event.preventDefault();_launchSubmit(this)">
+    ${machineSel}
+    <label class="ln-lbl" for="ln-cwd">Folder</label>
+    <input id="ln-cwd" class="settings-input" list="ln-dirs" placeholder="C:\\path\\to\\project" autocomplete="off" required>
+    <datalist id="ln-dirs">${(dirs||[]).map(d=>`<option value="${escHtml(d.path)}"></option>`).join('')}</datalist>
+    <div class="ln-chips">${chips||'<span class="ln-none">Folders Claude Code worked in lately show up here.</span>'}</div>
+    <label class="ln-lbl" for="ln-prompt">First message</label>
+    <textarea id="ln-prompt" class="settings-input" rows="5" placeholder="What should Claude do? (optional)" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_launchSubmit(this.form)}"></textarea>
+    <div class="ln-row"><label class="ln-lbl" for="ln-model">Model</label>
+      <select id="ln-model" class="settings-input"><option value="">Default</option><option value="opus">Opus</option><option value="sonnet">Sonnet</option><option value="haiku">Haiku</option></select>
+      <span style="flex:1"></span><span class="ln-err" id="ln-err"></span>
+      <button type="submit" class="adp-btn ln-go">Start session</button></div>
+    <div class="ln-note">Opens a new terminal window on that PC. With Remote approve on, its permission prompts reach you here while you're away.</div>
+  </form>`;
+}
+function _launchMachines(){
+  return [{name:'',label:'This PC'}].concat((typeof _remoteMachines!=='undefined'?_remoteMachines:[]).map(m=>({name:m.name,label:m.name})));
+}
+async function _launchLoadDirs(o, machine){
+  if(!o) return;
+  let dirs=[];
+  try{ dirs=(await fetch(_apiUrl(_machineFor(machine),'/launch/dirs')).then(r=>r.json())).dirs||[]; }catch(e){}
+  const keep=(o.querySelector('#ln-prompt')||{}).value||'';
+  o.querySelector('.chg-body').innerHTML=_launchFormHtml(dirs, _launchMachines(), machine);
+  o.querySelector('#ln-prompt').value=keep;
+  o.dataset.machine=machine||'';
+}
+function openLaunch(){
+  const o=_overlay('New Claude Code session', _launchFormHtml([], _launchMachines(), ''), 'chg-box ln-box');
+  _launchLoadDirs(o, '');
+}
+function _launchPick(btn){
+  const f=btn.closest('form');
+  f.querySelector('#ln-cwd').value=btn.dataset.path;
+  f.querySelectorAll('.ln-chip').forEach(b=>b.classList.toggle('on', b===btn));
+  f.querySelector('#ln-prompt').focus();
+}
+async function _launchSubmit(form){
+  const o=form.closest('.diff-overlay');
+  const machine=(o&&o.dataset.machine)||'';
+  const err=form.querySelector('#ln-err');
+  const go=form.querySelector('.ln-go');
+  go.disabled=true; err.textContent='';
+  try{
+    const d=await fetch(_apiUrl(_machineFor(machine),'/launch'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cwd:form.querySelector('#ln-cwd').value, prompt:form.querySelector('#ln-prompt').value, model:form.querySelector('#ln-model').value})}).then(r=>r.json());
+    if(d.ok){ o.remove(); showToast('done','Session started', d.trusted===false?'New folder: accept "trust this folder" in the new window first.':'It shows up here in a few seconds.', d.trusted===false?12000:5000); }
+    else err.textContent=d.error||'Could not start it.';
+  }catch(e){ err.textContent='Could not reach AOC.'; }
+  go.disabled=false;
+}
 /* ── History -> MODELS ── */
 let _adviceDays=30;
 /* Pure: the MODELS tab from GET /model_advice. */
@@ -16618,6 +16804,9 @@ class Handler(BaseHTTPRequestHandler):
             self._get_auditlog()
         elif path_no_qs == "/search_transcripts":
             self._get_search_transcripts()
+        elif path_no_qs == "/launch/dirs":
+            self._serve(200, "application/json", json.dumps({"dirs": _launch_known_dirs()}, ensure_ascii=False).encode(),
+                        no_cache=True)
         elif path_no_qs == "/model_advice":
             from urllib.parse import urlparse, parse_qs
             try:
@@ -16960,6 +17149,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("focus_session", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs == "/launch":
+            try:
+                reply = _launch_session(json.loads(body or b"{}"))
+            except Exception as e:
+                _log_bg_error("launch", e)
+                reply = {"ok": False, "error": "could not start Claude Code"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
 
         elif path_no_qs == "/clients":
             try:
