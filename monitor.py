@@ -4582,6 +4582,17 @@ def _loop_tool_key(name, inp):
     return f"{name}: {args}"[:220], ""
 
 
+_GIT_COMMIT_RE = re.compile(r"\bgit\b[^\n|;&]*?\scommit\b")
+
+
+def _is_commit_call(name, inp):
+    """Pure: a shell tool call that runs `git commit` (anywhere in a long
+    command line, e.g. `cd x && git add -A && git commit -m ...`)."""
+    if name not in ("Bash", "PowerShell") or not isinstance(inp, dict):
+        return False
+    return bool(_GIT_COMMIT_RE.search(str(inp.get("command") or "")))
+
+
 def _loop_track(stats, obj):
     """Feed one transcript line into stats["loop_ring"] (main thread only)."""
     if not isinstance(obj, dict) or obj.get("isSidechain"):
@@ -4593,7 +4604,8 @@ def _loop_track(stats, obj):
         for b in content:
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") not in ("Agent", "Task"):
                 key, path = _loop_tool_key(b.get("name"), b.get("input"))
-                ring.append({"id": b.get("id", ""), "key": key, "file": path, "err": None})
+                ring.append({"id": b.get("id", ""), "key": key, "file": path, "err": None,
+                             "commit": _is_commit_call(b.get("name"), b.get("input"))})
         del ring[:-_LOOP_RING_MAX]
     elif t == "user":
         results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
@@ -4606,7 +4618,7 @@ def _loop_track(stats, obj):
             for e in reversed(ring):
                 if e["id"] and e["id"] == r.get("tool_use_id"):
                     e["err"] = bool(r.get("is_error"))
-                    if not e["err"] and e["key"].startswith("Bash: ") and "git commit" in e["key"]:
+                    if not e["err"] and e.get("commit"):
                         ring.clear()  # committed: progress
                     break
 
@@ -4643,6 +4655,253 @@ def _loop_signal(ring):
         return {"kind": "edit_loop", "count": n,
                 "text": f"{name} edited {n}× with {errors} failures in between, no commit"}
     return None
+
+
+# ── "While you were away": what a session did since your last message ─────
+# The scanner counts tool calls / failures / commits / edited files since
+# your last message to each session (_activity_track, cheap, every scan).
+# On Today, sessions with real activity since then get a short recap written
+# by Claude Haiku through your own Claude Code login (`claude -p`, no tools,
+# hooks off, nothing saved -- about 1 cent), cached per session until it
+# has done more (_recap_get).
+RECAP_SETTINGS_FILE = os.path.join(AOC_DATA_DIR, "recap.json")
+RECAP_CACHE_FILE = os.path.join(AOC_DATA_DIR, "recaps.json")
+_RECAP_MODES = ("auto", "click", "off")
+_RECAP_MIN_AWAY_S = 15 * 60     # your last message at least this long ago...
+_RECAP_MIN_TOOLS = 3            # ...and at least this many tool calls since
+_RECAP_REFRESH_S = 10 * 60      # don't re-summarize one session more often
+_RECAP_DIGEST_MAX = 12000
+_recap_lock = threading.Lock()
+_recap_busy = set()             # session ids being summarized right now
+
+
+def _human_text(obj):
+    """Pure: the text of a line YOU wrote to the main thread, else None
+    (tool results, meta/system lines and subagent lines are not you)."""
+    if not isinstance(obj, dict) or obj.get("type") != "user" or obj.get("isMeta") or obj.get("isSidechain"):
+        return None
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return None
+
+
+def _activity_track(stats, obj, now):
+    """Feed one transcript line into stats["activity"]: counters since your
+    last message to this session."""
+    act = stats.setdefault("activity", {"since": 0, "tools": 0, "errors": 0, "commits": 0, "files": [], "pending": {}})
+    if _human_text(obj) is not None:
+        act.update({"since": _iso_to_epoch(obj.get("timestamp")) or now, "tools": 0, "errors": 0,
+                    "commits": 0, "files": [], "pending": {}})
+        return
+    if not isinstance(obj, dict) or obj.get("isSidechain"):
+        return
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        if obj.get("type") == "assistant" and b.get("type") == "tool_use":
+            act["tools"] += 1
+            key, path = _loop_tool_key(b.get("name"), b.get("input"))
+            if path and path not in act["files"]:
+                act["files"] = (act["files"] + [path])[-50:]
+            if _is_commit_call(b.get("name"), b.get("input")):
+                act["pending"][b.get("id", "")] = "commit"
+        elif obj.get("type") == "user" and b.get("type") == "tool_result":
+            if b.get("is_error"):
+                act["errors"] += 1
+            elif act["pending"].pop(b.get("tool_use_id", ""), None) == "commit":
+                act["commits"] += 1
+            act["pending"].pop(b.get("tool_use_id", ""), None)
+
+
+def _activity_view(act, now):
+    """Pure: the public "since your last message" summary, or None if the
+    session hasn't done enough on its own to be worth a recap."""
+    if not act or not act.get("since") or now - act["since"] < _RECAP_MIN_AWAY_S \
+            or act.get("tools", 0) < _RECAP_MIN_TOOLS:
+        return None
+    return {"since": act["since"], "tools": act["tools"], "errors": act["errors"],
+            "commits": act["commits"], "files": len(act.get("files") or [])}
+
+
+def _recap_digest(lines, max_chars=_RECAP_DIGEST_MAX):
+    """Pure: compact text of what happened after your last message in these
+    transcript lines (your message, Claude's words, each tool call with its
+    failures), middle cut if too long. "" if you never wrote anything."""
+    objs = []
+    for line in lines:
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(o, dict) and not o.get("isSidechain"):
+            objs.append(o)
+    start = next((i for i in range(len(objs) - 1, -1, -1) if _human_text(objs[i]) is not None), None)
+    if start is None:
+        return ""
+    out = ["YOU: " + _human_text(objs[start]).strip()[:800]]
+    names = {}
+    for o in objs[start + 1:]:
+        content = (o.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if o.get("type") == "assistant" and b.get("type") == "text" and (b.get("text") or "").strip():
+                out.append("CLAUDE: " + " ".join(b["text"].split())[:400])
+            elif o.get("type") == "assistant" and b.get("type") == "tool_use":
+                key = _loop_tool_key(b.get("name"), b.get("input"))[0]
+                names[b.get("id", "")] = key
+                out.append("-> " + key[:160])
+            elif o.get("type") == "user" and b.get("type") == "tool_result" and b.get("is_error"):
+                c = b.get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                out.append("   FAILED: " + " ".join(str(c or "").split())[:200])
+    last = _assistant_text(next((o for o in reversed(objs) if _assistant_text(o)), None), limit=1500)
+    if last:
+        out.append("CLAUDE'S LAST MESSAGE: " + last)
+    text = "\n".join(out)
+    if len(text) > max_chars:
+        head = max_chars // 4
+        text = text[:head] + "\n[... middle cut ...]\n" + text[-(max_chars - head):]
+    return text
+
+
+_RECAP_INSTRUCTION = (
+    "Below is a log of a Claude Code session since its owner's last message (YOU), who has been "
+    "away. Write a recap for them: 2-4 short bullet points (start each with '- '). Say what got done, "
+    "the state now (tests passing? committed? pushed? finished or still going?), and anything that "
+    "needs them (errors, a question, a decision). Later lines override earlier ones: describe the "
+    "final state, never both versions. Plain text only: no markdown, no bold, no backticks. Plain words, no preamble, no headings. Write in the "
+    "same language as the YOU message.")
+
+
+def _find_claude_exe():
+    """claude.exe for `claude -p`: the npm wrapper's real binary (a .cmd
+    would mangle the empty --tools argument), the native installer's, or
+    whatever is on PATH."""
+    import shutil
+    found = shutil.which("claude")
+    if found and found.lower().endswith((".cmd", ".bat", ".ps1")) or (found and not os.path.splitext(found)[1]):
+        exe = os.path.join(os.path.dirname(found), "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe")
+        if os.path.exists(exe):
+            return exe
+    native = os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe")
+    if os.path.exists(native):
+        return native
+    return found
+
+
+def _run_haiku(prompt, stdin_text, timeout=120):
+    """-> (text, cost_usd). `claude -p` with Haiku, no tools, hooks off (our
+    own hooks would otherwise register it as a session), not saved."""
+    exe = _find_claude_exe()
+    if not exe:
+        raise RuntimeError("Claude Code (claude) not found")
+    r = subprocess.run(
+        [exe, "-p", "--model", "haiku", "--no-session-persistence", "--tools", "",
+         "--settings", '{"disableAllHooks": true}', "--output-format", "json", prompt],
+        input=stdin_text.encode("utf-8"), capture_output=True, timeout=timeout,
+        cwd=AOC_DATA_DIR if os.path.isdir(AOC_DATA_DIR) else None,
+        creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW
+    try:
+        d = json.loads(r.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        raise RuntimeError((r.stderr.decode("utf-8", "replace") or "no output").strip()[:200])
+    if d.get("is_error") or not (d.get("result") or "").strip():
+        raise RuntimeError(str(d.get("result") or "empty answer")[:200])
+    return d["result"].strip(), float(d.get("total_cost_usd") or 0)
+
+
+def _load_recap_settings():
+    d = _load_json_file(RECAP_SETTINGS_FILE, {})
+    mode = d.get("mode") if isinstance(d, dict) and d.get("mode") in _RECAP_MODES else "auto"
+    return {"mode": mode}
+
+
+def _save_recap_settings(data):
+    mode = data.get("mode") if isinstance(data, dict) and data.get("mode") in _RECAP_MODES else "auto"
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    with open(RECAP_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"mode": mode}, f)
+    return {"mode": mode}
+
+
+def _recap_cached(sid):
+    d = _load_json_file(RECAP_CACHE_FILE, {})
+    return (d if isinstance(d, dict) else {}).get(sid)
+
+
+def _recap_store(sid, entry):
+    with _recap_lock:
+        d = _load_json_file(RECAP_CACHE_FILE, {})
+        d = d if isinstance(d, dict) else {}
+        d[sid] = entry
+        # keep the 200 newest
+        d = dict(sorted(d.items(), key=lambda kv: kv[1].get("generated_at", 0))[-200:])
+        os.makedirs(AOC_DATA_DIR, exist_ok=True)
+        tmp = RECAP_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, RECAP_CACHE_FILE)
+
+
+def _recap_needs_refresh(cached, since, size, now, force):
+    """Pure: summarize again? Not while nothing new happened; not more often
+    than _RECAP_REFRESH_S unless asked (force) -- and never when nothing new."""
+    if not cached or cached.get("since") != since:
+        return True
+    if cached.get("size") == size:
+        return False
+    return force or now - cached.get("generated_at", 0) >= _RECAP_REFRESH_S
+
+
+def _recap_get(sid, force=False, run=None, now=None):
+    """GET /recap: {"ok", "text", "generated_at", "cost", "fresh"} for a
+    session's activity since your last message; summarizes (blocking,
+    a few seconds) when needed. run = the summarizer (tests swap it)."""
+    now = now or time.time()
+    with _transcript_cursors_lock:
+        cur = dict(_transcript_cursors.get(sid) or {})
+    path = cur.get("path")
+    act = (cur.get("stats") or {}).get("activity") or {}
+    if not path or not os.path.exists(path):
+        return {"ok": False, "error": "no transcript for this session"}
+    size = os.path.getsize(path)
+    cached = _recap_cached(sid)
+    if not _recap_needs_refresh(cached, act.get("since"), size, now, force):
+        return {"ok": True, **cached, "fresh": False}
+    with _recap_lock:
+        if sid in _recap_busy:
+            return {"ok": False, "busy": True, "error": "already summarizing"}
+        _recap_busy.add(sid)
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 4 * 1024 * 1024))  # the last 4 MB is plenty
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        digest = _recap_digest(lines)
+        if not digest:
+            return {"ok": False, "error": "nothing to summarize yet"}
+        text, cost = (run or _run_haiku)(_RECAP_INSTRUCTION, digest)
+        entry = {"text": text[:2000], "cost": round(cost, 4), "generated_at": now,
+                 "since": act.get("since"), "size": size}
+        _recap_store(sid, entry)
+        return {"ok": True, **entry, "fresh": True}
+    except Exception as e:
+        _log_bg_error("recap", e)
+        return {"ok": False, "error": str(e)[:200]}
+    finally:
+        with _recap_lock:
+            _recap_busy.discard(sid)
 
 
 def _usage_first_sighting(stats: dict, msg_id, request_id) -> bool:
@@ -4752,6 +5011,7 @@ def _transcript_scanner_worker():
                             continue
                         t = obj.get("type")
                         _loop_track(stats, obj)
+                        _activity_track(stats, obj, now)
                         _ql = obj.get("quotaLimits")
                         if isinstance(_ql, dict) and _ql.get("status") == "rejected":
                             _record_rate_limit_hit(_ql.get("rateLimitType"), _ql.get("resetsAt"),
@@ -4976,6 +5236,9 @@ def _transcript_scanner_worker():
                         if stats.get("last_message"):
                             sess["last_message"] = stats["last_message"]
                         sess["loop"] = stats.get("loop")
+                        _act = stats.get("activity") or {}
+                        sess["activity_raw"] = {k: _act.get(k, 0) for k in ("since", "tools", "errors", "commits")}
+                        sess["activity_raw"]["files"] = list(_act.get("files") or [])
                         if ai_title:
                             # Self-heals an already-corrupted stored value, not
                             # just "set if missing" -- the previous version of
@@ -7020,6 +7283,18 @@ button.le-tag { cursor:pointer; }
 .perm-btn.deny { border-color:var(--r);color:var(--r); }
 .perm-btn.term { color:var(--t2); }
 .perm-btn:hover { filter:brightness(1.12); }
+.td-away { margin-top:6px;padding:6px 9px;border-left:2px solid rgba(var(--c-rgb),.45);background:rgba(var(--c-rgb),.05);border-radius:0 6px 6px 0; }
+.td-away-head { display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px;font:400 10px var(--font2);color:var(--t2); }
+.td-away-lbl { font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:9px;color:var(--c); }
+.td-recap-btn { margin-left:auto;font:700 9px var(--font2);letter-spacing:.05em;padding:3px 9px;border-radius:5px;cursor:pointer;
+  background:transparent;color:var(--c);border:1px solid rgba(var(--c-rgb),.4); }
+.td-recap-btn:disabled { opacity:.5;cursor:default; }
+.td-recap code { font:400 11px var(--font2);background:rgba(var(--c-rgb),.1);padding:0 3px;border-radius:3px; }
+.td-recap { margin:6px 0 0;padding:0 0 0 16px;font-size:12px;line-height:1.5;color:var(--t); }
+div.td-recap { padding:0; }
+.td-recap li { margin:1px 0; }
+.td-recap-note { margin-top:5px;font:400 10px var(--font2);color:var(--t3); }
+.td-recap-note.err { color:var(--o); }
 .loop-flag { display:flex;align-items:baseline;gap:7px;margin-top:5px;padding:3px 8px;border-radius:5px;min-width:0;
   background:rgba(224,161,58,.09);border:1px solid rgba(224,161,58,.35);font-size:11px;color:var(--t); }
 .loop-lbl { flex-shrink:0;font:700 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o); }
@@ -8141,6 +8416,19 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
           Held prompts show <b>Allow</b> / <b>Deny</b> on the session, here and on your phone (remote access).
           Touch the PC again and the prompt goes back to the terminal dialog.
         </div>
+        <div class="settings-section">AWAY RECAPS</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Recap on Today</label>
+          <select class="settings-input" id="st-recap-mode" style="width:auto" onchange="_recapSaveMode()"
+            title="A short recap of what a session did since your last message, written by Claude Haiku through your own Claude Code login (about 1 cent each).">
+            <option value="auto">Summarize automatically</option>
+            <option value="click">Summarize when I click</option>
+            <option value="off">Off (counts only)</option>
+          </select>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          For sessions you last wrote to 15+ minutes ago that kept working: what they did since, in a few bullets. Redone only after the session did more.
+        </div>
         <div class="settings-section">NOTIFICATIONS</div>
         <div class="settings-row">
           <label class="settings-lbl">Webhook URL</label>
@@ -9165,12 +9453,72 @@ async function renderToday(sr){
     try{ _todayCommits=await fetch('/commit_costs?days=1').then(r=>r.json()); }catch(e){}
   }
   if(currentView!=='today') return;
-  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr());
+  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr(), _recaps, _recapMode);
   if(el.innerHTML!==html) el.innerHTML=html;
+  _recapAuto(sr);
+}
+/* "While you were away" recaps, keyed by machine|session id:
+   {text, generated_at, cost, loading, error, asked_at}. */
+const _recaps={};
+let _recapMode=null, _recapInFlight=false;
+function _recapKey(s){ return (s.machine||'')+'|'+s.id; }
+async function _recapLoad(id, machineName, force){
+  const s={id, machine:machineName};
+  const k=_recapKey(s);
+  const cur=_recaps[k]||{};
+  _recaps[k]={...cur, loading:true, error:'', asked_at:Date.now()};
+  if(lastStatus) renderToday(lastStatus);
+  _recapInFlight=true;
+  try{
+    const d=await fetch(_apiUrl(_machineFor(machineName),'/recap?session_id='+encodeURIComponent(id)+(force?'&force=1':''))).then(r=>r.json());
+    _recaps[k]=d.ok?{text:d.text, generated_at:d.generated_at, cost:d.cost, asked_at:Date.now()}
+      :{...cur, loading:false, error:d.busy?'':(d.error||'failed'), asked_at:Date.now()};
+  }catch(e){ _recaps[k]={...cur, loading:false, error:'Could not reach AOC', asked_at:Date.now()}; }
+  _recapInFlight=false;
+  if(lastStatus) renderToday(lastStatus);
+}
+/* Auto mode: one request at a time, each session at most once a minute
+   (the server answers from its cache unless the session did more). */
+async function _recapAuto(sr){
+  if(_recapMode===null){
+    _recapMode='loading';
+    try{ _recapMode=(await fetch('/recap/settings').then(r=>r.json())).mode||'auto'; }catch(e){ _recapMode='auto'; }
+  }
+  if(_recapMode!=='auto'||_recapInFlight) return;
+  const next=((sr&&sr.sessions_list)||[]).filter(s=>s&&s.away&&s.session_active!==false)
+    .find(s=>{ const r=_recaps[_recapKey(s)]; return !r||(!r.loading&&Date.now()-(r.asked_at||0)>60000); });
+  if(next) _recapLoad(next.id, next.machine||'', false);
+}
+/* Pure: "while you were away" block inside a session's Today row: what
+   it did since your last message, and the Haiku recap (r = _recaps entry
+   or undefined). '' unless the scanner flagged it (s.away). */
+function _awayBlockHtml(s, r, nowS, mode){
+  const a=s&&s.away;
+  if(!a) return '';
+  const ago=_fmtDurationDHM(Math.max(60,nowS-(a.since||nowS)));
+  const facts=[`${a.tools} tool call${a.tools===1?'':'s'}`,
+    a.commits?`${a.commits} commit${a.commits===1?'':'s'}`:'',
+    a.errors?`${a.errors} failed`:'',
+    a.files?`${a.files} file${a.files===1?'':'s'} edited`:''].filter(Boolean).join(' · ');
+  const md=t=>escHtml(t).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`]+)`/g,'<code>$1</code>');
+  let body='';
+  if(r&&r.text){
+    const lines=String(r.text).split(/\n+/).map(l=>l.trim()).filter(Boolean);
+    const bullets=lines.every(l=>/^[-*•]\s/.test(l));
+    body=bullets?`<ul class="td-recap">${lines.map(l=>`<li>${md(l.replace(/^[-*•]\s+/,''))}</li>`).join('')}</ul>`
+      :`<div class="td-recap">${md(lines.join(' '))}</div>`;
+  }
+  if(r&&r.loading) body+=`<div class="td-recap-note">Summarizing…</div>`;
+  else if(r&&r.error) body+=`<div class="td-recap-note err">${escHtml(r.error)}</div>`;
+  const call=`_recapLoad(${jsq(s.id)},${jsq(s.machine||'')},true)`;
+  const button=mode==='off'?'':`<button class="td-recap-btn" onclick="${call}" title="Summarize what it did since your last message (Claude Haiku, about 1 cent)"${r&&r.loading?' disabled':''}>${r&&r.text?'Refresh':'Summarize'}</button>`;
+  return `<div class="td-away"><div class="td-away-head"><span class="td-away-lbl">Since your message ${escHtml(ago)} ago</span><span>${escHtml(facts)}</span>${button}</div>${body}</div>`;
 }
 /* Pure: the TODAY view. sr = /status, an = /analytics, cm = /commit_costs
-   stats for today (or null), nowS = epoch s, todayStr = local YYYY-MM-DD. */
-function _todayHtml(sr, an, cm, nowS, todayStr){
+   stats for today (or null), nowS = epoch s, todayStr = local YYYY-MM-DD,
+   recaps = _recaps, recapMode = auto|click|off. */
+function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
+  const awayOf=s=>_awayBlockHtml(s, (recaps||{})[(s.machine||'')+'|'+s.id], nowS, recapMode||'auto');
   sr=sr||{}; an=an||{};
   const money=v=>'$'+(Number(v)||0).toFixed(2);
   const nameOf=s=>s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||String(s.id||'').slice(0,8);
@@ -9201,7 +9549,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr){
     return `<div class="td-row${wl.blocked?' blocked':''}">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag${wl.blocked?' blocked':''}">${escHtml(wl.bay)} · ${escHtml(_fmtDurationDHM(Math.max(60,s.waiting_secs||0)))}</span></div>
         ${_permAskHtml(s)||(text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:'')}
-        ${_loopBadgeHtml(s)}${_ctxMeterHtml(s, nowS)}</div>
+        ${_loopBadgeHtml(s)}${awayOf(s)}${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
   const workRows=working.map(s=>{
@@ -9210,7 +9558,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr){
     return `<div class="td-row">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag run">Working${n?` · ${n} agent${n===1?'':'s'}`:''}</span></div>
         <div class="td-sub">${[model, s.estimated_cost?money(s.estimated_cost):''].filter(Boolean).map(escHtml).join(' · ')}</div>
-        ${_loopBadgeHtml(s)}${_ctxMeterHtml(s, nowS)}</div>
+        ${_loopBadgeHtml(s)}${awayOf(s)}${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
   const lim=((sr.rate_limits||{}).windows||[]).filter(w=>w.status!=='reset'&&typeof w.pct==='number').map(w=>{
@@ -10349,6 +10697,12 @@ async function _permDecide(machineName,id,decision){
     else showToast('warning','Already answered','This prompt is no longer waiting.');
   }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
 }
+async function _recapSaveMode(){
+  const mode=document.getElementById('st-recap-mode').value;
+  try{ _recapMode=(await fetch('/recap/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})}).then(r=>r.json())).mode; }
+  catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
+  if(lastStatus&&currentView==='today') renderToday(lastStatus);
+}
 async function _raLoad(){
   try{
     const d=await (await fetch('/permission/settings')).json();
@@ -10356,6 +10710,8 @@ async function _raLoad(){
     if(m) m.value=d.mode||'away';
     if(i) i.value=d.idle_min||5;
     _raSyncIdle();
+    const rm=document.getElementById('st-recap-mode');
+    if(rm) rm.value=(await (await fetch('/recap/settings')).json()).mode||'auto';
   }catch(e){}
 }
 function _raSyncIdle(){
@@ -15090,6 +15446,7 @@ def _build_status_payload_uncached() -> dict:
          "waiting_message": v.get("waiting_message", "") if v.get("waiting_on_you") else "",
          "last_message": v.get("last_message", ""),
          "loop": v.get("loop") if _session_really_active(v, now_epoch) else None,
+         "away": _activity_view(v.get("activity_raw"), now_epoch),
          "note": v.get("note", ""),
          "pr_url": _pr_link_cache_snapshot.get(v.get("git_branch", ""), {}).get("url"),
          "waiting_secs": _compute_waiting_secs(v, now_epoch)}
@@ -15405,6 +15762,18 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/permission/settings":
             self._serve(200, "application/json", json.dumps(_load_remote_approve()).encode(), no_cache=True)
+        elif path_no_qs == "/recap":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            sid = (qs.get("session_id") or [""])[0]
+            force = (qs.get("force") or ["0"])[0] == "1"
+            if _load_recap_settings()["mode"] == "off" and not force:
+                reply = {"ok": False, "error": "recaps are off"}
+            else:
+                reply = _recap_get(sid, force=force)
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/recap/settings":
+            self._serve(200, "application/json", json.dumps(_load_recap_settings()).encode(), no_cache=True)
         elif path_no_qs == "/status":
             try:
                 data = _build_status_payload()
@@ -15805,6 +16174,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("focus_session", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs == "/recap/settings":
+            try:
+                reply = _save_recap_settings(json.loads(body or b"{}"))
+                self._serve(200, "application/json", json.dumps(reply).encode())
+            except Exception:
+                self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
 
         elif path_no_qs in ("/permission/request", "/permission/decide", "/permission/settings"):
             try:

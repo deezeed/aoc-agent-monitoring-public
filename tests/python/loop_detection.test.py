@@ -2,7 +2,7 @@
 _loop_signal), fed with real transcript-shaped lines: failure streaks, the
 same call failing again and again, the edit -> run -> fail cycle on one
 file, and what counts as progress (your message, a successful commit)."""
-import sys, os, json
+import sys, os, json, re
 
 sys.path.insert(0, os.path.dirname(__file__))
 from lib.extract import exec_functions
@@ -10,8 +10,8 @@ from lib.check import Checker
 
 c = Checker()
 ns = exec_functions(["_LOOP_RING_MAX", "_LOOP_ERROR_STREAK", "_LOOP_SAME_FAIL", "_LOOP_FILE_EDITS",
-                     "_LOOP_FILE_ERRORS", "_LOOP_EDIT_TOOLS", "_loop_tool_key", "_loop_track", "_loop_signal"],
-                    {"json": json})
+                     "_LOOP_FILE_ERRORS", "_LOOP_EDIT_TOOLS", "_loop_tool_key", "_GIT_COMMIT_RE", "_is_commit_call", "_loop_track", "_loop_signal"],
+                    {"json": json, "re": re})
 track, signal, key = ns["_loop_track"], ns["_loop_signal"], ns["_loop_tool_key"]
 n = [0]
 
@@ -99,6 +99,19 @@ for i in range(5):
     call(st, "Bash", {"command": "make"}, err=True)
 call(st, "Bash", {"command": "git commit -m x"}, err=True)
 c.check("failed commit is no progress", signal(st["loop_ring"])["kind"] == "errors")
+for i in range(5):
+    call(st, "Bash", {"command": "make"}, err=True)
+call(st, "Bash", {"command": 'cd "C:/very/long/path/' + "x" * 250 + '"; git add -A && git commit -q -F - <<EOF\nmsg\nEOF'}, err=False)
+c.check("commit at the end of a 300-char command still counts", st["loop_ring"] == [])
+for i in range(5):
+    call(st, "PowerShell", {"command": "npm test"}, err=True)
+call(st, "PowerShell", {"command": 'Set-Location x; git commit -q -m "fix"'}, err=False)
+c.check("PowerShell commit counts", st["loop_ring"] == [])
+
+isc = ns["_is_commit_call"]
+c.check("commit detection", isc("Bash", {"command": "git commit -m x"}) and isc("Bash", {"command": "git -C repo commit"})
+        and not isc("Bash", {"command": "git status"}) and not isc("Read", {"command": "git commit"})
+        and not isc("Bash", {"command": "echo committed"}) and not isc("Bash", None))
 
 # subagents and pending calls
 st = {}
