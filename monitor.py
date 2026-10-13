@@ -3292,6 +3292,11 @@ def _perm_open(data, cfg, now) -> dict:
             "tool_name": str(data.get("tool_name") or ""), "summary": summary, "detail": detail,
             "created": now, "last_poll": now, "state": "pending", "message": "",
         }
+    try:
+        _push_notify(f"🔐 {_push_session_name(data.get('session_id'))} needs your OK", summary,
+                     tag="perm-" + rid, urgent=True)
+    except Exception as e:
+        _log_bg_error("push", e)
     return {"hold": True, "id": rid, "summary": summary}
 
 
@@ -3383,6 +3388,13 @@ def _reply_open(data, cfg, now) -> dict:
             "message": str(data.get("last_assistant_message") or "")[-6000:],
             "created": now, "last_poll": now, "state": "pending", "reply": "",
         }
+    try:
+        msg = str(data.get("last_assistant_message") or "").strip()
+        _push_notify(f"💬 {_push_session_name(sid)} " + ("asks" if msg.endswith("?") else "finished its turn"),
+                     ("…" + msg[-240:]) if len(msg) > 240 else (msg or "Reply from AOC to carry on."),
+                     tag="reply-" + rid, urgent=True)
+    except Exception as e:
+        _log_bg_error("push", e)
     return {"hold": True, "id": rid}
 
 
@@ -3433,6 +3445,277 @@ def _reply_pending_by_session(now) -> dict:
                 out[q["session_id"]] = {"id": q["id"], "message": q["message"],
                                         "age_s": int(now - q["created"])}
     return out
+
+
+# ── Phone push notifications (Web Push) ───────────────────────────────────
+# A phone that opened AOC through Remote access (https) and pressed "Enable
+# on this device" gets real push notifications through its browser's push
+# service, even with the AOC page closed: every toast AOC shows on this PC
+# (while you're away, or always), plus held permission prompts and turns
+# waiting for a reply. Messages are encrypted for the device (RFC 8291,
+# aes128gcm) and signed with AOC's own VAPID key (RFC 8292) -- no third-party
+# account, just `cryptography`, which AOC already needs.
+PUSH_VAPID_FILE = os.path.join(AOC_DATA_DIR, "push_vapid.json")
+PUSH_SUBS_FILE = os.path.join(AOC_DATA_DIR, "push_subs.json")
+PUSH_SETTINGS_FILE = os.path.join(AOC_DATA_DIR, "push.json")
+_PUSH_MODES = ("away", "always", "off")
+_PUSH_HOSTS = ("fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com",
+               ".notify.windows.com", ".push.apple.com")
+_PUSH_MAX_SUBS = 10
+_PUSH_TAG_GAP_S = 30
+_push_lock = threading.Lock()
+_push_last_tag = {}
+
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _b64u_dec(s: str) -> bytes:
+    s = str(s or "").strip()
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _webpush_encrypt(plaintext: bytes, ua_public: bytes, auth_secret: bytes, as_private=None, salt=None) -> bytes:
+    """RFC 8291 aes128gcm body (one record) for one push subscription.
+    as_private / salt are only passed by tests (RFC 8291 appendix A)."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    as_private = as_private or ec.generate_private_key(ec.SECP256R1())
+    salt = salt or os.urandom(16)
+    as_public = as_private.public_key().public_bytes(serialization.Encoding.X962,
+                                                      serialization.PublicFormat.UncompressedPoint)
+    ua_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_public)
+    shared = as_private.exchange(ec.ECDH(), ua_key)
+    ikm = HKDF(hashes.SHA256(), 32, auth_secret, b"WebPush: info\x00" + ua_public + as_public).derive(shared)
+    cek = HKDF(hashes.SHA256(), 16, salt, b"Content-Encoding: aes128gcm\x00").derive(ikm)
+    nonce = HKDF(hashes.SHA256(), 12, salt, b"Content-Encoding: nonce\x00").derive(ikm)
+    ct = AESGCM(cek).encrypt(nonce, plaintext + b"\x02", None)
+    return salt + (4096).to_bytes(4, "big") + bytes([len(as_public)]) + as_public + ct
+
+
+def _vapid_keys():
+    """(private key, public key b64url) -- created once, kept in AOC's data dir."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+    with _push_lock:
+        data = _load_json_file(PUSH_VAPID_FILE, {})
+        priv = None
+        if isinstance(data, dict) and data.get("private_pem"):
+            try:
+                priv = serialization.load_pem_private_key(data["private_pem"].encode(), None)
+            except Exception:
+                priv = None
+        if priv is None:
+            priv = ec.generate_private_key(ec.SECP256R1())
+            pem = priv.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                     serialization.NoEncryption()).decode()
+            os.makedirs(AOC_DATA_DIR, exist_ok=True)
+            with open(PUSH_VAPID_FILE, "w", encoding="utf-8") as f:
+                json.dump({"private_pem": pem}, f)
+        pub = priv.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        return priv, _b64u(pub)
+
+
+def _vapid_auth(endpoint, priv, pub_b64, now=None) -> str:
+    """RFC 8292 Authorization header value for a push to `endpoint`."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    from urllib.parse import urlparse
+    u = urlparse(endpoint)
+    header = _b64u(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
+    claims = _b64u(json.dumps({"aud": f"{u.scheme}://{u.netloc}", "exp": int((now or time.time()) + 12 * 3600),
+                               "sub": "https://github.com/deezeed/aoc-agent-monitoring-public"},
+                              separators=(",", ":")).encode())
+    r, s = decode_dss_signature(priv.sign(f"{header}.{claims}".encode(), ec.ECDSA(hashes.SHA256())))
+    return f"vapid t={header}.{claims}.{_b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}, k={pub_b64}"
+
+
+def _push_endpoint_ok(endpoint) -> bool:
+    """Pure: an https URL on a known browser push service (no SSRF via a
+    made-up 'subscription')."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(str(endpoint or ""))
+    except ValueError:
+        return False
+    host = (u.hostname or "").lower()
+    return u.scheme == "https" and any(host == h or (h.startswith(".") and host.endswith(h)) for h in _PUSH_HOSTS)
+
+
+def _push_sanitize_sub(data):
+    """Pure: POST /push/subscribe body -> subscription dict, or None."""
+    sub = (data or {}).get("subscription") if isinstance(data, dict) else None
+    if not isinstance(sub, dict) or not _push_endpoint_ok(sub.get("endpoint")):
+        return None
+    keys = sub.get("keys") or {}
+    try:
+        p256dh, auth = _b64u_dec(keys.get("p256dh")), _b64u_dec(keys.get("auth"))
+    except Exception:
+        return None
+    if len(p256dh) != 65 or p256dh[0] != 4 or len(auth) != 16:
+        return None
+    return {"endpoint": sub["endpoint"], "keys": {"p256dh": _b64u(p256dh), "auth": _b64u(auth)},
+            "label": str(data.get("label") or "")[:60] or "Phone", "created": int(time.time())}
+
+
+def _push_subs():
+    data = _load_json_file(PUSH_SUBS_FILE, [])
+    return [s for s in data if isinstance(s, dict) and s.get("endpoint")] if isinstance(data, list) else []
+
+
+def _push_save_subs(subs):
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = PUSH_SUBS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(subs[-_PUSH_MAX_SUBS:], f)
+    os.replace(tmp, PUSH_SUBS_FILE)
+
+
+def _push_subscribe(data) -> dict:
+    sub = _push_sanitize_sub(data)
+    if not sub:
+        return {"ok": False, "error": "not a browser push subscription"}
+    with _push_lock:
+        subs = [s for s in _push_subs() if s["endpoint"] != sub["endpoint"]] + [sub]
+        _push_save_subs(subs)
+    return {"ok": True, "devices": len(subs)}
+
+
+def _push_unsubscribe(endpoint) -> bool:
+    with _push_lock:
+        subs = _push_subs()
+        kept = [s for s in subs if s["endpoint"] != endpoint]
+        if len(kept) != len(subs):
+            _push_save_subs(kept)
+            return True
+    return False
+
+
+def _load_push_settings() -> dict:
+    d = _load_json_file(PUSH_SETTINGS_FILE, {})
+    mode = d.get("mode") if isinstance(d, dict) and d.get("mode") in _PUSH_MODES else "away"
+    return {"mode": mode}
+
+
+def _save_push_settings(data) -> dict:
+    cfg = {"mode": data.get("mode") if isinstance(data, dict) and data.get("mode") in _PUSH_MODES else "away"}
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    with open(PUSH_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    return cfg
+
+
+def _pc_idle_seconds():
+    """Seconds since this PC last had keyboard/mouse input (None if unknown)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class _LII(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+        lii = _LII()
+        lii.cbSize = ctypes.sizeof(lii)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return None
+        return ((ctypes.windll.kernel32.GetTickCount() - lii.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return None
+
+
+def _push_should_send(mode, idle_s, idle_min, urgent) -> bool:
+    """Pure: send this alert to the phones? urgent = something is blocked on
+    you right now (a held prompt / turn) -- those only happen while away."""
+    if mode == "off":
+        return False
+    if mode == "always" or urgent:
+        return True
+    return idle_s is not None and idle_s >= idle_min * 60
+
+
+def _push_send_one(sub, payload: bytes, urlopen=None) -> int:
+    """POST one encrypted message; returns the HTTP status (0 = network error)."""
+    import urllib.request
+    import urllib.error
+    priv, pub = _vapid_keys()
+    body = _webpush_encrypt(payload, _b64u_dec(sub["keys"]["p256dh"]), _b64u_dec(sub["keys"]["auth"]))
+    req = urllib.request.Request(sub["endpoint"], data=body, method="POST", headers={
+        "Authorization": _vapid_auth(sub["endpoint"], priv, pub), "Content-Encoding": "aes128gcm",
+        "Content-Type": "application/octet-stream", "TTL": "3600", "Urgency": "high"})
+    try:
+        with (urlopen or urllib.request.urlopen)(req, timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+
+def _push_notify(title, body, tag="aoc", urgent=False, force=False, now=None) -> int:
+    """Send to every enabled device in a background thread. Returns how many
+    devices it went to (0 when off / at the PC / throttled / none)."""
+    now = now or time.time()
+    if not force:
+        cfg = _load_push_settings()
+        if not _push_should_send(cfg["mode"], _pc_idle_seconds(), _load_remote_approve()["idle_min"], urgent):
+            return 0
+        with _push_lock:
+            if now - _push_last_tag.get(tag, 0) < _PUSH_TAG_GAP_S:
+                return 0
+            _push_last_tag[tag] = now
+    subs = _push_subs()
+    if not subs:
+        return 0
+    # the payload is encrypted for the device, so the token may ride along
+    url = ""
+    if _tunnel_status[0] == "ready" and _tunnel_url[0]:
+        url = _tunnel_url[0].rstrip("/") + "/" + (f"?token={_auth_token}" if _auth_token else "")
+    payload = json.dumps({"title": str(title)[:120], "body": str(body)[:300], "tag": str(tag)[:60], "url": url},
+                         ensure_ascii=False).encode("utf-8")
+
+    def _go():
+        gone = []
+        for s in subs:
+            code = _push_send_one(s, payload)
+            if code in (404, 410):
+                gone.append(s["endpoint"])
+            elif code not in (200, 201, 202):
+                _log_bg_error("push", Exception(f"push service answered {code}"))
+        for ep in gone:
+            _push_unsubscribe(ep)
+    threading.Thread(target=_go, daemon=True, name="push-send").start()
+    return len(subs)
+
+
+def _push_session_name(sid) -> str:
+    for s in (_own_status_payload() or {}).get("sessions_list") or []:
+        if s.get("id") == sid:
+            return s.get("display_name") or s.get("project") or "A session"
+    return "A session"
+
+
+_SW_JS = r"""self.addEventListener('fetch', () => {});
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'AOC', {
+    body: d.body || '', tag: d.tag || 'aoc', renotify: true, icon: '/icon.svg', badge: '/icon.svg',
+    data: { url: d.url || '' },
+  }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const want = (e.notification.data && e.notification.data.url) || self.registration.scope;
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+    for (const c of list) { if ('focus' in c) return c.focus(); }
+    return self.clients.openWindow(want);
+  }));
+});
+"""
 
 
 def _pid_exe_name(pid) -> str:
@@ -5421,6 +5704,110 @@ def _queue_tick(now=None, launch=None, view=None):
     except Exception:
         pass
     return task
+
+
+# ── Prompt library: reusable first messages for New session / the queue ───
+# %LOCALAPPDATA%\AOC\prompts.json; {{name}} in a template becomes a field to
+# fill in the New session form ({{date}} / {{yesterday}} fill themselves).
+# Until you save your own, three starters are offered.
+PROMPTS_FILE = os.path.join(AOC_DATA_DIR, "prompts.json")
+_PROMPTS_MAX = 100
+_prompts_lock = threading.Lock()
+_PROMPT_STARTERS = [
+    {"id": "starter-tests", "name": "Fix failing tests",
+     "text": "Run the test suite. For every failing test, find the root cause and fix the code (not the test, unless the test is wrong -- then say why). Re-run until green and summarize what you changed.",
+     "cwd": "", "model": ""},
+    {"id": "starter-review", "name": "Review my uncommitted changes",
+     "text": "Review the uncommitted changes in this repo (git diff) for bugs, missed edge cases and leftover debug code. List findings by severity with file:line. Don't change anything.",
+     "cwd": "", "model": ""},
+    {"id": "starter-audit", "name": "Dependency audit",
+     "text": "Audit this project's dependencies for known vulnerabilities and outdated major versions ({{date}}). Report what to upgrade first and why. Don't upgrade anything yet.",
+     "cwd": "", "model": "sonnet"},
+]
+
+
+def _sanitize_prompt(data, now=None):
+    """Pure: POST /prompts body -> template dict, or (None, error)."""
+    if not isinstance(data, dict):
+        return None, "bad request"
+    name = " ".join(str(data.get("name") or "").split())[:80]
+    text = str(data.get("text") or "").strip()
+    if not name:
+        return None, "give the template a name"
+    if not text:
+        return None, "the template is empty"
+    if len(text) > 20000:
+        return None, "template too long (20,000 characters max)"
+    model = str(data.get("model") or "").strip().lower()
+    if model not in _LAUNCH_MODELS:
+        model = ""
+    tid = str(data.get("id") or "")
+    if not re.match(r"^[A-Za-z0-9_-]{1,40}$", tid) or tid.startswith("starter-"):
+        tid = _secrets.token_hex(5)
+    return {"id": tid, "name": name, "text": text, "cwd": str(data.get("cwd") or "").strip()[:500], "model": model,
+            "updated": int(now or time.time())}, None
+
+
+def _prompts_load():
+    data = _load_json_file(PROMPTS_FILE, None)
+    if not isinstance(data, list):
+        return [dict(p) for p in _PROMPT_STARTERS]
+    return [p for p in data if isinstance(p, dict) and p.get("id") and p.get("text")]
+
+
+def _prompts_save(items):
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = PROMPTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items[:_PROMPTS_MAX], f, ensure_ascii=False)
+    os.replace(tmp, PROMPTS_FILE)
+
+
+def _prompts_upsert(data, now=None) -> dict:
+    tpl, err = _sanitize_prompt(data, now)
+    if err:
+        return {"ok": False, "error": err}
+    with _prompts_lock:
+        items = _prompts_load()
+        same = [i for i, p in enumerate(items) if p["id"] == tpl["id"] or p["name"].lower() == tpl["name"].lower()]
+        if same:
+            old = items[same[0]]
+            tpl["id"] = old["id"] if not str(old["id"]).startswith("starter-") else tpl["id"]
+            tpl["used"] = old.get("used", 0)
+            items[same[0]] = tpl
+        else:
+            if len(items) >= _PROMPTS_MAX:
+                return {"ok": False, "error": f"the library is full ({_PROMPTS_MAX} templates)"}
+            items.append(tpl)
+        _prompts_save(items)
+    return {"ok": True, "template": tpl}
+
+
+def _prompts_delete(tid) -> bool:
+    with _prompts_lock:
+        items = _prompts_load()
+        kept = [p for p in items if p["id"] != tid]
+        if len(kept) == len(items):
+            return False
+        _prompts_save(kept)
+        return True
+
+
+def _prompts_used(tid, now=None) -> bool:
+    """Count a use (the list is sorted most-used first)."""
+    with _prompts_lock:
+        items = _prompts_load()
+        for p in items:
+            if p["id"] == tid:
+                p["used"] = int(p.get("used", 0)) + 1
+                p["last_used"] = int(now or time.time())
+                _prompts_save(items)
+                return True
+    return False
+
+
+def _prompts_list():
+    return sorted(_prompts_load(), key=lambda p: (-int(p.get("used", 0)), p["name"].lower()))
 
 
 # ── Hard budget caps: stop a session's tool calls past a $ limit ───────────
@@ -8495,6 +8882,12 @@ body.light .reply-full { background:rgba(0,0,0,.05); }
 .ln-row .ln-lbl { margin:0; }
 .ln-row select { width:auto !important; }
 .ln-err { font-size:11px;color:var(--r); }
+.ln-tplrow { margin-top:2px; }
+.ln-tplrow select { flex:1;min-width:160px;width:auto !important; }
+.ln-mini { font-size:9px;padding:4px 10px; }
+.ln-vars { display:flex;flex-wrap:wrap;gap:6px 10px; }
+.ln-vars:empty { display:none; }
+.ln-var { display:flex;flex-direction:column;gap:3px;flex:1 1 180px;font:700 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o); }
 .ln-chk { display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--t2);cursor:pointer; }
 .q-row { display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid rgba(var(--c-rgb),.1); }
 .q-row:first-child { border-top:0; }
@@ -9768,6 +10161,20 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
           Uses the same "away" time. A held turn shows <b>Reply…</b> on the session; Claude carries on with what you write.
           Up to 7 replies in a row, then the session waits in its terminal.
         </div>
+        <div class="settings-section">PHONE PUSH</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Push alerts</label>
+          <select class="settings-input" id="st-push-mode" style="width:auto" onchange="_pushSaveMode()"
+            title="Which AOC alerts go to the devices below. Held prompts and turns waiting for your reply always go (they only happen while you're away).">
+            <option value="away">While I'm away from the PC</option>
+            <option value="always">Always</option>
+            <option value="off">Off</option>
+          </select>
+          <button class="adp-btn" id="st-push-enable" onclick="_pushEnable()" style="font-size:10px;padding:4px 12px">Enable on this device</button>
+          <button class="adp-btn" onclick="_pushTest()" style="font-size:10px;padding:4px 12px">Send test</button>
+        </div>
+        <div id="st-push-devices" style="display:flex;flex-direction:column;gap:4px;margin:0 0 6px"></div>
+        <div id="st-push-hint" style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px"></div>
         <div class="settings-section">AWAY RECAPS</div>
         <div class="settings-row" style="gap:10px;flex-wrap:wrap">
           <label class="settings-lbl">Recap on Today</label>
@@ -12334,6 +12741,70 @@ async function _budgetContinue(machineName, sid, day){
     else showToast('warning','Nothing to lift','That session is no longer over a cap.');
   }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
 }
+/* ── Phone push (Web Push) ── */
+/* Pure: can this page subscribe to push, and if not, why. */
+function _pushSupport(w){
+  if(!w.isSecureContext) return {ok:false, why:'Open AOC on your phone through Remote access (the https link) and press "Enable on this device" there.'};
+  if(!('serviceWorker' in w.navigator)||!('PushManager' in w)) return {ok:false, why:/iPhone|iPad/.test(w.navigator.userAgent||'')
+    ?'On iPhone: Share → Add to Home Screen, open AOC from that icon, then enable push here (iOS 16.4+).'
+    :'This browser has no Web Push.'};
+  return {ok:true, why:''};
+}
+function _b64uToBytes(s){
+  const b=atob(s.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-s.length%4)%4));
+  return Uint8Array.from(b, c=>c.charCodeAt(0));
+}
+let _pushInfo=null;
+async function _pushLoad(){
+  const hint=document.getElementById('st-push-hint'), list=document.getElementById('st-push-devices');
+  if(!hint) return;
+  try{ _pushInfo=await (await fetch('/push/info')).json(); }catch(e){ hint.textContent='Could not reach AOC.'; return; }
+  document.getElementById('st-push-mode').value=_pushInfo.mode||'away';
+  let mine='';
+  try{ const reg=await navigator.serviceWorker.getRegistration(); const sub=reg&&await reg.pushManager.getSubscription(); mine=sub?sub.endpoint:''; }catch(e){}
+  list.innerHTML=(_pushInfo.devices||[]).map(d=>`<div style="display:flex;align-items:center;gap:8px;font-size:11px">
+    <span>📱 ${escHtml(d.label||'Device')}${d.endpoint===mine?' <span style="color:var(--g);font-size:9px">THIS DEVICE</span>':''}</span>
+    <span style="color:var(--t3);font-size:9px">since ${d.created?new Date(d.created*1000).toLocaleDateString():'?'}</span>
+    <button class="adp-btn" style="font-size:9px;padding:2px 8px;margin-left:auto" onclick="_pushRemove(${jsq(d.endpoint)})">Remove</button></div>`).join('');
+  const sup=_pushSupport(window);
+  document.getElementById('st-push-enable').style.display=sup.ok&&!mine?'':'none';
+  hint.innerHTML=sup.ok?(mine?'Push is on for this device.':'Press <b>Enable on this device</b> and allow notifications.')
+    +' Alerts arrive even with the AOC page closed; tapping one opens AOC.':escHtml(sup.why);
+}
+function _pushLabel(){
+  const ua=navigator.userAgent||'';
+  return /iPhone/.test(ua)?'iPhone':/iPad/.test(ua)?'iPad':/Android/.test(ua)?'Android phone':/Windows/.test(ua)?'Windows browser':/Mac/.test(ua)?'Mac browser':'Browser';
+}
+async function _pushEnable(){
+  try{
+    if(Notification.permission!=='granted'&&await Notification.requestPermission()!=='granted'){ showToast('warning','Not allowed','Notifications are blocked for this site.'); return; }
+    const reg=await navigator.serviceWorker.ready;
+    const key=(_pushInfo&&_pushInfo.public_key)||(await (await fetch('/push/info')).json()).public_key;
+    const sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:_b64uToBytes(key)});
+    const d=await (await fetch('/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub.toJSON(),label:_pushLabel()})})).json();
+    if(d.ok){ showToast('done','Push enabled','Sending a test…'); _pushTest(); }
+    else showToast('warning','Not enabled',d.error||'');
+  }catch(e){ showToast('warning','Push failed',String(e&&e.message||e).slice(0,120)); }
+  _pushLoad();
+}
+async function _pushRemove(endpoint){
+  try{
+    await fetch('/push/unsubscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint})});
+    const reg=await navigator.serviceWorker.getRegistration(); const sub=reg&&await reg.pushManager.getSubscription();
+    if(sub&&sub.endpoint===endpoint) await sub.unsubscribe();
+  }catch(e){}
+  _pushLoad();
+}
+async function _pushTest(){
+  try{
+    const d=await (await fetch('/push/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+    showToast(d.ok?'done':'warning', d.ok?'Test sent':'No device', d.ok?`To ${d.devices} device${d.devices===1?'':'s'}.`:(d.error||''));
+  }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
+}
+async function _pushSaveMode(){
+  try{ await fetch('/push/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:document.getElementById('st-push-mode').value})}); }
+  catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
+}
 async function _capsLoad(){
   try{
     const d=await (await fetch('/budget_caps')).json();
@@ -13923,7 +14394,30 @@ function _setCommitView(sort, all){
 /* Pure: /commit_costs response -> report HTML. */
 /* ── Launch a new Claude Code session ── */
 /* Pure: the New session form. dirs = /launch/dirs, machines = [{name,label}]. */
-function _launchFormHtml(dirs, machines, machine){
+/* Pure: the {{fields}} a template asks for ({{date}} / {{yesterday}} fill themselves). */
+function _promptVars(text){
+  const out=[];
+  for(const m of String(text||'').matchAll(/\{\{\s*([A-Za-z][\w -]{0,30}?)\s*\}\}/g)){
+    const v=m[1].trim();
+    if(!['date','yesterday'].includes(v.toLowerCase())&&!out.includes(v)) out.push(v);
+  }
+  return out;
+}
+/* Pure: the template with its fields filled in; missing = names left empty. */
+function _fillPrompt(text, vals, now){
+  const ymd=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const missing=[];
+  const out=String(text||'').replace(/\{\{\s*([A-Za-z][\w -]{0,30}?)\s*\}\}/g,(m,name)=>{
+    const k=name.trim(), lk=k.toLowerCase();
+    if(lk==='date') return ymd(now);
+    if(lk==='yesterday') return ymd(new Date(now.getTime()-86400e3));
+    const v=String((vals||{})[k]||'').trim();
+    if(!v){ if(!missing.includes(k)) missing.push(k); return m; }
+    return v;
+  });
+  return {text:out, missing};
+}
+function _launchFormHtml(dirs, machines, machine, prompts){
   const chips=(dirs||[]).slice(0,8).map(d=>`<button type="button" class="ln-chip" onclick="_launchPick(this)" data-path="${escHtml(d.path)}" title="${escHtml(d.path)}">${escHtml(d.name)}</button>`).join('');
   const machineSel=(machines||[]).length>1?`<label class="ln-lbl">Run on</label>
     <select id="ln-machine" class="settings-input" onchange="_launchLoadDirs(this.closest('.diff-overlay'), this.value)">${machines.map(m=>`<option value="${escHtml(m.name)}"${m.name===machine?' selected':''}>${escHtml(m.label)}</option>`).join('')}</select>`:'';
@@ -13933,8 +14427,14 @@ function _launchFormHtml(dirs, machines, machine){
     <input id="ln-cwd" class="settings-input" list="ln-dirs" placeholder="C:\\path\\to\\project" autocomplete="off" required>
     <datalist id="ln-dirs">${(dirs||[]).map(d=>`<option value="${escHtml(d.path)}"></option>`).join('')}</datalist>
     <div class="ln-chips">${chips||'<span class="ln-none">Folders Claude Code worked in lately show up here.</span>'}</div>
+    <div class="ln-row ln-tplrow"><label class="ln-lbl" for="ln-tpl">Template</label>
+      <select id="ln-tpl" class="settings-input" onchange="_launchUseTemplate(this.form)" title="Prompt library: saved first messages">
+        <option value="">— write your own —</option>${(prompts||[]).map(t=>`<option value="${escHtml(t.id)}">${escHtml(t.name)}${t.used?` · ${t.used}×`:''}</option>`).join('')}</select>
+      <button type="button" class="adp-btn ln-mini" onclick="_launchSaveTemplate(this.form)" title="Save the message below (with any {{fields}}), folder and model as a template">Save as template</button>
+      <button type="button" class="adp-btn ln-mini" id="ln-tpl-del" style="display:none" onclick="_launchDeleteTemplate(this.form)">Delete</button></div>
     <label class="ln-lbl" for="ln-prompt">First message</label>
-    <textarea id="ln-prompt" class="settings-input" rows="5" placeholder="What should Claude do? (optional)" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_launchSubmit(this.form)}"></textarea>
+    <textarea id="ln-prompt" class="settings-input" rows="5" placeholder="What should Claude do? (optional) — {{like this}} makes a field to fill in" oninput="_launchVarsRender(this.form)" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_launchSubmit(this.form)}"></textarea>
+    <div id="ln-vars" class="ln-vars"></div>
     <div class="ln-row"><label class="ln-lbl" for="ln-model">Model</label>
       <select id="ln-model" class="settings-input"><option value="">Default</option><option value="opus">Opus</option><option value="sonnet">Sonnet</option><option value="haiku">Haiku</option></select>
       <label class="ln-lbl" for="ln-when">Start</label>
@@ -13953,11 +14453,60 @@ function _launchMachines(){
 async function _launchLoadDirs(o, machine){
   if(!o) return;
   let dirs=[];
+  let prompts=[];
   try{ dirs=(await fetch(_apiUrl(_machineFor(machine),'/launch/dirs')).then(r=>r.json())).dirs||[]; }catch(e){}
-  const keep=(o.querySelector('#ln-prompt')||{}).value||'';
-  o.querySelector('.chg-body').innerHTML=_launchFormHtml(dirs, _launchMachines(), machine);
-  o.querySelector('#ln-prompt').value=keep;
+  try{ prompts=(await fetch(_apiUrl(_machineFor(machine),'/prompts')).then(r=>r.json())).prompts||[]; }catch(e){}
+  // keep what's typed across the re-render (machine switch, template saved/deleted)
+  const ids=['#ln-prompt','#ln-cwd','#ln-model','#ln-when','#ln-at'];
+  const keep=ids.map(id=>(o.querySelector(id)||{}).value);
+  const keepChk=(o.querySelector('#ln-at-limits')||{checked:true}).checked;
+  o._prompts=prompts;
+  o.querySelector('.chg-body').innerHTML=_launchFormHtml(dirs, _launchMachines(), machine, prompts);
+  ids.forEach((id,i)=>{ const el=o.querySelector(id); if(el&&keep[i]!=null) el.value=keep[i]; });
+  o.querySelector('#ln-at-limits').checked=keepChk;
   o.dataset.machine=machine||'';
+  const f=o.querySelector('form');
+  if(keep[3]&&keep[3]!=='now') _launchWhen(f);
+  _launchVarsRender(f);
+}
+function _launchVarsRender(form){
+  if(!form) return;
+  const box=form.querySelector('#ln-vars');
+  const keep={}; box.querySelectorAll('input[data-var]').forEach(i=>keep[i.dataset.var]=i.value);
+  const vars=_promptVars(form.querySelector('#ln-prompt').value);
+  box.innerHTML=vars.map(v=>`<label class="ln-var"><span>${escHtml(v)}</span><input class="settings-input" data-var="${escHtml(v)}" value="${escHtml(keep[v]||'')}"></label>`).join('');
+}
+function _launchUseTemplate(form){
+  const o=form.closest('.diff-overlay'), id=form.querySelector('#ln-tpl').value;
+  const t=((o&&o._prompts)||[]).find(x=>x.id===id);
+  form.querySelector('#ln-tpl-del').style.display=t?'':'none';
+  if(!t) return;
+  form.querySelector('#ln-prompt').value=t.text;
+  if(t.cwd) form.querySelector('#ln-cwd').value=t.cwd;
+  form.querySelector('#ln-model').value=t.model||'';
+  _launchVarsRender(form);
+  const first=form.querySelector('#ln-vars input'); (first||form.querySelector('#ln-prompt')).focus();
+}
+async function _launchSaveTemplate(form){
+  const o=form.closest('.diff-overlay'), machine=(o&&o.dataset.machine)||'';
+  const text=form.querySelector('#ln-prompt').value.trim();
+  if(!text){ form.querySelector('#ln-err').textContent='Write the message first.'; return; }
+  const cur=((o&&o._prompts)||[]).find(x=>x.id===form.querySelector('#ln-tpl').value);
+  const name=prompt('Template name:', cur?cur.name:text.split(/\s+/).slice(0,5).join(' '));
+  if(!name) return;
+  const d=await fetch(_apiUrl(_machineFor(machine),'/prompts'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:cur&&cur.name===name?cur.id:'', name, text, cwd:form.querySelector('#ln-cwd').value, model:form.querySelector('#ln-model').value})}).then(r=>r.json()).catch(()=>({}));
+  if(!d.ok){ form.querySelector('#ln-err').textContent=d.error||'Not saved.'; return; }
+  showToast('done','Template saved',name);
+  await _launchLoadDirs(o, machine);
+  const f=o.querySelector('form'); f.querySelector('#ln-tpl').value=d.template.id; f.querySelector('#ln-tpl-del').style.display='';
+}
+async function _launchDeleteTemplate(form){
+  const o=form.closest('.diff-overlay'), machine=(o&&o.dataset.machine)||'', id=form.querySelector('#ln-tpl').value;
+  const t=((o&&o._prompts)||[]).find(x=>x.id===id);
+  if(!t||!confirm(`Delete the template "${t.name}"?`)) return;
+  await fetch(_apiUrl(_machineFor(machine),'/prompts/delete'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).catch(()=>{});
+  await _launchLoadDirs(o, machine);
 }
 function openLaunch(){
   const o=_overlay('New Claude Code session', _launchFormHtml([], _launchMachines(), ''), 'chg-box ln-box');
@@ -13993,14 +14542,19 @@ async function _launchSubmit(form){
   const err=form.querySelector('#ln-err');
   const go=form.querySelector('.ln-go');
   const when=form.querySelector('#ln-when').value;
+  const vals={}; form.querySelectorAll('#ln-vars input[data-var]').forEach(i=>vals[i.dataset.var]=i.value);
+  const filled=_fillPrompt(form.querySelector('#ln-prompt').value, vals, new Date());
+  if(filled.missing.length){ err.textContent='Fill in: '+filled.missing.join(', '); return; }
+  const tplId=form.querySelector('#ln-tpl').value;
+  const countUse=()=>{ if(tplId) fetch(_apiUrl(_machineFor(machine),'/prompts/used'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:tplId})}).catch(()=>{}); };
   if(when!=='now'){
-    const body=_queueBody(form.querySelector('#ln-cwd').value, form.querySelector('#ln-prompt').value, form.querySelector('#ln-model').value,
+    const body=_queueBody(form.querySelector('#ln-cwd').value, filled.text, form.querySelector('#ln-model').value,
       when, form.querySelector('#ln-at').value, form.querySelector('#ln-at-limits').checked);
     if(body.error){ err.textContent=body.error; return; }
     go.disabled=true; err.textContent='';
     try{
       const d=await fetch(_apiUrl(_machineFor(machine),'/queue'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
-      if(d.ok){ o.remove(); showToast('done','Queued',machine?'It starts on '+machine+' when it is due.':'It shows under Queued on Today.'); }
+      if(d.ok){ countUse(); o.remove(); showToast('done','Queued',machine?'It starts on '+machine+' when it is due.':'It shows under Queued on Today.'); }
       else err.textContent=d.error||'Could not queue it.';
     }catch(e){ err.textContent='Could not reach AOC.'; }
     go.disabled=false;
@@ -14009,8 +14563,8 @@ async function _launchSubmit(form){
   go.disabled=true; err.textContent='';
   try{
     const d=await fetch(_apiUrl(_machineFor(machine),'/launch'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cwd:form.querySelector('#ln-cwd').value, prompt:form.querySelector('#ln-prompt').value, model:form.querySelector('#ln-model').value})}).then(r=>r.json());
-    if(d.ok){ o.remove(); showToast('done','Session started', d.trusted===false?'New folder: accept "trust this folder" in the new window first.':'It shows up here in a few seconds.', d.trusted===false?12000:5000); }
+      body:JSON.stringify({cwd:form.querySelector('#ln-cwd').value, prompt:filled.text, model:form.querySelector('#ln-model').value})}).then(r=>r.json());
+    if(d.ok){ countUse(); o.remove(); showToast('done','Session started', d.trusted===false?'New folder: accept "trust this folder" in the new window first.':'It shows up here in a few seconds.', d.trusted===false?12000:5000); }
     else err.textContent=d.error||'Could not start it.';
   }catch(e){ err.textContent='Could not reach AOC.'; }
   go.disabled=false;
@@ -16380,6 +16934,7 @@ function openSettings(){
   _renderLicenseUI();
   _raLoad();
   _capsLoad();
+  _pushLoad();
   /* populate inputs */
   const v=n=>document.getElementById(n);
   if(v('st-cost-rate')) v('st-cost-rate').value=_costRate;
@@ -17632,12 +18187,19 @@ class Handler(BaseHTTPRequestHandler):
             manifest = _build_manifest(tok)
             self._serve(200, "application/json", json.dumps(manifest).encode(), no_cache=True)
         elif path_no_qs == "/sw.js":
-            # Minimal service worker: no offline caching (this is a live
-            # dashboard, a stale cached snapshot would be actively
-            # misleading), just enough of a fetch handler for PWA
-            # installability criteria on Android/Chromium.
-            sw = "self.addEventListener('fetch', () => {});"
-            self._serve(200, "application/javascript", sw.encode(), no_cache=True)
+            # No offline caching (this is a live dashboard, a stale cached
+            # snapshot would be actively misleading), just enough of a fetch
+            # handler for PWA installability on Android/Chromium -- plus the
+            # Web Push handlers (_push_notify).
+            self._serve(200, "application/javascript", _SW_JS.encode(), no_cache=True)
+        elif path_no_qs == "/prompts":
+            self._serve(200, "application/json", json.dumps({"prompts": _prompts_list()}, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/push/info":
+            subs = _push_subs()
+            self._serve(200, "application/json", json.dumps({
+                "public_key": _vapid_keys()[1], **_load_push_settings(),
+                "devices": [{"endpoint": x["endpoint"], "label": x.get("label", ""), "created": x.get("created")} for x in subs],
+            }).encode(), no_cache=True)
         elif path_no_qs == "/auth/info":
             self._serve(200, "application/json", json.dumps(_auth_info(), ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/license":
@@ -18159,6 +18721,42 @@ class Handler(BaseHTTPRequestHandler):
                 _log_bg_error("budget_caps", e)
                 reply = {"ok": False, "error": "bad request"}
             self._serve(200, "application/json", json.dumps(reply).encode())
+
+        elif path_no_qs in ("/prompts", "/prompts/delete", "/prompts/used"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/prompts":
+                    reply = _prompts_upsert(data)
+                elif path_no_qs == "/prompts/delete":
+                    reply = {"ok": _prompts_delete(str(data.get("id") or ""))}
+                else:
+                    reply = {"ok": _prompts_used(str(data.get("id") or ""))}
+            except Exception as e:
+                _log_bg_error("prompts", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+
+        elif path_no_qs in ("/push/subscribe", "/push/unsubscribe", "/push/settings", "/push/test"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/push/subscribe":
+                    reply = _push_subscribe(data)
+                elif path_no_qs == "/push/unsubscribe":
+                    reply = {"ok": _push_unsubscribe(str(data.get("endpoint") or ""))}
+                elif path_no_qs == "/push/settings":
+                    reply = {"ok": True, **_save_push_settings(data)}
+                else:
+                    n = _push_notify("✅ AOC push works", "You'll get alerts here while you're away from the PC.",
+                                     tag="test", force=True)
+                    reply = {"ok": n > 0, "devices": n} if n else {"ok": False, "error": "no device has push enabled"}
+            except Exception as e:
+                _log_bg_error("push", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
 
         elif path_no_qs in ("/queue", "/queue/cancel"):
             try:
@@ -18714,7 +19312,12 @@ def _show_native_toast(title: str, message: str):
     worked) as a fallback-safe default; now prefers AOC's own AUMID
     (_register_aumid_shortcut, called once at startup) for AOC's own
     name/icon on the notification instead of PowerShell's -- also
-    live-tested and confirmed showing distinctly from the borrowed one."""
+    live-tested and confirmed showing distinctly from the borrowed one.
+    Also goes to the phones with push enabled (_push_notify decides)."""
+    try:
+        _push_notify(title, message, tag=str(title)[:40])
+    except Exception as e:
+        _log_bg_error("push", e)
     try:
         def xml_esc(s: str) -> str:
             return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

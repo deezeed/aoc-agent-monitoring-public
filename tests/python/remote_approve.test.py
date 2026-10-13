@@ -15,6 +15,7 @@ from lib.extract import exec_functions
 from lib.check import Checker
 
 c = Checker()
+pushes = []
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 data_dir = tempfile.mkdtemp(prefix="aoc_ra_")
 
@@ -23,7 +24,9 @@ ns = exec_functions(
      "_perm_lock", "_perm_requests", "_sanitize_remote_approve", "_load_remote_approve", "_save_remote_approve",
      "_perm_should_hold", "_perm_summary", "_perm_expire", "_perm_open", "_perm_poll", "_perm_decide",
      "_perm_pending_by_session"],
-    {"os": os, "json": json, "threading": threading, "_secrets": secrets, "AOC_DATA_DIR": os.path.join(data_dir, "AOC")})
+    {"os": os, "json": json, "threading": threading, "_secrets": secrets, "AOC_DATA_DIR": os.path.join(data_dir, "AOC"),
+     "_push_notify": lambda title, body, tag="aoc", urgent=False, **k: pushes.append((title, body, urgent)) or 1,
+     "_push_session_name": lambda sid: f"Session {sid}", "_log_bg_error": lambda *a: None})
 
 # ── settings ──
 san = ns["_sanitize_remote_approve"]
@@ -59,6 +62,7 @@ c.check("garbage input survives", summ(None, "nope")[0] == "?:")
 always = {"mode": "always", "idle_min": 5}
 r = ns["_perm_open"]({"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "ls"}, "idle_s": 0}, always, 1000)
 c.check("open -> hold + id + summary", r["hold"] and r["id"] and r["summary"] == "Bash: ls")
+c.check("held prompt pushed to the phone, urgent", pushes[-1] == ("\U0001f510 Session s1 needs your OK", "Bash: ls", True))
 c.check("off -> no hold", ns["_perm_open"]({"session_id": "s1"}, {"mode": "off", "idle_min": 5}, 1000) == {"hold": False})
 pend = ns["_perm_pending_by_session"](1001)
 c.check("pending listed under its session", [q["id"] for q in pend.get("s1", [])] == [r["id"]] and pend["s1"][0]["age_s"] == 1)

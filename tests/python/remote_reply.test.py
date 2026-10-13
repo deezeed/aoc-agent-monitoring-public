@@ -15,6 +15,7 @@ from lib.extract import exec_functions
 from lib.check import Checker
 
 c = Checker()
+pushes = []
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 data_dir = tempfile.mkdtemp(prefix="aoc_rr_")
 
@@ -23,7 +24,9 @@ ns = exec_functions(
      "_sanitize_remote_approve", "_load_remote_approve", "_save_remote_approve",
      "_REPLY_MAX_STREAK", "_reply_lock", "_reply_requests", "_reply_streak", "_reply_should_hold", "_reply_expire",
      "_reply_open", "_reply_poll", "_reply_send", "_reply_pending_by_session"],
-    {"os": os, "json": json, "threading": threading, "_secrets": secrets, "AOC_DATA_DIR": os.path.join(data_dir, "AOC")})
+    {"os": os, "json": json, "threading": threading, "_secrets": secrets, "AOC_DATA_DIR": os.path.join(data_dir, "AOC"),
+     "_push_notify": lambda title, body, tag="aoc", urgent=False, **k: pushes.append((title, body, urgent)) or 1,
+     "_push_session_name": lambda sid: f"Session {sid}", "_log_bg_error": lambda *a: None})
 
 # ── settings ──
 san = ns["_sanitize_remote_approve"]
@@ -50,6 +53,8 @@ c.check("7 replies in a row -> no hold (Claude Code caps at 8)", not hold(away5,
 # ── request lifecycle ──
 r = ns["_reply_open"]({"session_id": "s1", "idle_s": 600, "last_assistant_message": "Ship it?"}, away5, 1000)
 c.check("open -> hold + id", r["hold"] is True and r["id"])
+c.check("held turn pushed to the phone, urgent, question wording",
+        pushes[-1][0] == "\U0001f4ac Session s1 asks" and pushes[-1][1] == "Ship it?" and pushes[-1][2] is True)
 pend = ns["_reply_pending_by_session"](1002)
 c.check("pending listed with the message + age", pend.get("s1") == {"id": r["id"], "message": "Ship it?", "age_s": 2})
 c.check("poll while pending", ns["_reply_poll"](r["id"], 700, away5, 1003) == {"state": "pending"})

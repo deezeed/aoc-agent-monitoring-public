@@ -377,6 +377,16 @@ one task a minute, with a toast when it does. Stored in
 `POST /queue`, `POST /queue/cancel`, `queue` in `/status`. The PC has to be on
 and AOC running at that time.
 
+**Prompt library.** The same form has a **Template** picker: it fills in
+the first message, folder and model of a saved template; *Save as template*
+stores what's in the form. Write `{{anything}}` in a template and the form
+asks for it before starting (`{{date}}` and `{{yesterday}}` fill
+themselves), so one template covers "review PR {{number}}" for every PR --
+and it works for queued tasks too. Three starters (fix failing tests,
+review uncommitted changes, dependency audit) are offered until you save
+your own; most-used templates come first. `GET/POST /prompts`,
+`POST /prompts/delete|used`; stored in `%LOCALAPPDATA%\AOC\prompts.json`.
+
 Views (toolbar buttons, each with a single-letter hotkey once the page has
 focus): toda(**Y**), **A**gents(**C**), **C**LI(**B**), **T**imeline, **S**ummary,
 **G**raph, heat(**X**), health(**K**), tree(**W**), history(**V**),
@@ -635,6 +645,19 @@ interactive sessions are held (`CLAUDE_CODE_ENTRYPOINT=cli`, never a
 terminal (Claude Code ends a turn after 8 Stop-hook blocks anyway). Routes:
 `/permission/request|poll|decide|settings`, `/reply/request|poll|send`;
 `perm_requests` / `reply_request` per session in `/status`.
+
+**Phone push.** Settings → Notify → PHONE PUSH: open AOC on the phone
+through Remote access (the https link; on iPhone add it to the Home Screen
+first, iOS 16.4+) and press *Enable on this device*. From then on AOC's
+alerts reach the phone as real notifications even with the page closed:
+every toast AOC shows (only while you're away from the PC by default, or
+always), plus held permission prompts and turns waiting for your reply.
+Tapping one opens AOC. It is standard Web Push: messages are encrypted for
+the device (RFC 8291) and signed with AOC's own VAPID key (RFC 8292, kept in
+`%LOCALAPPDATA%\AOC\push_vapid.json`), go through the browser's own push
+service (FCM, Mozilla, Apple, WNS -- the only endpoints AOC will post to),
+and need no account. `GET /push/info`, `POST /push/subscribe|unsubscribe|
+settings|test`.
 
 **Hard budget caps.** Settings → COST → HARD CAPS: *Stop a session at $X*
 and *Stop all at $Y per day*. setup.py registers an HTTP `PreToolUse` hook
