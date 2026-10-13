@@ -365,6 +365,18 @@ plan limits; spend by project today; today's commits (a link to History →
 COMMITS). It opens on first run, and once for anyone upgrading; after that
 the dashboard remembers the last view as before.
 
+**+ New session** on Today starts Claude Code in a folder with your first
+message (a new terminal window, `POST /launch`). Its **Start** choice can
+also queue the task instead: *When plan limits allow* (both the 5-hour and
+weekly window under 95 % and not hit -- handy when you've just run out), or
+*At a time…* within the next 14 days, optionally also waiting for the
+limits. Queued tasks show in a **Queued** card on Today with what each one
+waits for and a Cancel button; a worker checks every 20 s and starts at most
+one task a minute, with a toast when it does. Stored in
+`%LOCALAPPDATA%\AOC\queue.json` (finished entries drop off after a day);
+`POST /queue`, `POST /queue/cancel`, `queue` in `/status`. The PC has to be on
+and AOC running at that time.
+
 Views (toolbar buttons, each with a single-letter hotkey once the page has
 focus): toda(**Y**), **A**gents(**C**), **C**LI(**B**), **T**imeline, **S**ummary,
 **G**raph, heat(**X**), health(**K**), tree(**W**), history(**V**),
@@ -607,6 +619,50 @@ your permission to use Bash"): red **NEEDS OK** / **QUESTION** pill, the
 message instead of Claude's last text, and it jumps to the front of the
 waiting strip after 30 s instead of 10 min. Answering the prompt clears it
 (the tool result lands in the transcript). A finished turn stays **WAITING**.
+
+**Answer from the dashboard or your phone.** `hooks/aoc_permission.py` is
+registered twice: as the `PermissionRequest` hook (remote approve) and as a
+second `Stop` hook (reply). While you're away -- no keyboard or mouse input
+for the "away" time in Settings → Notify, default 5 min -- it holds the
+moment for you: a permission prompt shows **Allow / Deny / Answer in
+terminal** on the session, a finished turn shows Claude's last message with
+**Reply… / Done for now**. Your reply goes back as the Stop hook's
+`{"decision": "block", "reason": …}`, so Claude carries on with it in the same
+session. Touching the PC again, AOC going away or 25 min without an answer
+hands it back to the terminal; nothing is decided without you. Only
+interactive sessions are held (`CLAUDE_CODE_ENTRYPOINT=cli`, never a
+`claude -p` run), and after 7 replies in a row the session waits in its
+terminal (Claude Code ends a turn after 8 Stop-hook blocks anyway). Routes:
+`/permission/request|poll|decide|settings`, `/reply/request|poll|send`;
+`perm_requests` / `reply_request` per session in `/status`.
+
+**Hard budget caps.** Settings → COST → HARD CAPS: *Stop a session at $X*
+and *Stop all at $Y per day*. setup.py registers an HTTP `PreToolUse` hook
+for every tool (`http://127.0.0.1:5151/hook/pretool`, 3 s timeout -- no
+process per tool call); monitor.py answers it from memory, and once a cap is
+reached it returns `permissionDecision: "deny"` with the reason, so Claude
+stops calling tools and tells you where it got to. The session gets a red
+**Budget cap** flag with *Let it continue* (one more cap's worth for that
+session) or *Lift for today* (daily cap), plus a toast and the
+`budget_cap` webhook (under the budget-alert toggle). Costs come from the
+transcript scanner and the caps are re-checked every 10 s, so a cap bites
+within about a minute of being crossed, not on the exact cent. If AOC isn't
+running, Claude Code treats the hook as failed and nothing is blocked. The
+hook route is answered without the token only for direct loopback requests
+(never through a tunnel). `GET/POST /budget_caps`,
+`POST /budget_caps/continue`, `budget` per session in `/status`; stored in
+`%LOCALAPPDATA%\AOC\budget_caps.json`.
+
+**Replay a session.** ▶ on a CLI card or Today row (and ▶ REPLAY in a
+History session) opens the session step by step from its transcript: your
+prompts and slash commands, Claude's text, every tool call with its result
+(failures in red with the error output, slow calls with their seconds),
+git commits, and the cost of each API call on the step it produced. A spend
+strip on top shows where the money went (one block per call, width = cost,
+click to jump), with Play / a scrubber to step through, and tabs for the
+conversation only, tools, failures, commits and the five costliest steps.
+Main thread only (subagents have their own transcripts); the last 4,000
+steps of very long sessions. `GET /session_replay?session_id=`.
 
 **Switch to the terminal.** ⧉ on an active local CLI card (and *Terminal* on
 its bay, or a click on its entry in the waiting strip) brings the window

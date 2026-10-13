@@ -19,7 +19,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 data_dir = tempfile.mkdtemp(prefix="aoc_ra_")
 
 ns = exec_functions(
-    ["_load_json_file", "REMOTE_APPROVE_FILE", "_PERM_MODES", "_PERM_POLL_STALE_S", "_PERM_BACK_IDLE_S",
+    ["_load_json_file", "REMOTE_APPROVE_FILE", "_PERM_MODES", "_REPLY_MODES", "_PERM_POLL_STALE_S", "_PERM_BACK_IDLE_S",
      "_perm_lock", "_perm_requests", "_sanitize_remote_approve", "_load_remote_approve", "_save_remote_approve",
      "_perm_should_hold", "_perm_summary", "_perm_expire", "_perm_open", "_perm_poll", "_perm_decide",
      "_perm_pending_by_session"],
@@ -27,13 +27,13 @@ ns = exec_functions(
 
 # ── settings ──
 san = ns["_sanitize_remote_approve"]
-c.check("defaults: away after 5 min", san(None) == {"mode": "away", "idle_min": 5})
+c.check("defaults: away after 5 min", san(None) == {"mode": "away", "idle_min": 5, "reply": "away"})
 c.check("unknown mode -> away", san({"mode": "yolo"})["mode"] == "away")
 c.check("idle_min clamped", san({"idle_min": 0})["idle_min"] == 1 and san({"idle_min": 999})["idle_min"] == 120)
 c.check("idle_min garbage -> 5", san({"idle_min": "x"})["idle_min"] == 5)
-c.check("missing file -> defaults", ns["_load_remote_approve"]() == {"mode": "away", "idle_min": 5})
+c.check("missing file -> defaults", ns["_load_remote_approve"]() == {"mode": "away", "idle_min": 5, "reply": "away"})
 ns["_save_remote_approve"]({"mode": "always", "idle_min": 3, "evil": 1})
-c.check("save -> load round trip, only known keys", ns["_load_remote_approve"]() == {"mode": "always", "idle_min": 3})
+c.check("save -> load round trip, only known keys", ns["_load_remote_approve"]() == {"mode": "always", "idle_min": 3, "reply": "away"})
 
 # ── hold decision ──
 hold = ns["_perm_should_hold"]

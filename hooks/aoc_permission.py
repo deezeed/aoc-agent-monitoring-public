@@ -16,6 +16,13 @@ dashboard's decision (allow / deny). Touching the PC again, "Answer in
 terminal" on the dashboard, monitor.py going away or MAX_HOLD_S all release
 the prompt to the terminal dialog -- nothing is ever decided without you.
 
+The same script is also AOC's second Stop hook (reply from the dashboard):
+when a turn ends while you're away (settings "reply": "away"), it asks
+POST /reply/request whether to hold the end of the turn, polls
+GET /reply/poll, and prints {"decision": "block", "reason": <your reply>} so
+Claude carries on with what you wrote. Only interactive sessions
+(CLAUDE_CODE_ENTRYPOINT=cli) -- a `claude -p` run is never held.
+
 Runs under the console python.exe (like the statusline), not pythonw: the
 decision has to reach Claude Code on stdout. Deployment template: setup.py
 fills in MONITOR_SCRIPT when it copies this file into ~/.claude/hooks/.
@@ -100,6 +107,55 @@ def _set_waiting(hook, waiting, message=""):
         pass
 
 
+def reply_output(state, text=""):
+    """Pure: the Stop hook JSON that hands your reply to Claude, None otherwise."""
+    if state != "reply" or not text.strip():
+        return None
+    return {"decision": "block",
+            "reason": "The user replied from the AOC dashboard (away from the PC):\n\n" + text}
+
+
+def run_reply(hook, sleep=time.sleep, clock=time.monotonic, idle=idle_seconds, env=os.environ):
+    """Stop hook: returns the block dict to print, or None (= the turn ends)."""
+    if env.get("CLAUDE_CODE_ENTRYPOINT", "cli") != "cli":
+        return None
+    try:
+        reply = _call("/reply/request", {
+            "session_id": hook.get("session_id", ""), "cwd": hook.get("cwd", ""),
+            "stop_hook_active": bool(hook.get("stop_hook_active")),
+            "last_assistant_message": hook.get("last_assistant_message") or "",
+            "idle_s": idle(),
+        })
+    except Exception:
+        return None
+    if not reply.get("hold") or not reply.get("id"):
+        return None
+    rid = reply["id"]
+    started, failures = clock(), 0
+    while clock() - started < MAX_HOLD_S:
+        sleep(POLL_S)
+        q = {"id": rid}
+        i = idle()
+        if i is not None:
+            q["idle"] = f"{i:.1f}"
+        try:
+            r = _call("/reply/poll?" + urllib.parse.urlencode(q))
+            failures = 0
+        except Exception:
+            failures += 1
+            if failures >= MAX_POLL_FAILURES:
+                return None
+            continue
+        state = r.get("state")
+        if state == "pending":
+            continue
+        out = reply_output(state, r.get("reply") or "")
+        if out:
+            _set_waiting(hook, False)
+        return out
+    return None
+
+
 def run(hook, sleep=time.sleep, clock=time.monotonic, idle=idle_seconds):
     """Returns the decision dict to print, or None (= terminal dialog)."""
     try:
@@ -147,7 +203,7 @@ def main():
         return
     if not isinstance(hook, dict):
         return
-    out = run(hook)
+    out = run_reply(hook) if hook.get("hook_event_name") == "Stop" else run(hook)
     if out:
         sys.stdout.write(json.dumps(out))
         sys.stdout.flush()

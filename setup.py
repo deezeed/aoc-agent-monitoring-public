@@ -94,6 +94,14 @@ STATUSLINE_CHAIN_FILE = os.path.join(HOOKS_DST_DIR, "aoc_statusline_chain.json")
 PERMISSION_SCRIPT = "aoc_permission.py"
 PERMISSION_EVENT = "PermissionRequest"
 PERMISSION_TIMEOUT_S = 1800  # aoc_permission.py gives up holding after 25 min
+# The same script is AOC's second Stop hook: it holds the end of a turn
+# while you're away so you can reply from the dashboard. Its own entry,
+# separate from run_hook.pyw's Stop entry.
+HELD_EVENTS = (PERMISSION_EVENT, "Stop")
+# Budget caps: Claude Code POSTs every PreToolUse to monitor.py, which
+# answers allow or deny from memory -- an HTTP hook, no process per tool call.
+BUDGET_HOOK_URL = "http://127.0.0.1:5151/hook/pretool"
+BUDGET_HOOK_TIMEOUT_S = 3
 
 TASK_NAME = r"\AOC\AOC Watchdog"
 SENTINEL_TASK_NAME = r"\AOC\AOC Sentinel"
@@ -251,8 +259,37 @@ def _hook_command(pythonw: str) -> str:
 
 
 def _is_aoc_hook(h: dict) -> bool:
-    cmd = h.get("command", "").replace("\\", "/").rstrip('"')
-    return cmd.endswith("run_hook.pyw") or cmd.endswith(PERMISSION_SCRIPT)
+    return _is_run_hook(h) or _is_held_hook(h) or _is_budget_hook(h)
+
+
+def _is_budget_hook(h: dict) -> bool:
+    return h.get("type") == "http" and str(h.get("url", "")).startswith("http://127.0.0.1:5151/hook/")
+
+
+def _merge_budget_hook(settings: dict) -> str:
+    """Pure core: AOC's HTTP PreToolUse entry (all tools). Returns "added",
+    "updated" or "unchanged"."""
+    want = {"type": "http", "url": BUDGET_HOOK_URL, "timeout": BUDGET_HOOK_TIMEOUT_S}
+    entries = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    for entry in entries:
+        for h in entry.get("hooks", []):
+            if _is_budget_hook(h):
+                if h == want and entry.get("matcher") == "*":
+                    return "unchanged"
+                h.clear()
+                h.update(want)
+                entry["matcher"] = "*"
+                return "updated"
+    entries.append({"matcher": "*", "hooks": [want]})
+    return "added"
+
+
+def _is_run_hook(h: dict) -> bool:
+    return h.get("command", "").replace("\\", "/").rstrip('"').endswith("run_hook.pyw")
+
+
+def _is_held_hook(h: dict) -> bool:
+    return h.get("command", "").replace("\\", "/").rstrip('"').endswith(PERMISSION_SCRIPT)
 
 
 def _permission_command(python: str) -> str:
@@ -260,13 +297,13 @@ def _permission_command(python: str) -> str:
     return f'"{python.replace(chr(92), "/")}" "{script}"'
 
 
-def _merge_permission_hook(settings: dict, command: str) -> str:
-    """Pure core: AOC's PermissionRequest entry (own command + timeout).
-    Returns "added", "updated" or "unchanged"."""
-    entries = settings.setdefault("hooks", {}).setdefault(PERMISSION_EVENT, [])
+def _merge_permission_hook(settings: dict, command: str, event: str = PERMISSION_EVENT) -> str:
+    """Pure core: AOC's aoc_permission.py entry for one of HELD_EVENTS (own
+    command + timeout). Returns "added", "updated" or "unchanged"."""
+    entries = settings.setdefault("hooks", {}).setdefault(event, [])
     for entry in entries:
         for h in entry.get("hooks", []):
-            if _is_aoc_hook(h):
+            if _is_held_hook(h):
                 if h.get("command") == command and h.get("timeout") == PERMISSION_TIMEOUT_S:
                     return "unchanged"
                 h["command"] = command
@@ -291,7 +328,7 @@ def _merge_hook_entries(settings: dict, command: str):
             if entry.get("matcher", "") != matcher:
                 continue
             for h in entry.get("hooks", []):
-                if _is_aoc_hook(h):
+                if _is_run_hook(h):
                     found = True
                     if h.get("command") != command:
                         h["command"] = command
@@ -354,11 +391,18 @@ def merge_hook_settings(pythonw: str) -> None:
     brings an existing entry's command up to date."""
     settings = _load_settings()
     added, updated = _merge_hook_entries(settings, _hook_command(pythonw))
-    perm = _merge_permission_hook(settings, _permission_command(_find_python_console(pythonw)))
-    if perm == "added":
-        added.append((PERMISSION_EVENT, ""))
-    elif perm == "updated":
-        updated.append((PERMISSION_EVENT, ""))
+    held_cmd = _permission_command(_find_python_console(pythonw))
+    for event in HELD_EVENTS:
+        res = _merge_permission_hook(settings, held_cmd, event)
+        if res == "added":
+            added.append((event, ""))
+        elif res == "updated":
+            updated.append((event, ""))
+    res = _merge_budget_hook(settings)
+    if res == "added":
+        added.append(("PreToolUse", "*"))
+    elif res == "updated":
+        updated.append(("PreToolUse", "*"))
 
     if DRY_RUN:
         if added:
@@ -449,11 +493,14 @@ def validate() -> None:
             settings = json.load(f)
         events = settings.get("hooks", {})
         missing = [e for e, _ in HOOK_SPECS if e not in events] + \
-                  ([] if PERMISSION_EVENT in events else [PERMISSION_EVENT])
+                  [e for e in HELD_EVENTS
+                   if not any(_is_held_hook(h) for entry in events.get(e, []) for h in entry.get("hooks", []))] + \
+                  ([] if any(_is_budget_hook(h) for entry in events.get("PreToolUse", []) for h in entry.get("hooks", []))
+                   else ["PreToolUse (budget caps)"])
         if missing:
             print(f"[WARN] settings.json missing hook events: {missing}")
         else:
-            print(f"[ok] settings.json has all {len(HOOK_SPECS) + 1} AOC hook events")
+            print(f"[ok] settings.json has all {len(HOOK_SPECS) + len(HELD_EVENTS) + 1} AOC hook entries")
         sl = settings.get("statusLine")
         print(f"[{'ok' if _is_aoc_statusline(sl) else 'WARN'}] statusLine "
               + ("runs the AOC plan-limit recorder" if _is_aoc_statusline(sl) else "is not AOC's -- the plan-limit meter stays empty"))

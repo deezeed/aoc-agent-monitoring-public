@@ -3205,6 +3205,7 @@ def _focus_session_terminal(session_id):
 # prompt back to the terminal dialog.
 REMOTE_APPROVE_FILE = os.path.join(AOC_DATA_DIR, "remote_approve.json")
 _PERM_MODES = ("off", "away", "always")
+_REPLY_MODES = ("off", "away")
 _PERM_POLL_STALE_S = 15   # no poll for this long = the hook is gone (Esc, session closed)
 _PERM_BACK_IDLE_S = 5     # input this recent while held in "away" mode = you're back
 _perm_lock = threading.Lock()
@@ -3218,7 +3219,8 @@ def _sanitize_remote_approve(data) -> dict:
         idle_min = int(data.get("idle_min", 5))
     except (TypeError, ValueError):
         idle_min = 5
-    return {"mode": mode, "idle_min": max(1, min(idle_min, 120))}
+    reply = data.get("reply") if data.get("reply") in _REPLY_MODES else "away"
+    return {"mode": mode, "idle_min": max(1, min(idle_min, 120)), "reply": reply}
 
 
 def _load_remote_approve() -> dict:
@@ -3226,7 +3228,11 @@ def _load_remote_approve() -> dict:
 
 
 def _save_remote_approve(data) -> dict:
-    cfg = _sanitize_remote_approve(data)
+    """Saves the fields present in `data`; the rest keep their stored value."""
+    merged = _load_remote_approve()
+    if isinstance(data, dict):
+        merged.update({k: v for k, v in data.items() if k in ("mode", "idle_min", "reply")})
+    cfg = _sanitize_remote_approve(merged)
     os.makedirs(os.path.dirname(REMOTE_APPROVE_FILE), exist_ok=True)
     with open(REMOTE_APPROVE_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
@@ -3328,6 +3334,104 @@ def _perm_pending_by_session(now) -> dict:
                 out.setdefault(q["session_id"], []).append(
                     {"id": q["id"], "tool_name": q["tool_name"], "summary": q["summary"],
                      "detail": q["detail"], "age_s": int(now - q["created"])})
+    return out
+
+
+# ── Reply from the dashboard: answer a finished turn while you're away ────
+# The same hook script also runs on Stop (aoc_permission.py, mode "reply").
+# When a turn ends while you're away it asks POST /reply/request whether to
+# hold the end of the turn; while it holds, the dashboard shows the last
+# message with a reply box. Your reply goes back as the Stop hook's
+# {"decision": "block", "reason": ...} and Claude carries on with it.
+# Claude Code ends the turn anyway after CLAUDE_CODE_STOP_HOOK_BLOCK_CAP (8)
+# blocks in a row, so AOC stops offering a reply one short of that.
+_REPLY_MAX_STREAK = 7
+_reply_lock = threading.Lock()
+_reply_requests = {}      # id -> request dict (see _reply_open)
+_reply_streak = {}        # session_id -> replies sent in a row without you typing
+
+
+def _reply_should_hold(cfg, idle_s, streak) -> bool:
+    """Pure: hold the end of a turn for a reply from the dashboard?"""
+    if cfg.get("reply") != "away" or idle_s is None or streak >= _REPLY_MAX_STREAK:
+        return False
+    return idle_s >= cfg["idle_min"] * 60
+
+
+def _reply_expire(now):
+    """Drop requests whose hook stopped polling. Caller holds _reply_lock."""
+    for rid in [r for r, q in _reply_requests.items() if now - q["last_poll"] > _PERM_POLL_STALE_S]:
+        del _reply_requests[rid]
+
+
+def _reply_open(data, cfg, now) -> dict:
+    """POST /reply/request from the Stop hook -> {"hold": false} or
+    {"hold": true, "id"}. stop_hook_active false = this turn started from you
+    typing, so the run of dashboard replies starts again from zero."""
+    sid = str(data.get("session_id") or "")
+    with _reply_lock:
+        if not data.get("stop_hook_active"):
+            _reply_streak.pop(sid, None)
+        if not sid or not _reply_should_hold(cfg, data.get("idle_s"), _reply_streak.get(sid, 0)):
+            return {"hold": False}
+        _reply_expire(now)
+        for rid in [r for r, q in _reply_requests.items() if q["session_id"] == sid]:
+            del _reply_requests[rid]   # a newer turn end replaces an older one
+        rid = _secrets.token_hex(8)
+        _reply_requests[rid] = {
+            "id": rid, "session_id": sid,
+            "message": str(data.get("last_assistant_message") or "")[-6000:],
+            "created": now, "last_poll": now, "state": "pending", "reply": "",
+        }
+    return {"hold": True, "id": rid}
+
+
+def _reply_poll(rid, idle_s, cfg, now) -> dict:
+    """GET /reply/poll from the holding hook -> {"state": pending|reply|
+    release, "reply"}. Handed out once, then gone."""
+    with _reply_lock:
+        req = _reply_requests.get(rid)
+        if not req:
+            return {"state": "release"}
+        req["last_poll"] = now
+        if req["state"] == "pending":
+            if cfg.get("reply") != "away" or (idle_s is not None and idle_s < _PERM_BACK_IDLE_S):
+                req["state"] = "release"
+            else:
+                return {"state": "pending"}
+        del _reply_requests[rid]
+        if req["state"] == "reply":
+            _reply_streak[req["session_id"]] = _reply_streak.get(req["session_id"], 0) + 1
+        return {"state": req["state"], "reply": req["reply"]}
+
+
+def _reply_send(rid, action, text="") -> tuple:
+    """POST /reply/send from the dashboard: action "reply" (needs text) or
+    "done" (let the turn end; the session waits in the terminal as usual).
+    Returns (ok, error)."""
+    text = str(text or "").strip()
+    if action not in ("reply", "done"):
+        return False, "unknown action"
+    if action == "reply" and not text:
+        return False, "empty reply"
+    with _reply_lock:
+        req = _reply_requests.get(rid)
+        if not req or req["state"] != "pending":
+            return False, "no longer waiting"
+        req["state"] = "reply" if action == "reply" else "release"
+        req["reply"] = text[:20000]
+    return True, ""
+
+
+def _reply_pending_by_session(now) -> dict:
+    """{session_id: {id, message, age_s}} for turns held for a reply."""
+    out = {}
+    with _reply_lock:
+        _reply_expire(now)
+        for q in _reply_requests.values():
+            if q["state"] == "pending":
+                out[q["session_id"]] = {"id": q["id"], "message": q["message"],
+                                        "age_s": int(now - q["created"])}
     return out
 
 
@@ -5166,6 +5270,497 @@ def _launch_session(data, now=None, popen=None):
     p = (popen or subprocess.Popen)(_launch_argv(exe, args), cwd=args["cwd"],
                                     creationflags=0x00000010 if os.name == "nt" else 0)  # CREATE_NEW_CONSOLE
     return {"ok": True, "pid": p.pid, "cwd": args["cwd"], "trusted": _folder_trusted(args["cwd"])}
+
+
+# ── Task queue: start a session later -- at a set time and/or once the
+# plan limits allow. %LOCALAPPDATA%\AOC\queue.json holds the tasks; a worker
+# checks every 20 s and starts at most one task a minute through
+# _launch_session, so a reset doesn't fire the whole queue at once.
+QUEUE_FILE = os.path.join(AOC_DATA_DIR, "queue.json")
+_QUEUE_LIMIT_PCT = 95.0      # a window at/over this counts as "not available yet"
+_QUEUE_MIN_GAP_S = 60
+_QUEUE_KEEP_DONE_S = 24 * 3600
+_QUEUE_MAX = 50
+_queue_lock = threading.Lock()
+_queue_last_launch = [0.0]
+
+
+def _queue_limits_ok(view) -> bool:
+    """Pure: may a queued task use the plan now? (No limit data = yes.)"""
+    for w in (view or {}).get("windows", []):
+        if w.get("status") == "hit":
+            return False
+        if isinstance(w.get("pct"), (int, float)) and w["pct"] >= _QUEUE_LIMIT_PCT:
+            return False
+    return True
+
+
+def _queue_waiting_on(task, view, now) -> str:
+    """Pure: what a queued task waits for -- 'time', 'limits' or '' (due)."""
+    if task.get("at") and now < task["at"]:
+        return "time"
+    if task.get("limits", True) and not _queue_limits_ok(view):
+        return "limits"
+    return ""
+
+
+def _queue_next_due(tasks, view, now, last_launch):
+    """Pure: the queued task to start now (oldest due first), or None."""
+    if now - last_launch < _QUEUE_MIN_GAP_S:
+        return None
+    due = [t for t in tasks if t.get("state") == "queued" and not _queue_waiting_on(t, view, now)]
+    return min(due, key=lambda t: (t.get("at") or 0, t["created"])) if due else None
+
+
+def _queue_prune(tasks, now):
+    """Pure: drop finished tasks older than a day."""
+    return [t for t in tasks if t.get("state") == "queued"
+            or now - (t.get("finished_at") or t.get("created") or 0) < _QUEUE_KEEP_DONE_S]
+
+
+def _queue_load():
+    data = _load_json_file(QUEUE_FILE, [])
+    return [t for t in data if isinstance(t, dict) and t.get("id")] if isinstance(data, list) else []
+
+
+def _queue_save(tasks):
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False)
+    os.replace(tmp, QUEUE_FILE)
+
+
+def _queue_add(data, now=None) -> dict:
+    """POST /queue {cwd, prompt, model, at?, limits?} -> {"ok", "task"}."""
+    now = now or time.time()
+    args, err = _launch_validate(data)
+    if err:
+        return {"ok": False, "error": err}
+    if not args["prompt"]:
+        return {"ok": False, "error": "a queued task needs a first message"}
+    at = data.get("at")
+    if at not in (None, "", 0):
+        try:
+            at = int(float(at))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad start time"}
+        if at < now - 60 or at > now + 14 * 86400:
+            return {"ok": False, "error": "pick a start time within the next 14 days"}
+    else:
+        at = None
+    limits = data.get("limits", True) is not False
+    if at is None and not limits:
+        return {"ok": False, "error": "nothing to wait for -- use Start session instead"}
+    task = {"id": _secrets.token_hex(6), "cwd": args["cwd"], "prompt": args["prompt"], "model": args["model"],
+            "at": at, "limits": limits, "created": now, "state": "queued"}
+    with _queue_lock:
+        tasks = _queue_prune(_queue_load(), now)
+        if sum(1 for t in tasks if t.get("state") == "queued") >= _QUEUE_MAX:
+            return {"ok": False, "error": f"the queue is full ({_QUEUE_MAX} tasks)"}
+        tasks.append(task)
+        _queue_save(tasks)
+    return {"ok": True, "task": task}
+
+
+def _queue_cancel(tid, now=None) -> bool:
+    """POST /queue/cancel {id}: a queued task -> cancelled; a finished one is removed."""
+    now = now or time.time()
+    with _queue_lock:
+        tasks = _queue_load()
+        for t in tasks:
+            if t.get("id") == tid:
+                if t.get("state") == "queued":
+                    t["state"], t["finished_at"] = "cancelled", now
+                else:
+                    tasks.remove(t)
+                _queue_save(tasks)
+                return True
+    return False
+
+
+def _queue_view(view, now) -> list:
+    """The /status 'queue' block: tasks with what each waits for."""
+    with _queue_lock:
+        tasks = _queue_prune(_queue_load(), now)
+    out = []
+    for t in sorted(tasks, key=lambda t: (t.get("state") != "queued", t.get("at") or 0, t["created"])):
+        row = {k: t.get(k) for k in ("id", "cwd", "model", "at", "limits", "created", "state",
+                                     "finished_at", "pid", "error")}
+        row["prompt"] = (t.get("prompt") or "")[:300]
+        row["waiting_on"] = _queue_waiting_on(t, view, now) if t.get("state") == "queued" else ""
+        out.append(row)
+    return out
+
+
+def _queue_tick(now=None, launch=None, view=None):
+    """One worker pass: start the next due task, if any. Returns it or None."""
+    now = now or time.time()
+    view = _rate_limits_snapshot() if view is None else view
+    with _queue_lock:
+        tasks = _queue_load()
+        task = _queue_next_due(tasks, view, now, _queue_last_launch[0])
+        if not task:
+            return None
+        _queue_last_launch[0] = now
+        res = (launch or _launch_session)({"cwd": task["cwd"], "prompt": task["prompt"], "model": task["model"]}, now=now)
+        if not res.get("ok") and "every few seconds" in str(res.get("error")):
+            _queue_last_launch[0] = now - _QUEUE_MIN_GAP_S + 10   # a manual launch just ran; retry soon
+            return None
+        task["state"] = "launched" if res.get("ok") else "failed"
+        task["finished_at"] = now
+        task["pid"] = res.get("pid")
+        task["error"] = res.get("error") or ""
+        _queue_save(_queue_prune(tasks, now))
+    try:
+        name = os.path.basename(task["cwd"]) or task["cwd"]
+        if task["state"] == "launched":
+            _show_native_toast(f"▶ Queued task started · {name}", task["prompt"][:120])
+        else:
+            _show_native_toast(f"⚠ Queued task failed · {name}", task["error"][:120])
+    except Exception:
+        pass
+    return task
+
+
+# ── Hard budget caps: stop a session's tool calls past a $ limit ───────────
+# A per-session cap and a daily cap (all of today's Claude Code spend). The
+# worker below re-evaluates every 10 s into _budget_state; Claude Code asks
+# POST /hook/pretool (an HTTP PreToolUse hook, see setup.py) before every
+# tool call and gets a "deny" with the reason once a cap is reached, so
+# Claude stops and tells you where it got to. "Let it continue" on the
+# dashboard gives that session one more cap's worth (or lifts today's cap).
+BUDGET_CAPS_FILE = os.path.join(AOC_DATA_DIR, "budget_caps.json")
+_BUDGET_MAX_USD = 100000.0
+_budget_lock = threading.Lock()
+_budget_state = {"day": None, "sessions": {}, "today_spend": 0.0, "at": 0.0}
+
+
+def _sanitize_budget_caps(data) -> dict:
+    data = data if isinstance(data, dict) else {}
+
+    def usd(v):
+        try:
+            v = round(float(v), 2)
+        except (TypeError, ValueError):
+            return None
+        return v if 0 < v <= _BUDGET_MAX_USD else None
+
+    overrides = {}
+    for sid, cap in list((data.get("overrides") or {}).items())[-200:] if isinstance(data.get("overrides"), dict) else []:
+        c = usd(cap)
+        if c and str(sid):
+            overrides[str(sid)[:100]] = c
+    day_override = str(data.get("day_override") or "")
+    return {"session_usd": usd(data.get("session_usd")), "day_usd": usd(data.get("day_usd")),
+            "overrides": overrides,
+            "day_override": day_override if re.match(r"^\d{4}-\d\d-\d\d$", day_override) else ""}
+
+
+def _load_budget_caps() -> dict:
+    return _sanitize_budget_caps(_load_json_file(BUDGET_CAPS_FILE, {}))
+
+
+def _save_budget_caps(data) -> dict:
+    """Saves the fields present in `data`; the rest keep their stored value."""
+    merged = _load_budget_caps()
+    if isinstance(data, dict):
+        merged.update({k: v for k, v in data.items() if k in ("session_usd", "day_usd", "overrides", "day_override")})
+    cfg = _sanitize_budget_caps(merged)
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = BUDGET_CAPS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    os.replace(tmp, BUDGET_CAPS_FILE)
+    return cfg
+
+
+def _budget_verdicts(caps, sessions, today_spend, today_str) -> dict:
+    """Pure: caps + [(session_id, cost)] + today's total -> which caps are
+    reached: {"day": {...}|None, "sessions": {sid: {...}}}."""
+    day = None
+    if caps.get("day_usd") and today_spend >= caps["day_usd"] and caps.get("day_override") != today_str:
+        day = {"kind": "day", "spent": round(today_spend, 2), "cap": caps["day_usd"]}
+    out = {}
+    for sid, cost in sessions:
+        cap = caps.get("overrides", {}).get(sid) or caps.get("session_usd")
+        if cap and (cost or 0) >= cap:
+            out[sid] = {"kind": "session", "spent": round(cost or 0, 2), "cap": cap}
+    return {"day": day, "sessions": out}
+
+
+def _budget_reason(v) -> str:
+    """Pure: what Claude is told when a tool call is denied."""
+    what = (f"this session has spent ${v['spent']:.2f} of its ${v['cap']:.2f} budget cap" if v["kind"] == "session"
+            else f"today's Claude Code spend is ${v['spent']:.2f}, over the ${v['cap']:.2f} daily cap")
+    return (f"AOC budget cap reached: {what}. Do not call any more tools. Stop now and tell the user "
+            "briefly what is done and what is left; they can let the session continue from the AOC dashboard.")
+
+
+def _budget_hook_reply(state, hook) -> dict:
+    """Pure: POST /hook/pretool body (Claude Code's PreToolUse input) ->
+    {} (go ahead) or the deny decision."""
+    if not isinstance(hook, dict) or hook.get("hook_event_name", "PreToolUse") != "PreToolUse":
+        return {}
+    v = (state.get("sessions") or {}).get(str(hook.get("session_id") or "")) or state.get("day")
+    if not v:
+        return {}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": _budget_reason(v)}}
+
+
+def _budget_continue(data, caps, state, today_str):
+    """Pure: POST /budget_caps/continue {session_id} -> (new caps, ok).
+    A session over its cap gets one more cap's worth on top of what it has
+    spent; the daily cap is lifted for the rest of today."""
+    caps = {**caps, "overrides": dict(caps.get("overrides") or {})}
+    sid = str((data or {}).get("session_id") or "")
+    ok = False
+    v = (state.get("sessions") or {}).get(sid)
+    if v and caps.get("session_usd"):
+        caps["overrides"][sid] = round(v["spent"] + caps["session_usd"], 2)
+        ok = True
+    if state.get("day") or (data or {}).get("day"):
+        caps["day_override"] = today_str
+        ok = True
+    return caps, ok
+
+
+def _budget_today_spend(live, today_str) -> float:
+    """Today's Claude Code spend: sessions.cost of today's rows, with live
+    sessions' current cost in place of their (older) saved value."""
+    live = dict(live)
+    total = 0.0
+    with _db_lock:
+        try:
+            c = _db_conn()
+            rows = c.execute("SELECT id, cost FROM sessions WHERE date = ?", (today_str,)).fetchall()
+            c.close()
+        except Exception:
+            rows = []
+    for r in rows:
+        if r["id"] not in live:
+            total += r["cost"] or 0
+    return total + sum(v or 0 for v in live.values())
+
+
+def _budget_tick(now=None):
+    now = now or time.time()
+    caps = _load_budget_caps()
+    d = _own_status_payload() or {}
+    sessions = [(s["id"], s.get("estimated_cost") or 0) for s in d.get("sessions_list") or [] if s.get("session_active") is not False]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_spend = _budget_today_spend(sessions, today_str) if caps.get("day_usd") else 0.0
+    v = _budget_verdicts(caps, sessions, today_spend, today_str)
+    with _budget_lock:
+        prev = dict(_budget_state)
+        _budget_state.update(v, today_spend=round(today_spend, 2), at=now)
+    names = {s["id"]: s.get("display_name") or s.get("project") or "Session" for s in d.get("sessions_list") or []}
+    new = [(sid, x) for sid, x in v["sessions"].items() if sid not in (prev.get("sessions") or {})]
+    if v["day"] and not prev.get("day"):
+        new.append(("", v["day"]))
+    for sid, x in new:
+        title = f"⛔ Budget cap · {names.get(sid, 'Session')[:40]}" if sid else "⛔ Daily budget cap reached"
+        body = f"${x['spent']:.2f} of ${x['cap']:.2f} -- tool calls are blocked until you let it continue"
+        try:
+            _show_native_toast(title, body)
+        except Exception:
+            pass
+        cfg = _webhook_settings
+        if cfg.get("url") and (cfg.get("events") or {}).get("budget_alert"):
+            _fire_webhook(cfg["url"], {"event": "budget_cap", "kind": x["kind"], "session_id": sid or None,
+                                       "display_name": names.get(sid) if sid else None,
+                                       "spent": x["spent"], "cap": x["cap"]})
+
+
+def _budget_worker():
+    time.sleep(20)
+    while True:
+        try:
+            _budget_tick()
+        except Exception as e:
+            _log_bg_error("budget_worker", e)
+        time.sleep(10)
+
+
+threading.Thread(target=_budget_worker, daemon=True, name="budget-worker").start()
+
+
+def _queue_worker():
+    time.sleep(_STARTUP_GRACE_S / 6)
+    while True:
+        try:
+            _queue_tick()
+        except Exception as e:
+            _log_bg_error("queue_worker", e)
+        time.sleep(20)
+
+
+threading.Thread(target=_queue_worker, daemon=True, name="queue-worker").start()
+
+
+# ── Session replay: one session's transcript, step by step ────────────────
+# GET /session_replay?session_id= -> every prompt, piece of assistant text,
+# tool call (with its result / error) and git commit in order, with the cost
+# of each API call on the first step it produced -- to see afterwards where
+# a session went wrong or where the money went.
+_REPLAY_MAX_STEPS = 4000
+_REPLAY_TEXT_MAX = 1200
+_replay_cache = {"key": None, "value": None}
+_replay_cache_lock = threading.Lock()
+
+
+def _replay_epoch(ts):
+    """Pure: transcript ISO timestamp -> epoch seconds (None if unparsable)."""
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _replay_result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _replay_steps(lines, max_steps=_REPLAY_MAX_STEPS) -> dict:
+    """Pure: transcript lines (raw JSON strings) -> {"steps", "summary",
+    "truncated"}. Main thread only; each API call's cost is counted once
+    (lines repeat the same usage per content block) and put on the first
+    step it produced."""
+    steps, by_tool_id, seen_calls = [], {}, set()
+    total = 0.0
+    calls = 0
+    pending = {}   # the current API call's cost, until a step from that call takes it
+
+    def flush():
+        if pending:   # a call that produced no text / tool step (only thinking)
+            steps.append({"t": pending["t"], "kind": "text", "text": "(thinking)", "cost": pending["cost"],
+                          "model": pending["model"], "tokens": pending["tokens"]})
+            pending.clear()
+    for raw in lines:
+        try:
+            obj = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or obj.get("isSidechain"):
+            continue
+        t = _replay_epoch(obj.get("timestamp"))
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        if obj.get("type") == "user" and not obj.get("isMeta"):
+            flush()
+            if isinstance(content, str) and content.strip():
+                text = content.strip()
+                kind = "command" if text.startswith(("<command-", "<local-command")) else "prompt"
+                if kind == "command":
+                    m = re.search(r"<command-name>([^<]*)</command-name>", text)
+                    text = m.group(1).strip() if m else "(command output)"
+                    if not m:
+                        continue
+                steps.append({"t": t, "kind": kind, "text": text[:_REPLAY_TEXT_MAX]})
+            elif isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_result":
+                        st = by_tool_id.pop(b.get("tool_use_id"), None)
+                        if st is not None:
+                            st["err"] = bool(b.get("is_error"))
+                            st["result"] = _replay_result_text(b.get("content")).strip()[:400]
+                            if t and st.get("t"):
+                                st["secs"] = round(max(0.0, t - st["t"]), 1)
+                    elif b.get("type") == "text" and (b.get("text") or "").strip() \
+                            and not str(b.get("text")).lstrip().startswith("<"):
+                        steps.append({"t": t, "kind": "prompt", "text": b["text"].strip()[:_REPLAY_TEXT_MAX]})
+        elif obj.get("type") == "assistant" and isinstance(content, list):
+            usage = msg.get("usage") or {}
+            model = msg.get("model") or ""
+            key = (msg.get("id") or "", obj.get("requestId") or "")
+            if pending and pending["key"] != key:
+                flush()
+            if usage and (key == ("", "") or key not in seen_calls):
+                seen_calls.add(key)
+                calls += 1
+                cost = _calc_cost(usage.get("input_tokens", 0) or 0, usage.get("output_tokens", 0) or 0,
+                                  usage.get("cache_creation_input_tokens", 0) or 0,
+                                  usage.get("cache_read_input_tokens", 0) or 0, model,
+                                  ((usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0))
+                total += cost
+                pending.update(key=key, cost=round(cost, 5), model=model, t=t,
+                               tokens=sum((usage.get(k, 0) or 0) for k in ("input_tokens", "output_tokens",
+                                                                       "cache_creation_input_tokens", "cache_read_input_tokens")))
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                st = None
+                if b.get("type") == "text" and (b.get("text") or "").strip():
+                    st = {"t": t, "kind": "text", "text": b["text"].strip()[:_REPLAY_TEXT_MAX]}
+                elif b.get("type") == "tool_use":
+                    summary, detail = _perm_summary(b.get("name"), b.get("input"))
+                    st = {"t": t, "kind": "tool", "tool": str(b.get("name") or "?"), "text": summary,
+                          "detail": detail[:_REPLAY_TEXT_MAX], "err": None}
+                    if _is_commit_call(b.get("name"), b.get("input")):
+                        st["commit"] = True
+                    by_tool_id[b.get("id")] = st
+                if st is None:
+                    continue
+                if pending and pending["key"] == key:
+                    st["cost"], st["model"], st["tokens"] = pending["cost"], pending["model"], pending["tokens"]
+                    pending.clear()
+                steps.append(st)
+    flush()
+    truncated = len(steps) > max_steps
+    if truncated:
+        steps = steps[-max_steps:]
+    times = [s["t"] for s in steps if s.get("t")]
+    for i, s in enumerate(steps):
+        s["i"] = i
+    costly = sorted((s for s in steps if s.get("cost")), key=lambda s: -s["cost"])[:5]
+    summary = {
+        "start": min(times) if times else None, "end": max(times) if times else None,
+        "cost": round(total, 4), "calls": calls,
+        "prompts": sum(1 for s in steps if s["kind"] == "prompt"),
+        "tools": sum(1 for s in steps if s["kind"] == "tool"),
+        "errors": sum(1 for s in steps if s.get("err")),
+        "commits": sum(1 for s in steps if s.get("commit")),
+        "top": [s["i"] for s in costly],
+    }
+    return {"steps": steps, "summary": summary, "truncated": truncated}
+
+
+def _find_transcript(sid):
+    """The main transcript file of a session, live or past ('' if none)."""
+    if not re.match(r"^[A-Za-z0-9_-]{8,80}$", str(sid or "")):
+        return ""
+    with _transcript_cursors_lock:
+        path = (_transcript_cursors.get(sid) or {}).get("path")
+    if path and os.path.exists(path):
+        return path
+    base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    hits = glob.glob(os.path.join(base, "*", sid + ".jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else ""
+
+
+def _session_replay(sid) -> dict:
+    """GET /session_replay -> {"ok", "steps", "summary", "truncated"}."""
+    path = _find_transcript(sid)
+    if not path:
+        return {"ok": False, "error": "no transcript for this session on this PC"}
+    st = os.stat(path)
+    key = (path, st.st_size, st.st_mtime)
+    with _replay_cache_lock:
+        if _replay_cache["key"] == key:
+            return _replay_cache["value"]
+    with open(path, "rb") as f:
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    value = {"ok": True, **_replay_steps(lines)}
+    with _replay_cache_lock:
+        _replay_cache["key"], _replay_cache["value"] = key, value
+    return value
 
 
 def _usage_first_sighting(stats: dict, msg_id, request_id) -> bool:
@@ -7877,6 +8472,13 @@ button.le-tag { cursor:pointer; }
 .perm-btn.deny { border-color:var(--r);color:var(--r); }
 .perm-btn.term { color:var(--t2); }
 .perm-btn:hover { filter:brightness(1.12); }
+.reply-ask { border-color:rgba(var(--c-rgb),.45);border-left-color:var(--c);background:rgba(var(--c-rgb),.07); }
+.reply-ask .perm-head .woy-lbl { color:var(--c); }
+.reply-ask .reply-sum { font-family:var(--font);word-break:break-word; }
+.reply-ask .perm-btn.allow { background:var(--c);border-color:var(--c); }
+.reply-full { margin:0;max-height:38vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:400 12px/1.45 var(--font);
+  color:var(--t);background:rgba(0,0,0,.16);padding:8px 10px;border-radius:6px; }
+body.light .reply-full { background:rgba(0,0,0,.05); }
 .td-head { position:relative; }
 .td-launch { position:absolute;right:0;top:4px;font-size:10px;padding:4px 12px; }
 .ln-box { max-width:620px; }
@@ -7893,6 +8495,62 @@ button.le-tag { cursor:pointer; }
 .ln-row .ln-lbl { margin:0; }
 .ln-row select { width:auto !important; }
 .ln-err { font-size:11px;color:var(--r); }
+.ln-chk { display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--t2);cursor:pointer; }
+.q-row { display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid rgba(var(--c-rgb),.1); }
+.q-row:first-child { border-top:0; }
+.q-main { flex:1;min-width:0; }
+.q-name { font-weight:700;font-size:12px; }
+.q-when { font:400 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o);margin-left:6px; }
+.q-when.done { color:var(--g); }
+.q-when.bad { color:var(--r); }
+.q-text { font-size:11px;color:var(--t2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.q-x { font-size:10px;padding:3px 9px; }
+.rp-box { max-width:980px;width:min(980px,96vw); }
+.rp-btn { margin-left:4px; }
+.rp-wrap { display:flex;flex-direction:column;gap:10px;min-width:0; }
+.rp-facts { display:flex;flex-wrap:wrap;gap:6px 14px;font:400 11px var(--font2);color:var(--t2); }
+.rp-facts span:first-child { color:var(--t); }
+.rp-bad { color:var(--r); }
+.rp-strip { display:flex;height:16px;border-radius:4px;overflow:hidden;background:rgba(var(--c-rgb),.06);gap:1px; }
+.rp-seg { display:block;flex-basis:0;min-width:1px;cursor:pointer;background:rgba(var(--c-rgb),.55); }
+.rp-seg.k-text { background:rgba(var(--c-rgb),.28); }
+.rp-seg.k-err { background:var(--r); }
+.rp-seg:hover { filter:brightness(1.35); }
+.rp-ctl { display:flex;align-items:center;gap:10px; }
+.rp-play { font-size:10px;padding:4px 12px;flex-shrink:0; }
+.rp-scrub { flex:1;min-width:0;accent-color:var(--c); }
+.rp-pos { font:400 10px var(--font2);color:var(--t3);flex-shrink:0;min-width:92px;text-align:right; }
+.rp-tabs { display:flex;flex-wrap:wrap;gap:4px; }
+.rp-tab { font:700 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;padding:4px 10px;border-radius:5px;cursor:pointer;
+  border:1px solid rgba(var(--c-rgb),.2);background:transparent;color:var(--t2); }
+.rp-tab.on { border-color:var(--c);color:var(--c);background:rgba(var(--c-rgb),.08); }
+.rp-note { font-size:10px;color:var(--t3); }
+.rp-list { max-height:56vh;overflow:auto;border-top:1px solid rgba(var(--c-rgb),.1); }
+.rp-row { display:grid;grid-template-columns:62px 16px minmax(0,1fr) auto;gap:8px;align-items:baseline;padding:6px 6px;
+  border-bottom:1px solid rgba(var(--c-rgb),.06);font-size:12px; }
+.rp-row.cur { background:rgba(var(--c-rgb),.12);box-shadow:inset 3px 0 0 var(--c); }
+.rp-t { font:400 10px var(--font2);color:var(--t3);text-align:right; }
+.rp-g { text-align:center;color:var(--t3); }
+.rp-row.k-prompt .rp-g, .rp-row.k-prompt .rp-text { color:var(--o); }
+.rp-row.k-prompt .rp-text { font-weight:700; }
+.rp-row.k-err .rp-g, .rp-row.k-err .rp-text b { color:var(--r); }
+.rp-row.k-commit .rp-g { color:var(--g); }
+.rp-row.k-tool .rp-text { font-family:var(--font2);font-size:11px;color:var(--t2); }
+.rp-row.k-tool .rp-text b { color:var(--t); }
+.rp-text { white-space:pre-wrap;word-break:break-word;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden; }
+.rp-secs { margin-left:6px;font:400 9px var(--font2);color:var(--o); }
+.rp-more summary { cursor:pointer;font:400 9px var(--font2);color:var(--t3);margin-top:2px; }
+.rp-more pre { margin:4px 0 0;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;font:400 10px var(--font2);
+  color:var(--t2);background:rgba(0,0,0,.18);padding:6px;border-radius:5px; }
+body.light .rp-more pre { background:rgba(0,0,0,.05); }
+.rp-more pre.rp-errout { color:var(--r); }
+.rp-cost { font:400 10px var(--font2);color:var(--t3);white-space:nowrap; }
+.rp-cost.top { color:var(--o);font-weight:700; }
+@media (max-width: 600px) {
+  .rp-row { grid-template-columns:48px minmax(0,1fr) auto;font-size:11px; }
+  .rp-g { display:none; }
+  .rp-pos { min-width:0; }
+}
 .ln-go { border-color:var(--c);color:var(--c);padding:6px 16px; }
 .ln-go:disabled { opacity:.5; }
 .ln-note { font-size:10px;color:var(--t3);line-height:1.5;margin-top:4px; }
@@ -7961,6 +8619,10 @@ div.td-recap { padding:0; }
 .td-recap-note.err { color:var(--o); }
 .loop-flag { display:flex;align-items:baseline;gap:7px;margin-top:5px;padding:3px 8px;border-radius:5px;min-width:0;
   background:rgba(224,161,58,.09);border:1px solid rgba(224,161,58,.35);font-size:11px;color:var(--t); }
+.budget-flag { align-items:center;flex-wrap:wrap;row-gap:4px;border:1px solid rgba(229,83,75,.35);background:rgba(229,83,75,.08); }
+.budget-flag .loop-text { flex:1 1 150px; }
+.budget-flag .loop-lbl { color:var(--r); }
+.budget-go { margin-left:auto;flex-shrink:0;font-size:9px;padding:3px 9px;border-color:var(--r);color:var(--r); }
 .loop-lbl { flex-shrink:0;font:700 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o); }
 .loop-text { min-width:0;overflow:hidden;color:var(--t2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical; }
 .sbay > .loop-flag { margin:0 12px 8px; }
@@ -9045,6 +9707,20 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
           <label class="settings-lbl">Budget alert ($/session)</label>
           <input class="settings-input" id="st-budget" type="number" min="0" step="0.01" placeholder="e.g. 1.00" title="Show red KPI when exceeded">
         </div>
+        <div class="settings-section">HARD CAPS</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Stop a session at ($)</label>
+          <input class="settings-input" id="st-cap-session" type="number" min="0" step="0.5" placeholder="no cap" style="width:110px" onchange="_capsSave()"
+            title="When one Claude Code session has cost this much, AOC denies its tool calls so Claude stops and reports. 'Let it continue' on the session gives it one more cap's worth.">
+          <label class="settings-lbl">Stop all at ($/day)</label>
+          <input class="settings-input" id="st-cap-day" type="number" min="0" step="1" placeholder="no cap" style="width:110px" onchange="_capsSave()"
+            title="When today's Claude Code spend (all sessions) reaches this, AOC denies tool calls in every session until you lift it for today.">
+          <span id="st-cap-today" style="font-family:var(--font2);font-size:10px;color:var(--t3)"></span>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          Enforced through Claude Code's PreToolUse hook: the model is told the cap is reached and stops. Empty = no cap.
+          If AOC isn't running, nothing is blocked.
+        </div>
         <div class="settings-row" style="align-items:flex-start">
           <label class="settings-lbl" style="padding-top:6px">Per-project budgets</label>
           <textarea class="settings-input settings-input-wide" id="st-project-budgets" rows="3" spellcheck="false"
@@ -9079,6 +9755,18 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
         <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
           Held prompts show <b>Allow</b> / <b>Deny</b> on the session, here and on your phone (remote access).
           Touch the PC again and the prompt goes back to the terminal dialog.
+        </div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Finished turns</label>
+          <select class="settings-input" id="st-ra-reply" style="width:auto" onchange="_raSave()"
+            title="When Claude finishes a turn while you're away, keep the session open for a reply from the dashboard or your phone.">
+            <option value="away">Reply from dashboard while I'm away</option>
+            <option value="off">Terminal only</option>
+          </select>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          Uses the same "away" time. A held turn shows <b>Reply…</b> on the session; Claude carries on with what you write.
+          Up to 7 replies in a row, then the session waits in its terminal.
         </div>
         <div class="settings-section">AWAY RECAPS</div>
         <div class="settings-row" style="gap:10px;flex-wrap:wrap">
@@ -10181,6 +10869,32 @@ function _awayBlockHtml(s, r, nowS, mode){
 /* Pure: the TODAY view. sr = /status, an = /analytics, cm = /commit_costs
    stats for today (or null), nowS = epoch s, todayStr = local YYYY-MM-DD,
    recaps = _recaps, recapMode = auto|click|off. */
+/* Pure: the Queued card's rows (sr.queue from /status, see _queue_view). */
+function _queueHtml(queue, nowS){
+  const clock=s=>{ const d=new Date(s*1000), t=d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    return (s-nowS<20*3600&&new Date(nowS*1000).getDate()===d.getDate())?t:d.toLocaleDateString([], {weekday:'short'})+' '+t; };
+  return (queue||[]).map(t=>{
+    const name=String(t.cwd||'').split(/[\\/]/).filter(Boolean).pop()||t.cwd||'?';
+    let when, cls='';
+    if(t.state==='queued'){
+      when=t.waiting_on==='time'?'at '+clock(t.at)+(t.limits?' · if limits allow':'')
+        :t.waiting_on==='limits'?'waits for plan limits':'starting…';
+    } else if(t.state==='launched'){ when='started '+clock(t.finished_at); cls=' done'; }
+    else if(t.state==='failed'){ when='failed · '+(t.error||''); cls=' bad'; }
+    else { when='cancelled'; cls=' bad'; }
+    const x=t.state==='queued'
+      ?`<button class="adp-btn q-x" onclick="_queueCancel(${jsq(t.id)})" title="Take it off the queue">Cancel</button>`
+      :`<button class="adp-btn q-x" onclick="_queueCancel(${jsq(t.id)})" title="Remove from this list">✕</button>`;
+    return `<div class="q-row"><div class="q-main"><div class="q-name" title="${escHtml(t.cwd||'')}">${escHtml(name)}<span class="q-when${cls}">${escHtml(when)}</span>${t.model?`<span class="q-when">${escHtml(t.model)}</span>`:''}</div>
+      <div class="q-text" title="${escHtml(t.prompt||'')}">${escHtml(t.prompt||'')}</div></div>${x}</div>`;
+  }).join('');
+}
+async function _queueCancel(id){
+  try{
+    const d=await fetch('/queue/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json());
+    if(!d.ok) showToast('warning','Not found','That task is gone already.');
+  }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
+}
 function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
   const awayOf=s=>_awayBlockHtml(s, (recaps||{})[(s.machine||'')+'|'+s.id], nowS, recapMode||'auto');
   sr=sr||{}; an=an||{};
@@ -10205,15 +10919,15 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
     `<b>${sessions.length}</b> session${sessions.length===1?'':'s'} open`,
     `<b>${commits.length}</b> commit${commits.length===1?'':'s'}${cm&&cm.total&&cm.total.cost?` for ${money(cm.total.cost)}`:''}`,
   ];
-  const btn=(s,label)=>`<div class="td-btns">${s._isLocal===false?'':`<button class="adp-btn td-btn" onclick="_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window">${label}</button>`}${_changesBtnHtml(s)}</div>`;
+  const btn=(s,label)=>`<div class="td-btns">${s._isLocal===false?'':`<button class="adp-btn td-btn" onclick="_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window">${label}</button>`}${_changesBtnHtml(s)}${_replayBtnHtml(s)}</div>`;
   const waitRows=waiting.map(s=>{
     const wl=_waitLabel(s);
     const info=_lastMessageInfo(s.last_message, 180);
     const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
     return `<div class="td-row${wl.blocked?' blocked':''}">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag${wl.blocked?' blocked':''}">${escHtml(wl.bay)} · ${escHtml(_fmtDurationDHM(Math.max(60,s.waiting_secs||0)))}</span></div>
-        ${_permAskHtml(s)||(text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:'')}
-        ${_loopBadgeHtml(s)}${awayOf(s)}${_ctxMeterHtml(s, nowS)}</div>
+        ${_permAskHtml(s)||_replyAskHtml(s)||(text?`<div class="td-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:'')}
+        ${_budgetBadgeHtml(s)}${_loopBadgeHtml(s)}${awayOf(s)}${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
   const workRows=working.map(s=>{
@@ -10222,7 +10936,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
     return `<div class="td-row">
       <div class="td-main"><div class="td-name">${escHtml(nameOf(s))}<span class="td-tag run">Working${n?` · ${n} agent${n===1?'':'s'}`:''}</span></div>
         <div class="td-sub">${[model, s.estimated_cost?money(s.estimated_cost):''].filter(Boolean).map(escHtml).join(' · ')}</div>
-        ${_loopBadgeHtml(s)}${awayOf(s)}${_ctxMeterHtml(s, nowS)}</div>
+        ${_budgetBadgeHtml(s)}${_loopBadgeHtml(s)}${awayOf(s)}${_ctxMeterHtml(s, nowS)}</div>
       ${btn(s,'Terminal')}</div>`;
   }).join('');
   const lim=((sr.rate_limits||{}).windows||[]).filter(w=>w.status!=='reset'&&typeof w.pct==='number').map(w=>{
@@ -10250,6 +10964,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
       <div class="td-col">
         ${sec(`Needs you${waiting.length?` <span class="td-count">${waiting.length}</span>`:''}`, waitRows, 'Nothing is waiting on you.')}
         ${sec('Working', workRows, sessions.length?'Every open session is waiting on you.':'No Claude Code session is open.')}
+        ${(sr.queue||[]).length?sec(`Queued <span class="td-count">${sr.queue.filter(t=>t.state==='queued').length}</span>`, _queueHtml(sr.queue, nowS), ''):''}
       </div>
       <div class="td-col">
         ${lim?sec('Plan limits', lim, ''):''}
@@ -10722,6 +11437,96 @@ function _diffLinesHtml(text){
   }).join('\n');
 }
 /* Pure: "Δ n" button for a session that edited files. */
+/* ── Session replay (GET /session_replay) ── */
+function _replayBtnHtml(s){
+  if(!s||!s.id) return '';
+  const label=s.display_name||s.project||'this session';
+  return `<button class="chg-btn rp-btn" onclick="event.stopPropagation();openReplay(${jsq(s.id)},${jsq(s.machine||'')},${jsq(label)})" title="Replay this session step by step: prompts, tool calls, errors, commits and what each step cost">▶</button>`;
+}
+const _RP_GLYPH={prompt:'›',command:'/',text:'◆',tool:'⚙'};
+/* Pure: which steps a filter shows. */
+function _replayFilter(steps, f, top){
+  const t=new Set(top||[]);
+  return (steps||[]).filter(s=>f==='prompts'?(s.kind==='prompt'||s.kind==='text')
+    :f==='tools'?s.kind==='tool':f==='errors'?!!s.err:f==='costly'?t.has(s.i):f==='commits'?!!s.commit:true);
+}
+/* Pure: "+1:02:03" offset of a step from the session start. */
+function _replayOffset(t, start){
+  if(t==null||start==null) return '';
+  let s=Math.max(0,Math.round(t-start));
+  const h=Math.floor(s/3600), m=Math.floor(s%3600/60); s%=60;
+  return '+'+(h?h+':'+String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');
+}
+/* Pure: the replay panel from GET /session_replay. */
+function _replayHtml(d, f){
+  if(!d||!d.ok) return `<div class="chg-empty">${escHtml((d&&d.error)||'Could not load the session.')}</div>`;
+  const sm=d.summary||{}, steps=d.steps||[], money=v=>'$'+(Number(v)||0).toFixed(v>=1?2:3);
+  const dur=sm.start!=null&&sm.end!=null?_fmtDurationDHM(Math.max(60,sm.end-sm.start)):'';
+  const facts=[dur, money(sm.cost), `${sm.calls||0} API calls`, `${sm.prompts||0} prompts`, `${sm.tools||0} tool calls`,
+    sm.errors?`<span class="rp-bad">${sm.errors} failed</span>`:'', sm.commits?`${sm.commits} commit${sm.commits===1?'':'s'}`:''].filter(Boolean);
+  const total=steps.reduce((a,s)=>a+(s.cost||0),0)||1;
+  const strip=steps.filter(s=>s.cost).map(s=>`<i class="rp-seg k-${s.err?'err':s.kind}" style="flex-grow:${(s.cost/total*1000).toFixed(2)}" onclick="_replayGo(${s.i})" title="${escHtml(_replayOffset(s.t,sm.start)+' · '+money(s.cost)+' · '+(s.text||'').slice(0,80))}"></i>`).join('');
+  const top=new Set(sm.top||[]);
+  const tabs=[['all','All'],['prompts','Conversation'],['tools','Tools'],['errors','Failed'],['commits','Commits'],['costly','Costliest 5']]
+    .map(([k,l])=>`<button class="rp-tab${f===k?' on':''}" onclick="_replaySetFilter(${jsq(k)})">${l}</button>`).join('');
+  const rows=_replayFilter(steps, f, sm.top).map(s=>{
+    const k=s.err?'err':s.commit?'commit':s.kind;
+    const glyph=s.err?'✖':s.commit?'⎇':(_RP_GLYPH[s.kind]||'·');
+    const head=s.kind==='tool'?`<b>${escHtml(s.tool||'')}</b> ${escHtml(String(s.text||'').replace(/^[^:]*:\s*/,''))}`:escHtml(s.text||'');
+    const more=(s.detail||s.result)?`<details class="rp-more"><summary>${s.err?'Error':'Details'}</summary>${s.detail?`<pre>${escHtml(s.detail)}</pre>`:''}${s.result?`<pre class="${s.err?'rp-errout':''}">${escHtml(s.result)}</pre>`:''}</details>`:'';
+    const cost=s.cost?`<span class="rp-cost${top.has(s.i)?' top':''}" title="${escHtml((s.model||'')+' · '+(s.tokens||0).toLocaleString()+' tokens')}">${money(s.cost)}</span>`:'';
+    return `<div class="rp-row k-${k}" id="rp-${s.i}" data-i="${s.i}"><span class="rp-t">${_replayOffset(s.t,sm.start)}</span><span class="rp-g">${glyph}</span>
+      <div class="rp-body"><div class="rp-text">${head}${s.secs>=10?`<span class="rp-secs">${Math.round(s.secs)}s</span>`:''}</div>${more}</div>${cost}</div>`;
+  }).join('');
+  return `<div class="rp-wrap">
+    <div class="rp-facts">${facts.map(x=>`<span>${x}</span>`).join('')}</div>
+    ${strip?`<div class="rp-strip" title="Where the money went: one block per API call, width = its cost">${strip}</div>`:''}
+    <div class="rp-ctl"><button class="adp-btn rp-play" onclick="_replayPlay()" title="Step through the session">▶ Play</button>
+      <input type="range" class="rp-scrub" min="0" max="${Math.max(0,steps.length-1)}" value="0" oninput="_replayGo(+this.value,true)" aria-label="Scrub through the session">
+      <span class="rp-pos">${steps.length} steps</span></div>
+    <div class="rp-tabs">${tabs}</div>
+    ${d.truncated?'<div class="rp-note">Long session: showing its last 4,000 steps.</div>':''}
+    <div class="rp-list">${rows||'<div class="chg-empty">Nothing of this kind in this session.</div>'}</div>
+  </div>`;
+}
+let _replayData=null, _replayFilterKey='all', _replayTimer=null;
+async function openReplay(sid, machine, label){
+  const o=_overlay('Replay · '+label, '<div class="chg-empty">Loading…</div>', 'chg-box rp-box');
+  _replayFilterKey='all';
+  try{ _replayData=await fetch(_apiUrl(_machineFor(machine),'/session_replay?session_id='+encodeURIComponent(sid))).then(r=>r.json()); }
+  catch(e){ _replayData={ok:false,error:'Could not reach AOC.'}; }
+  o.querySelector('.chg-body').innerHTML=_replayHtml(_replayData,_replayFilterKey);
+  const obs=new MutationObserver(()=>{ if(!document.body.contains(o)){ clearInterval(_replayTimer); _replayTimer=null; obs.disconnect(); } });
+  obs.observe(document.body,{childList:true});
+}
+function _replaySetFilter(k){
+  _replayFilterKey=k;
+  const b=document.querySelector('.rp-box .chg-body');
+  if(b) b.innerHTML=_replayHtml(_replayData,k);
+}
+function _replayGo(i, fromScrub){
+  const box=document.querySelector('.rp-box'); if(!box) return;
+  let row=box.querySelector('#rp-'+i);
+  if(!row&&_replayFilterKey!=='all'){ _replaySetFilter('all'); row=box.querySelector('#rp-'+i); }
+  box.querySelectorAll('.rp-row.cur').forEach(r=>r.classList.remove('cur'));
+  if(row){ row.classList.add('cur'); row.scrollIntoView({block:'center',behavior:fromScrub?'auto':'smooth'}); }
+  const sc=box.querySelector('.rp-scrub'); if(sc&&!fromScrub) sc.value=i;
+  const pos=box.querySelector('.rp-pos'), n=(_replayData&&_replayData.steps||[]).length;
+  if(pos) pos.textContent=`step ${i+1} of ${n}`;
+}
+function _replayPlay(){
+  const box=document.querySelector('.rp-box'); if(!box) return;
+  const btn=box.querySelector('.rp-play');
+  if(_replayTimer){ clearInterval(_replayTimer); _replayTimer=null; btn.textContent='▶ Play'; return; }
+  if(_replayFilterKey!=='all') _replaySetFilter('all');
+  const sc=document.querySelector('.rp-box .rp-scrub'), n=(_replayData&&_replayData.steps||[]).length;
+  let i=+((sc&&sc.value)||0); if(i>=n-1) i=0;
+  document.querySelector('.rp-box .rp-play').textContent='❚❚ Pause';
+  _replayTimer=setInterval(()=>{
+    if(!document.querySelector('.rp-box')||i>=n){ clearInterval(_replayTimer); _replayTimer=null; const b=document.querySelector('.rp-box .rp-play'); if(b) b.textContent='▶ Play'; return; }
+    _replayGo(i++);
+  },450);
+}
 function _changesBtnHtml(s){
   if(!s||!s.edited_count) return '';
   const label=s.display_name||s.project||'this session';
@@ -11419,6 +12224,8 @@ async function _raLoad(){
     const m=document.getElementById('st-ra-mode'), i=document.getElementById('st-ra-idle');
     if(m) m.value=d.mode||'away';
     if(i) i.value=d.idle_min||5;
+    const rp=document.getElementById('st-ra-reply');
+    if(rp) rp.value=d.reply||'away';
     _raSyncIdle();
     const rm=document.getElementById('st-recap-mode');
     if(rm) rm.value=(await (await fetch('/recap/settings')).json()).mode||'auto';
@@ -11426,19 +12233,76 @@ async function _raLoad(){
 }
 function _raSyncIdle(){
   const m=document.getElementById('st-ra-mode'), w=document.getElementById('st-ra-idle-wrap');
-  if(m&&w) w.style.display=m.value==='away'?'inline-flex':'none';
+  const rp=document.getElementById('st-ra-reply');
+  if(m&&w) w.style.display=m.value==='away'||(rp&&rp.value==='away')?'inline-flex':'none';
 }
 async function _raSave(){
   _raSyncIdle();
   const mode=document.getElementById('st-ra-mode').value;
   const idle_min=parseInt(document.getElementById('st-ra-idle').value,10)||5;
+  const reply=document.getElementById('st-ra-reply').value;
   try{
-    const d=await (await fetch('/permission/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,idle_min})})).json();
+    const d=await (await fetch('/permission/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,idle_min,reply})})).json();
     document.getElementById('st-ra-idle').value=d.idle_min;
   }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
 }
+/* Pure: a finished turn AOC is holding so you can answer it from here
+   (reply from the dashboard: s.reply_request, see _reply_open). '' if none. */
+function _replyAskHtml(s){
+  const r=s&&s.reply_request;
+  if(!r) return '';
+  const info=_lastMessageInfo(r.message||s.last_message, 240);
+  const m=jsq(s.machine||'');
+  return `<div class="perm-ask reply-ask" onclick="event.stopPropagation()">
+    <div class="perm-head"><span class="woy-lbl">💬 ${info&&info.asked?'Claude asks':'Turn finished'} · reply from here</span></div>
+    ${info?`<div class="perm-sum reply-sum">${escHtml(info.text)}</div>`:''}
+    <div class="perm-btns">
+      <button class="perm-btn allow" onclick="_replyOpen(${m},${jsq(s.id)})">Reply…</button>
+      <button class="perm-btn term" onclick="_replySend(${m},${jsq(r.id)},'done')" title="Let the turn end: the session waits in its terminal as usual">Done for now</button>
+    </div></div>`;
+}
+function _replyFind(machine, sid){
+  return ((lastStatus&&lastStatus.sessions_list)||[]).find(s=>s.id===sid&&(s.machine||'')===(machine||''));
+}
+function _replyOpen(machine, sid){
+  const s=_replyFind(machine, sid), r=s&&s.reply_request;
+  if(!r){ showToast('warning','Already answered','This session is no longer waiting for a reply.'); return; }
+  const name=s.display_name||s.project||'session';
+  const o=_overlay('Reply · '+name, `<form class="ln-form" onsubmit="event.preventDefault();_replySubmit(this)">
+    <div class="ln-lbl">Claude's last message</div>
+    <pre class="reply-full">${escHtml(r.message||s.last_message||'(no text)')}</pre>
+    <label class="ln-lbl" for="rp-text">Your reply</label>
+    <textarea id="rp-text" class="settings-input" rows="4" required placeholder="Answer, or tell Claude what to do next" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_replySubmit(this.form)}"></textarea>
+    <div class="ln-row"><span style="flex:1"></span><span class="ln-err" id="rp-err"></span>
+      <button type="submit" class="adp-btn ln-go">Send</button></div>
+    <div class="ln-note">Claude carries on with this in the same session. Touch the PC and the session goes back to its terminal.</div>
+  </form>`, 'chg-box ln-box');
+  o.dataset.machine=machine||''; o.dataset.rid=r.id;
+  const pre=o.querySelector('.reply-full'); pre.scrollTop=pre.scrollHeight;
+  o.querySelector('#rp-text').focus();
+}
+async function _replySubmit(form){
+  const o=form.closest('.diff-overlay');
+  const text=form.querySelector('#rp-text').value.trim();
+  if(!text) return;
+  const go=form.querySelector('.ln-go'); go.disabled=true;
+  const d=await _replySend(o.dataset.machine, o.dataset.rid, 'reply', text, true);
+  go.disabled=false;
+  if(d.ok) o.remove();
+  else form.querySelector('#rp-err').textContent=d.error==='no longer waiting'?'No longer waiting — the session moved on.':(d.error||'Not sent');
+}
+async function _replySend(machineName, id, action, text, quiet){
+  let d={};
+  try{
+    const r=await fetch(_apiUrl(_machineFor(machineName),'/reply/send'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,action,text:text||''})});
+    d=await r.json().catch(()=>({}));
+  }catch(e){ d={ok:false,error:'Could not reach AOC.'}; }
+  if(d.ok) showToast('done',action==='reply'?'Reply sent':'Left for the terminal',action==='reply'?'Claude carries on.':'');
+  else if(!quiet) showToast('warning','Already answered','This session is no longer waiting for a reply.');
+  return d;
+}
 function _woyQuoteHtml(s){
-  const ask=_permAskHtml(s);
+  const ask=_permAskHtml(s)||_replyAskHtml(s);
   if(ask) return ask;
   const wl=_waitLabel(s);
   if(wl.blocked&&s.waiting_message)
@@ -11453,6 +12317,39 @@ function _woyQuoteHtml(s){
    message re-caches the whole context at the cache-write price. */
 /* Pure: "looks stuck in a loop" flag for a CLI session (s.loop comes from
    the transcript scanner, see _loop_signal). '' when it looks healthy. */
+/* Pure: the hard-budget-cap flag on a session (s.budget, see _budget_verdicts):
+   its tool calls are being denied until you let it continue. '' if none. */
+function _budgetBadgeHtml(s){
+  const b=s&&s.budget;
+  if(!b||typeof b.spent!=='number') return '';
+  const what=b.kind==='day'?`Today $${b.spent.toFixed(2)} of the $${b.cap.toFixed(2)} daily cap`:`$${b.spent.toFixed(2)} of its $${b.cap.toFixed(2)} cap`;
+  return `<div class="loop-flag budget-flag" onclick="event.stopPropagation()" title="Claude Code's tool calls in this session are denied by AOC until you let it continue (Settings → COST → HARD CAPS).">
+    <span class="loop-lbl">⛔ Budget cap</span><span class="loop-text">${escHtml(what)} · tools blocked</span>
+    <button class="adp-btn budget-go" onclick="_budgetContinue(${jsq(s.machine||'')},${jsq(s.id)},${b.kind==='day'})">${b.kind==='day'?'Lift for today':'Let it continue'}</button></div>`;
+}
+async function _budgetContinue(machineName, sid, day){
+  try{
+    const d=await fetch(_apiUrl(_machineFor(machineName),'/budget_caps/continue'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,day:!!day})}).then(r=>r.json());
+    if(d.ok) showToast('done',day?'Daily cap lifted for today':'Session may continue',day?'':'It gets one more cap of spend.');
+    else showToast('warning','Nothing to lift','That session is no longer over a cap.');
+  }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
+}
+async function _capsLoad(){
+  try{
+    const d=await (await fetch('/budget_caps')).json();
+    const a=document.getElementById('st-cap-session'), b=document.getElementById('st-cap-day'), t=document.getElementById('st-cap-today');
+    if(a) a.value=d.session_usd||'';
+    if(b) b.value=d.day_usd||'';
+    if(t) t.textContent=d.day_usd?`Today so far: $${(d.today_spend||0).toFixed(2)}${d.day?' — cap reached':''}`:'';
+  }catch(e){}
+}
+async function _capsSave(){
+  const val=id=>{ const v=parseFloat(document.getElementById(id).value); return isFinite(v)&&v>0?v:null; };
+  try{
+    await fetch('/budget_caps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_usd:val('st-cap-session'),day_usd:val('st-cap-day')})});
+    _capsLoad();
+  }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
+}
 function _loopBadgeHtml(s){
   const l=s&&s.loop;
   if(!l||!l.text) return '';
@@ -11543,7 +12440,7 @@ function _sessionBayHtml(bay, stripsHtml){
       <div class="sbay-right"><span class="sbay-counts">${counts}</span>${state}${dismiss}
         <button class="bay-btn" onclick="toggleBay(${jsq(bay.key)})" aria-expanded="${!collapsed}" title="${collapsed?'Show':'Hide'} this session's agents">${collapsed?'▼':'▲'}</button></div>
     </header>
-    ${active?_loopBadgeHtml(s)+_ctxMeterHtml(s, Date.now()/1000):''}
+    ${active?_budgetBadgeHtml(s)+_loopBadgeHtml(s)+_ctxMeterHtml(s, Date.now()/1000):''}
     ${waiting?_woyQuoteHtml(s):''}
     ${collapsed?'':`<div class="sbay-slots">${stripsHtml}</div>`}
   </section>`;
@@ -12036,7 +12933,7 @@ function renderAgents(data){
             </div>
             ${metaLine}
             ${statsLine}
-            ${isActive?_loopBadgeHtml(s)+_ctxMeterHtml(s, Date.now()/1000):''}
+            ${isActive?_budgetBadgeHtml(s)+_loopBadgeHtml(s)+_ctxMeterHtml(s, Date.now()/1000):''}
             ${waitingOnYou?_woyQuoteHtml(s):''}
             ${noteLine}
             ${burnBadge}
@@ -12047,7 +12944,7 @@ function renderAgents(data){
           ${isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window" style="background:none;border:none;color:${waitingOnYou?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='${waitingOnYou?'var(--o)':'var(--t3)'}'">⧉</button>`:''}
           <button onclick="event.stopPropagation();exportSessionDetail(${jsq(s.id)})" title="Export session as Markdown" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⇩</button>
           <button onclick="toggleSessionCompare(${jsq(s.id)},event)" title="${_sessCompareIds.includes(s.id)?'Remove from compare':'Add to compare (pick 2 sessions)'}" style="background:none;border:none;color:${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'};cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--o)'" onmouseout="this.style.color='${_sessCompareIds.includes(s.id)?'var(--o)':'var(--t3)'}'">⊞</button>
-          ${_changesBtnHtml(s)}
+          ${_changesBtnHtml(s)}${_replayBtnHtml(s)}
           ${isActive&&s.host_pid?`<button onclick="event.stopPropagation();_forceStopSession(${jsq(s.id)},${jsq(s.project||s.cwd||'this session')},${jsq(s.machine||'')})" title="Force stop this CLI session (kills its claude.exe process)" style="background:none;border:none;color:rgba(240,164,151,.7);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='rgba(240,164,151,.7)'">⛔</button>`:''}
           ${!isActive&&!sIsRemote?`<button onclick="event.stopPropagation();_copyResumeCmd(${jsq(s.id)})" title="Copy resume command to clipboard" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--c)'" onmouseout="this.style.color='var(--t3)'">⟲</button>`:''}
           ${!isActive?` <button onclick="event.stopPropagation();_dismissSession(${jsq(s.id)},${jsq(s.machine||'')})" title="Dismiss" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:13px;padding:4px 6px;margin-left:4px;line-height:1;border-radius:4px;transition:color .2s" onmouseover="this.style.color='var(--r)'" onmouseout="this.style.color='var(--t3)'">✕</button>`:''}
@@ -13040,7 +13937,12 @@ function _launchFormHtml(dirs, machines, machine){
     <textarea id="ln-prompt" class="settings-input" rows="5" placeholder="What should Claude do? (optional)" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_launchSubmit(this.form)}"></textarea>
     <div class="ln-row"><label class="ln-lbl" for="ln-model">Model</label>
       <select id="ln-model" class="settings-input"><option value="">Default</option><option value="opus">Opus</option><option value="sonnet">Sonnet</option><option value="haiku">Haiku</option></select>
-      <span style="flex:1"></span><span class="ln-err" id="ln-err"></span>
+      <label class="ln-lbl" for="ln-when">Start</label>
+      <select id="ln-when" class="settings-input" onchange="_launchWhen(this.form)" title="Queue it: start later, once your plan limits allow, or at a set time">
+        <option value="now">Now</option><option value="limits">When plan limits allow</option><option value="at">At a time…</option></select>
+      <input id="ln-at" type="datetime-local" class="settings-input" style="display:none;width:auto">
+      <label id="ln-at-lim" class="ln-chk" style="display:none"><input type="checkbox" id="ln-at-limits" checked> and limits allow</label></div>
+    <div class="ln-row"><span style="flex:1"></span><span class="ln-err" id="ln-err"></span>
       <button type="submit" class="adp-btn ln-go">Start session</button></div>
     <div class="ln-note">Opens a new terminal window on that PC. With Remote approve on, its permission prompts reach you here while you're away.</div>
   </form>`;
@@ -13067,11 +13969,43 @@ function _launchPick(btn){
   f.querySelectorAll('.ln-chip').forEach(b=>b.classList.toggle('on', b===btn));
   f.querySelector('#ln-prompt').focus();
 }
+function _launchWhen(form){
+  const w=form.querySelector('#ln-when').value, at=form.querySelector('#ln-at');
+  at.style.display=w==='at'?'':'none';
+  form.querySelector('#ln-at-lim').style.display=w==='at'?'':'none';
+  if(w==='at'&&!at.value){
+    const d=new Date(Date.now()+3600e3); d.setMinutes(0,0,0);
+    at.value=new Date(d.getTime()-d.getTimezoneOffset()*60e3).toISOString().slice(0,16);
+  }
+  form.querySelector('.ln-go').textContent=w==='now'?'Start session':'Add to queue';
+}
+/* Pure: the POST /queue body for the form's "Start" choice, or {error}. */
+function _queueBody(cwd, prompt, model, when, atValue, atLimits){
+  if(!String(prompt||'').trim()) return {error:'A queued task needs a first message.'};
+  if(when==='limits') return {cwd, prompt, model, at:null, limits:true};
+  const t=Date.parse(atValue||'');
+  if(!isFinite(t)) return {error:'Pick a start time.'};
+  return {cwd, prompt, model, at:Math.round(t/1000), limits:!!atLimits};
+}
 async function _launchSubmit(form){
   const o=form.closest('.diff-overlay');
   const machine=(o&&o.dataset.machine)||'';
   const err=form.querySelector('#ln-err');
   const go=form.querySelector('.ln-go');
+  const when=form.querySelector('#ln-when').value;
+  if(when!=='now'){
+    const body=_queueBody(form.querySelector('#ln-cwd').value, form.querySelector('#ln-prompt').value, form.querySelector('#ln-model').value,
+      when, form.querySelector('#ln-at').value, form.querySelector('#ln-at-limits').checked);
+    if(body.error){ err.textContent=body.error; return; }
+    go.disabled=true; err.textContent='';
+    try{
+      const d=await fetch(_apiUrl(_machineFor(machine),'/queue'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+      if(d.ok){ o.remove(); showToast('done','Queued',machine?'It starts on '+machine+' when it is due.':'It shows under Queued on Today.'); }
+      else err.textContent=d.error||'Could not queue it.';
+    }catch(e){ err.textContent='Could not reach AOC.'; }
+    go.disabled=false;
+    return;
+  }
   go.disabled=true; err.textContent='';
   try{
     const d=await fetch(_apiUrl(_machineFor(machine),'/launch'),{method:'POST',headers:{'Content-Type':'application/json'},
@@ -13420,6 +14354,7 @@ async function showHistoryDetail(sid,baseUrl,token){
         <span style="font-family:var(--font2);font-size:11px;color:var(--c);letter-spacing:.1em">${escHtml(snap.project||'Session '+sid)}</span>
         <span style="font-family:var(--font2);font-size:9px;color:var(--t3)">${snap.started_at||''}</span>
         ${d.cc_version?`<span style="font-family:var(--font2);font-size:9px;color:var(--t3)" title="Claude Code version">v${escHtml(d.cc_version)}</span>`:''}
+        ${baseUrl?'':`<button class="adp-btn" style="font-size:9px;padding:2px 10px;margin-left:auto" onclick="openReplay(${jsq(sid)},'',${jsq(snap.project||'session')})" title="Replay this session step by step from its transcript">▶ REPLAY</button>`}
       </div>
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px">
         ${tags.map(t=>isRemote
@@ -15444,6 +16379,7 @@ function openSettings(){
   _authRefresh();
   _renderLicenseUI();
   _raLoad();
+  _capsLoad();
   /* populate inputs */
   const v=n=>document.getElementById(n);
   if(v('st-cost-rate')) v('st-cost-rate').value=_costRate;
@@ -16358,9 +17294,14 @@ def _build_status_payload_uncached() -> dict:
     ]
     _ctx = _context_snapshot([s["id"] for s in active_sessions])
     _perms = _perm_pending_by_session(time.time())
+    _replies = _reply_pending_by_session(time.time())
+    with _budget_lock:
+        _budget_snap = {"sessions": dict(_budget_state["sessions"]), "day": _budget_state["day"]}
     for s in active_sessions:
         s["context"] = _ctx.get(s["id"])
         s["perm_requests"] = _perms.get(s["id"], [])
+        s["reply_request"] = _replies.get(s["id"])
+        s["budget"] = _budget_snap["sessions"].get(s["id"]) or _budget_snap["day"]
     # sessions_count: floor at the real claude.exe process count (background
     # scanner, _claude_proc_worker, counts claude.exe processes every 2s). Hook-tracked
     # sessions can under-count — a CLI sitting idle with no fresh heartbeat,
@@ -16394,6 +17335,7 @@ def _build_status_payload_uncached() -> dict:
         data["self_update"] = dict(_self_update_status)
     data["infra_health"] = _infra_health_snapshot()
     data["rate_limits"] = _rate_limits_snapshot()
+    data["queue"] = _queue_view(data["rate_limits"], time.time())
     return data
 
 
@@ -16401,6 +17343,14 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # enables keep-alive, eliminates TIME_WAIT storm
     def log_message(self, fmt, *args):
         pass
+
+    def _is_direct_loopback(self) -> bool:
+        """A request from this machine itself, not relayed by a tunnel
+        (cloudflared / ngrok always add forwarding headers)."""
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return False
+        return not any(self.headers.get(h) for h in ("X-Forwarded-For", "Cf-Connecting-Ip", "X-Forwarded-Host",
+                                                      "X-Real-Ip", "Forwarded", "Ngrok-Trace-Id", "Cf-Ray"))
 
     def _check_auth(self) -> bool:
         """Return True if request is authorized. Localhost always allowed, UNLESS a
@@ -16700,6 +17650,29 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 idle_s = None
             reply = _perm_poll((qs.get("id") or [""])[0], idle_s, _load_remote_approve(), time.time())
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/session_replay":
+            from urllib.parse import urlparse, parse_qs
+            sid = (parse_qs(urlparse(self.path).query).get("session_id") or [""])[0]
+            try:
+                reply = _session_replay(sid)
+            except Exception as e:
+                _log_bg_error("session_replay", e)
+                reply = {"ok": False, "error": "could not read the transcript"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/budget_caps":
+            with _budget_lock:
+                st = {"today_spend": _budget_state["today_spend"], "day": _budget_state["day"]}
+            cfg = _load_budget_caps()
+            self._serve(200, "application/json", json.dumps({"session_usd": cfg["session_usd"], "day_usd": cfg["day_usd"], **st}).encode(), no_cache=True)
+        elif path_no_qs == "/reply/poll":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                idle_s = float((qs.get("idle") or [""])[0])
+            except ValueError:
+                idle_s = None
+            reply = _reply_poll((qs.get("id") or [""])[0], idle_s, _load_remote_approve(), time.time())
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/permission/settings":
             self._serve(200, "application/json", json.dumps(_load_remote_approve()).encode(), no_cache=True)
@@ -17123,6 +18096,20 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(500, "text/plain", str(e).encode())
 
     def do_POST(self):
+        if self.path.split("?")[0] == "/hook/pretool" and self._is_direct_loopback():
+            # Claude Code's HTTP PreToolUse hook (budget caps) can't carry the
+            # token, so it is answered without one -- but only straight from
+            # this machine, never through a tunnel (which adds forwarding
+            # headers). Read-only: it returns allow or deny, nothing else.
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                hook = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                hook = {}
+            with _budget_lock:
+                reply = _budget_hook_reply(_budget_state, hook)
+            self._serve(200, "application/json", json.dumps(reply).encode())
+            return
         if not self._check_auth():
             self._serve(401, "text/plain", b"Unauthorized"); return
         length = int(self.headers.get("Content-Length", 0))
@@ -17150,6 +18137,42 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("focus_session", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs in ("/budget_caps", "/budget_caps/continue"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/budget_caps":
+                    cfg = _save_budget_caps({k: data[k] for k in ("session_usd", "day_usd") if k in data})
+                    _budget_tick()
+                    reply = {"ok": True, **cfg}
+                else:
+                    with _budget_lock:
+                        state = dict(_budget_state)
+                    caps, ok = _budget_continue(data, _load_budget_caps(), state, datetime.now().strftime("%Y-%m-%d"))
+                    if ok:
+                        _save_budget_caps(caps)
+                        _budget_tick()
+                    reply = {"ok": ok} if ok else {"ok": False, "error": "not over a cap"}
+            except Exception as e:
+                _log_bg_error("budget_caps", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply).encode())
+
+        elif path_no_qs in ("/queue", "/queue/cancel"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/queue":
+                    reply = _queue_add(data)
+                else:
+                    reply = {"ok": _queue_cancel(str(data.get("id") or ""))}
+            except Exception as e:
+                _log_bg_error("queue", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
 
         elif path_no_qs == "/launch":
             try:
@@ -17189,6 +18212,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve(200, "application/json", json.dumps(reply).encode())
             except Exception as e:
                 _log_bg_error("permission", e)
+                self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
+
+        elif path_no_qs in ("/reply/request", "/reply/send"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/reply/request":
+                    reply = _reply_open(data, _load_remote_approve(), time.time())
+                else:
+                    ok, err = _reply_send(str(data.get("id") or ""), data.get("action"), data.get("text"))
+                    reply = {"ok": True} if ok else {"ok": False, "error": err}
+                self._serve(200, "application/json", json.dumps(reply).encode())
+            except Exception as e:
+                _log_bg_error("reply", e)
                 self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
 
         elif path_no_qs == "/remove":

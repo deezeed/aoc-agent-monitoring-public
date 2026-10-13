@@ -18,7 +18,7 @@ c = Checker()
 
 def ns_for(aoc_dir="C:\\nowhere"):
     return exec_functions(
-        ["_hook_command", "_is_aoc_hook", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes",
+        ["_hook_command", "_is_aoc_hook", "_is_run_hook", "_is_held_hook", "_is_budget_hook", "_merge_budget_hook", "BUDGET_HOOK_URL", "BUDGET_HOOK_TIMEOUT_S", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes",
          "PERMISSION_SCRIPT", "PERMISSION_EVENT", "PERMISSION_TIMEOUT_S", "_permission_command", "_merge_permission_hook"],
         {"os": os, "subprocess": subprocess, "HOOK_SPECS": HOOK_SPECS, "HOOKS_DST_DIR": HOOKS_DST_DIR,
          "AOC_DIR": aoc_dir, "TASK_NAME": r"\AOC-test-nonexistent\A",
@@ -130,5 +130,38 @@ c.check("recognized as an AOC hook", pns["_is_aoc_hook"]({"command": pcmd}))
 removed = pns["_remove_hook_entries"](s)
 c.check("uninstall removes only AOC's permission hook",
         removed == 1 and s["hooks"]["PermissionRequest"] == [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine.sh"}]}])
+
+# ── the same script as a second Stop hook (reply from the dashboard) ──
+s = {}
+ns["_merge_hook_entries"](s, cmd)
+c.check("held Stop hook added next to run_hook.pyw's", pns["_merge_permission_hook"](s, pcmd, "Stop") == "added")
+stop_cmds = [h["command"] for e in s["hooks"]["Stop"] for h in e["hooks"]]
+c.check("Stop now has both commands", stop_cmds == [cmd, pcmd])
+c.check("held Stop entry has the long timeout", s["hooks"]["Stop"][1]["hooks"][0].get("timeout") == 1800)
+before = copy.deepcopy(s)
+added, updated = ns["_merge_hook_entries"](s, cmd)
+c.check("re-merging run_hook entries leaves the held Stop hook alone", added == [] and updated == [] and s == before)
+added, updated = ns["_merge_hook_entries"](s, cmd.replace("Py", "Py2"))
+c.check("new pythonw rewrites run_hook.pyw only",
+        [h["command"] for e in s["hooks"]["Stop"] for h in e["hooks"]] == [cmd.replace("Py", "Py2"), pcmd])
+c.check("re-merging the held hook -> unchanged, run_hook.pyw untouched",
+        pns["_merge_permission_hook"](s, pcmd, "Stop") == "unchanged" and s["hooks"]["Stop"][0]["hooks"][0]["command"] == cmd.replace("Py", "Py2"))
+c.check("uninstall removes both Stop commands", ns["_remove_hook_entries"](s) == 5 and "hooks" not in s)
+
+# -- budget caps: HTTP PreToolUse hook for all tools --
+s = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine.sh"}]}]}}
+ns["_merge_hook_entries"](s, cmd)
+c.check("budget hook added", ns["_merge_budget_hook"](s) == "added")
+bh = [e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "*"]
+c.check("matcher * with the HTTP hook",
+        len(bh) == 1 and bh[0]["hooks"] == [{"type": "http", "url": "http://127.0.0.1:5151/hook/pretool", "timeout": 3}])
+c.check("re-run -> unchanged", ns["_merge_budget_hook"](s) == "unchanged")
+bh[0]["hooks"][0]["timeout"] = 30
+c.check("drifted entry -> updated in place", ns["_merge_budget_hook"](s) == "updated" and bh[0]["hooks"][0]["timeout"] == 3)
+c.check("run_hook merge leaves it alone", ns["_merge_hook_entries"](s, cmd) == ([], []))
+c.check("someone else's http hook is not AOC's", not ns["_is_aoc_hook"]({"type": "http", "url": "https://example.com/hook"}))
+removed = ns["_remove_hook_entries"](s)
+c.check("uninstall removes the budget hook, keeps the user's",
+        s["hooks"]["PreToolUse"] == [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine.sh"}]}] and removed == 5)
 
 c.finish()
