@@ -7776,6 +7776,319 @@ def _context_report(days, now=None):
     return report
 
 
+# ── Failure map (History -> FAILURES) ─────────────────────────────────────
+# Every tool call that came back as an error, across the transcripts of the
+# last N days (main sessions and their subagents), grouped by tool, what it
+# ran (the program for shell commands) and a readable reason. What a failure
+# lost: the failed call's own run time plus Claude's next turn reacting to
+# it (time and that API call's cost, shared among the results it answered).
+# Permission denials (you, a hook or the auto-mode classifier said no) are
+# counted apart -- they're decisions, not things that broke.
+_FAIL_CACHE_S = 15 * 60
+_FAIL_GAP_CAP_S = 600          # an idle gap (you walked away) isn't time lost to the failure
+_FAIL_TOOL_ID = re.compile(rb'"id":\s*"(toolu_[A-Za-z0-9_-]+)"')
+_FAIL_RESULT_ID = re.compile(rb'"tool_use_id":\s*"(toolu_[A-Za-z0-9_-]+)"')
+_FAIL_IS_ERROR = re.compile(rb'"is_error":\s*true')
+_FAIL_ASSISTANT = re.compile(rb'"type":\s*"assistant"')
+_FAIL_SHELLS = ("Bash", "PowerShell")
+_FAIL_TRIVIAL = {"cd", "set-location", "pushd", "popd", "export", "set", "echo", "sleep", "start-sleep", "cat",
+                 "ls", "pwd", "true", "mkdir", "write-output", "write-host", "$env"}
+_FAIL_SUBCMD = {"git", "npm", "npx", "pnpm", "yarn", "gh", "pip", "pip3", "docker", "cargo", "dotnet", "go",
+                "vercel", "supabase", "uv", "poetry", "kubectl", "winget", "choco", "claude"}
+# (substring, reason, kind) -- first match wins; kind 'denied' = a no, not a breakage
+_FAIL_REASONS = (
+    ("doesn't want to proceed", "You rejected the call", "denied"),
+    ("user rejected", "You rejected the call", "denied"),
+    ("Permission for this action was denied", "Denied by auto mode", "denied"),
+    ("auto mode classifier gave no verdict", "Auto-mode check unavailable", "denied"),
+    ("so auto mode cannot de", "Auto-mode check unavailable", "denied"),
+    ("hook error", "Blocked by a hook", "denied"),
+    ("blocked by hook", "Blocked by a hook", "denied"),
+    ("File has not been read yet", "Edited before reading the file", "failed"),
+    ("String to replace not found", "Text to replace not found", "failed"),
+    ("File has been modified since read", "File changed since it was read", "failed"),
+    ("No changes to make", "Edit with no change", "failed"),
+    ("uv_spawn", "Program not found", "failed"),
+    ("unexpected EOF while looking for matching", "Shell quoting error", "failed"),
+    ("syntax error near unexpected token", "Shell quoting error", "failed"),
+    ("File does not exist", "File does not exist", "failed"),
+    ("Path does not exist", "File does not exist", "failed"),
+    ("no such file or directory", "File does not exist", "failed"),
+    ("InputValidationError", "Invalid tool input", "failed"),
+    ("Insufficient scope", "Missing OAuth scope", "failed"),
+    ("Executable not found", "Program not found", "failed"),
+    ("command not found", "Program not found", "failed"),
+    ("is not recognized as", "Program not found", "failed"),
+    ("ripgrep rejected the pattern", "Bad search pattern", "failed"),
+    ("<tool_use_error>Blocked:", "Blocked by Claude Code", "failed"),
+    ("Command timed out", "Timed out", "failed"),
+    ("timed out after", "Timed out", "failed"),
+)
+
+
+def _fail_reason(tool, text):
+    """Pure: (tool name, error result text) -> (reason, kind, first useful line)."""
+    text = str(text or "")
+    body = re.sub(r"</?tool_use_error>", "", text).strip()
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    m = re.match(r"Exit code (\d+)", lines[0]) if lines else None
+    # a failed command's cause is usually its last line (a traceback's exception)
+    detail = lines[-1] if m and len(lines) > 1 else (lines[0] if lines else "")
+    low = text.lower()
+    for needle, reason, kind in _FAIL_REASONS:
+        if needle.lower() in low:
+            return reason, kind, detail[:300]
+    exc = None
+    if "Traceback (most recent call last)" in text:
+        exc = next((re.match(r"([A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit))\b", ln)
+                    for ln in reversed(lines) if re.match(r"[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit)\b", ln)), None)
+    if exc:
+        return f"Python {exc.group(1).split('.')[-1]}", "failed", detail[:300]
+    if m:
+        return f"Exit code {m.group(1)}", "failed", detail[:300]
+    if not lines:
+        return "Error with no message", "failed", ""
+    first = re.sub(r"[A-Za-z]:\\[^\s'\"]*|/[\w.-]+(?:/[\w.-]+)+", "<path>", lines[0])
+    first = re.sub(r"\d+", "N", first)
+    return first[:80], "failed", lines[0][:300]
+
+
+def _fail_target(tool, inp):
+    """Pure: what a call ran -- 'git push', 'python build.py', 'npm test' for
+    shell commands: the last real command of a chain (a chain stops at the
+    one that failed; `cd`, `cat > f`, `echo` and pipe filters skipped,
+    heredoc bodies ignored), else ''."""
+    if tool not in _FAIL_SHELLS or not isinstance(inp, dict):
+        return ""
+    cmd = str(inp.get("command") or "").strip()
+    cmd = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)",
+                 lambda mm: mm.group(0).split("\n", 1)[0], cmd, flags=re.S)   # keep the line, drop the body
+    for seg in reversed(re.split(r"&&|\|\||;|\n", cmd)):
+        words = re.findall(r'"[^"]*"|\'[^\']*\'|[^\s"\']+', seg.split("|", 1)[0].strip())   # "C:\Program Files\x.exe" stays one word
+        while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] == "&"):   # FOO=1 cmd, & "x.exe"
+            words.pop(0)
+        if not words or words[0].lower() in _FAIL_TRIVIAL or words[0].startswith(("#", "$", "(", "{", "}")):
+            continue
+        head = re.split(r"[\\/]", words[0].strip("\"'&"))[-1].lower()
+        head = re.sub(r"\.(exe|cmd|bat)$", "", head)
+        if not re.match(r"^[\w.+-]+$", head):
+            continue
+        rest = [w for w in words[1:] if not w.startswith("-")]
+        if head in _FAIL_SUBCMD and rest:
+            return f"{head} {rest[0].lower()}"[:60]
+        if head.startswith("python") or head in ("node", "py", "powershell", "pwsh", "bash", "sh"):
+            script = next((w for w in rest if re.search(r"\.(py|js|mjs|ts|ps1|sh)$", w, re.I)), "")
+            name = re.split(r"[\\/]", script.strip("\"'"))[-1] if script else ""
+            return (f"{head} {name}" if name else head)[:60]
+        return head[:60]
+    return ""
+
+
+def _fail_scan_lines(lines, sid, label=""):
+    """Pure: one transcript's raw lines -> {"calls": tool calls, "fails": [...]}.
+    A tool_use line is kept as raw bytes until its result arrives, and only
+    parsed when that result is an error -- most lines are never JSON-parsed."""
+    pending = {}            # toolu id -> raw tool_use line
+    calls = 0
+    fails = []
+    waiting = []            # failures from the last results line, until Claude's next call
+    for raw in lines:
+        if b'"tool_use_id"' in raw:
+            ids = _FAIL_RESULT_ID.findall(raw)
+            if not _FAIL_IS_ERROR.search(raw):
+                for i in ids:
+                    pending.pop(i, None)
+                continue
+            try:
+                o = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            t = _replay_epoch(o.get("timestamp"))
+            content = (o.get("message") or {}).get("content")
+            results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
+                if isinstance(content, list) else []
+            batch = []
+            for r in results:
+                use_raw = pending.pop(str(r.get("tool_use_id") or "").encode(), None)
+                if not r.get("is_error"):
+                    continue
+                tool, inp, t0 = "?", {}, None
+                if use_raw is not None:
+                    try:
+                        u = json.loads(use_raw)
+                        t0 = _replay_epoch(u.get("timestamp"))
+                        for b in (u.get("message") or {}).get("content") or []:
+                            if isinstance(b, dict) and b.get("type") == "tool_use" and \
+                                    str(b.get("id")) == str(r.get("tool_use_id")):
+                                tool, inp = str(b.get("name") or "?"), b.get("input") or {}
+                    except (TypeError, ValueError):
+                        pass
+                reason, kind, detail = _fail_reason(tool, _replay_result_text(r.get("content")))
+                f = {"sid": sid, "label": label, "t": t, "tool": tool, "target": _fail_target(tool, inp),
+                     "reason": reason, "kind": kind, "detail": detail, "secs": 0.0, "cost": 0.0, "share": 0}
+                if t and t0:
+                    f["secs"] = min(_FAIL_GAP_CAP_S, max(0.0, t - t0))
+                batch.append(f)
+            for f in batch:
+                f["share"] = 1 / max(1, len(results))
+            fails.extend(batch)
+            waiting = batch
+            continue
+        if not _FAIL_ASSISTANT.search(raw):
+            continue
+        ids = _FAIL_TOOL_ID.findall(raw) if b'"tool_use"' in raw else []
+        for i in ids:
+            pending[i] = raw
+        calls += len(ids)
+        if waiting and b'"usage"' in raw:   # Claude's next call, reacting to the failures
+            try:
+                o = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            msg = o.get("message") or {}
+            u = msg.get("usage") or {}
+            cost = _calc_cost(u.get("input_tokens", 0) or 0, u.get("output_tokens", 0) or 0,
+                              u.get("cache_creation_input_tokens", 0) or 0, u.get("cache_read_input_tokens", 0) or 0,
+                              msg.get("model") or "", ((u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0))
+            t = _replay_epoch(o.get("timestamp"))
+            for f in waiting:
+                f["cost"] = cost * f["share"]
+                if t and f["t"]:
+                    f["secs"] += min(_FAIL_GAP_CAP_S, max(0.0, t - f["t"]))
+            waiting = []
+    return {"calls": calls, "fails": fails}
+
+
+def _fail_report(scans, days) -> dict:
+    """Pure: per-transcript scans -> the FAILURES tab."""
+    calls = sum(s["calls"] for s in scans)
+    fails = [f for s in scans for f in s["fails"]]
+    broke = [f for f in fails if f["kind"] == "failed"]
+    denied = [f for f in fails if f["kind"] == "denied"]
+    month = 30 / max(1, days)
+
+    def group(items, keyf):
+        out = {}
+        for f in items:
+            k = keyf(f)
+            g = out.get(k)
+            if g is None:
+                g = out[k] = {"tool": f["tool"], "target": f["target"], "reason": f["reason"], "count": 0,
+                              "secs": 0.0, "cost": 0.0, "sessions": set(), "last": None}
+            g["count"] += 1
+            g["secs"] += f["secs"]
+            g["cost"] += f["cost"]
+            g["sessions"].add(f["sid"])
+            if g["last"] is None or (f["t"] or 0) >= (g["last"]["t"] or 0):
+                g["last"] = f
+        rows = []
+        for g in out.values():
+            last = g.pop("last")
+            g.update(sessions=len(g["sessions"]), secs=round(g["secs"]), cost=round(g["cost"], 2),
+                     last_sid=last["sid"], last_label=last["label"], last_t=last["t"], example=last["detail"])
+            rows.append(g)
+        rows.sort(key=lambda g: (-g["count"], -g["cost"]))
+        return rows
+
+    top = group(broke, lambda f: (f["tool"], f["target"], f["reason"]))
+    by_tool = group(broke, lambda f: f["tool"])
+    by_reason = group(broke, lambda f: f["reason"])
+    den = group(denied, lambda f: f["reason"])
+    tips = []
+    for g in top[:12]:
+        hint = _FAIL_HINTS.get(g["reason"])
+        if hint and g["count"] >= 3:
+            tips.append({"reason": g["reason"], "tool": g["tool"], "target": g["target"], "count": g["count"],
+                         "detail": hint, "cost_month": round(g["cost"] * month, 2)})
+    seen = set()
+    tips = [t for t in tips if not (t["detail"] in seen or seen.add(t["detail"]))][:5]
+    return {
+        "days": days, "calls": calls, "failed": len(broke), "denied": len(denied),
+        "rate": round(len(broke) / calls * 100, 1) if calls else 0,
+        "secs": round(sum(f["secs"] for f in broke)), "cost": round(sum(f["cost"] for f in broke), 2),
+        "sessions": len({f["sid"] for f in broke}),
+        "top": top[:25], "by_tool": by_tool[:12], "by_reason": by_reason[:12], "denied_rows": den[:8],
+        "tips": tips,
+    }
+
+
+_FAIL_HINTS = {
+    "Edited before reading the file": "Claude tried to edit files it hadn't read in this session. Usually after a "
+                                      "compaction or a subagent's edit -- nothing to fix on your side, but frequent "
+                                      "cases mean long sessions; /clear between tasks helps.",
+    "Text to replace not found": "Edits whose old text didn't match the file (line endings, a file changed by "
+                                 "something else). On Windows, CRLF files are a common cause.",
+    "File does not exist": "Calls on paths that weren't there -- often the wrong working folder. Starting Claude "
+                           "in the project folder instead of your home folder avoids most of them.",
+    "Program not found": "A command needs a program that isn't on PATH for Claude's shell. Install it or note "
+                         "the full path in CLAUDE.md.",
+    "Missing OAuth scope": "A connector lacks a permission. Reconnect it in claude.ai settings and grant the "
+                           "scope it asks for.",
+    "Invalid tool input": "Claude called a tool with the wrong arguments -- mostly harmless retries.",
+    "Bad search pattern": "Searches with a regex ripgrep rejected; Claude retries with a fixed pattern.",
+    "Timed out": "Commands that hit their time limit. Long builds or tests are better run in the background.",
+    "Shell quoting error": "Long commands with heredocs or nested quotes that the shell couldn't parse. Writing the "
+                           "script to a file first (and running the file) avoids them.",
+    "Python UnicodeEncodeError": "Python printed text the Windows console code page can't show. Setting "
+                                 "PYTHONIOENCODING=utf-8 (user environment variable) fixes it for every session.",
+    "Python UnicodeDecodeError": "Python read a file with the Windows default code page. Open files with "
+                                 "encoding='utf-8' -- worth a line in CLAUDE.md.",
+    "Python ModuleNotFoundError": "Scripts import packages that aren't installed for the Python Claude runs. Note "
+                                  "the right interpreter / venv in CLAUDE.md.",
+}
+
+
+def _fail_files(days, now):
+    base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    since = now - days * 86400
+    for pattern in ("*/*.jsonl", "*/*/subagents/*.jsonl"):
+        for f in glob.glob(os.path.join(base, pattern)):
+            try:
+                if os.path.getmtime(f) < since:
+                    continue
+            except OSError:
+                continue
+            parts = os.path.normpath(f).split(os.sep)
+            sid = parts[-3] if parts[-2] == "subagents" else os.path.splitext(parts[-1])[0]
+            yield f, sid
+
+
+def _failure_map(days, now=None):
+    """GET /failure_map: scan the last `days` of transcripts (cached 15 min)."""
+    now = now or time.time()
+    hit = _fail_cache.get(days)
+    if hit and now - hit[0] < _FAIL_CACHE_S:
+        return hit[1]
+    titles = {}
+    if os.path.exists(TRANSCRIPT_INDEX_DB):
+        conn = None
+        try:
+            conn = _transcript_index_connect()
+            titles = dict(conn.execute("SELECT session_id, COALESCE(NULLIF(title, ''), project, '') FROM sessions_meta").fetchall())
+        except Exception as e:
+            _log_bg_error("failure map titles", e)
+        finally:
+            if conn is not None:
+                conn.close()
+    scans = []
+    for f, sid in _fail_files(days, now):
+        try:
+            with open(f, "rb") as fh:
+                scans.append(_fail_scan_lines(fh, sid, titles.get(sid, "")))
+        except OSError:
+            continue
+    since = now - days * 86400
+    for s in scans:
+        s["fails"] = [x for x in s["fails"] if not x["t"] or x["t"] >= since]
+    report = _fail_report(scans, days)
+    report["computed_at"] = now
+    _fail_cache[days] = (now, report)
+    return report
+
+
+_fail_cache = {}
+
+
 def _client_report_print_html(report, client):
     """A plain, printable page (browser -> Save as PDF) for one client's month."""
     import html as _html
@@ -9105,7 +9418,7 @@ button.le-tag { cursor:pointer; }
 
 /* ── HISTORY VIEW ── */
 #history-area { overflow-y:auto;padding:20px 24px;align-items:center; }
-.hist-toolbar { display:flex;align-items:center;gap:10px;padding:12px 16px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0; }
+.hist-toolbar { display:flex;align-items:center;flex-wrap:wrap;row-gap:6px;gap:10px;padding:12px 16px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0; }
 .hist-title { font-family:var(--font2);font-size:11px;letter-spacing:.14em;color:var(--c);font-weight:700; }
 .hist-body { flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:8px; }
 /* .hist-body is a fixed-height flex column: without this the report's
@@ -9245,6 +9558,11 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .adv-dim { color:var(--t3); }
 .adv-table { overflow-x:auto; }
 .ctx-wrap { flex-shrink:0; }
+.fm-rate { font-size:.55em;color:var(--t3);margin-left:4px; }
+.fm-reason { font-size:11px;color:var(--t2);margin-top:2px; }
+.fm-ex { font:400 10px var(--font2);color:var(--t3);margin-top:2px;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.fm-cols { display:grid;grid-template-columns:1fr 1fr;gap:14px; }
+@media (max-width:760px) { .fm-cols { grid-template-columns:1fr; } .fm-ex { max-width:200px; } }
 .ctx-sec { margin:14px 0 4px;font:700 9px var(--font2);letter-spacing:.12em;text-transform:uppercase;color:var(--t3); }
 .ctx-unused { color:var(--o); }
 .cl-wrap { display:flex;flex-direction:column;gap:12px;padding:4px 0 20px; }
@@ -12188,9 +12506,9 @@ function _replayHtml(d, f){
   </div>`;
 }
 let _replayData=null, _replayFilterKey='all', _replayTimer=null;
-async function openReplay(sid, machine, label){
+async function openReplay(sid, machine, label, filter){
   const o=_overlay('Replay · '+label, '<div class="chg-empty">Loading…</div>', 'chg-box rp-box');
-  _replayFilterKey='all';
+  _replayFilterKey=filter||'all';
   try{ _replayData=await fetch(_apiUrl(_machineFor(machine),'/session_replay?session_id='+encodeURIComponent(sid))).then(r=>r.json()); }
   catch(e){ _replayData={ok:false,error:'Could not reach AOC.'}; }
   o.querySelector('.chg-body').innerHTML=_replayHtml(_replayData,_replayFilterKey);
@@ -14119,8 +14437,10 @@ async function renderHistory(){
         <div class="adp-tab ${_histTab==='clients'?'active':''}" onclick="_histTab='clients';renderHistory()" title="Monthly Claude Code spend per client, for invoicing">CLIENTS</div>
         <div class="adp-tab ${_histTab==='models'?'active':''}" onclick="_histTab='models';renderHistory()" title="Which work each model's spend went to, and what a cheaper model would save">MODELS</div>
         <div class="adp-tab ${_histTab==='context'?'active':''}" onclick="_histTab='context';renderHistory()" title="What every session loads before your first message (skills, MCP tools, CLAUDE.md) and what re-reading it costs">CONTEXT</div>
+        <div class="adp-tab ${_histTab==='failures'?'active':''}" onclick="_histTab='failures';renderHistory()" title="Which tool calls fail most, why, and what that costs">FAILURES</div>
       </div>
       ${_histTab==='models'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_adviceDays===d?'active':''}" onclick="_adviceDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
+      ${_histTab==='failures'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_failDays===d?'active':''}" onclick="_failDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='context'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_ctxDays===d?'active':''}" onclick="_ctxDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='cache'||_histTab==='commits'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='search'?`<input type="search" id="conv-search-input" class="conv-input" placeholder="Search past conversations…" value="${escHtml(_convQuery)}" oninput="setConvSearch(this.value)" autocomplete="off">`:''}
@@ -14157,6 +14477,14 @@ async function renderHistory(){
   </div>`;
 
   const body=document.getElementById('hist-body');
+  if(_histTab==='failures'){
+    body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
+    try{
+      const d=await fetch('/failure_map?days='+_failDays).then(r=>r.json());
+      if(gen===_histRenderGen) body.innerHTML=_failureMapHtml(d);
+    }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the failure map.</div>'; }
+    return;
+  }
   if(_histTab==='context'){
     body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
     try{
@@ -14944,6 +15272,57 @@ function _contextReportHtml(d){
     ${files?section('CLAUDE.md & memory files')+table('<th>File</th><th class="num">Tokens</th><th class="num cache-opt">Sessions</th><th class="num">Cost</th>',files):''}
     ${section('By project')}${table('<th>Project</th><th class="num cache-opt">Sessions</th><th class="num">At start</th><th class="num cache-opt">Calls</th><th class="num">Cost</th>',projects)}
     <div class="cl-help" style="margin-top:8px">Sizes come from your transcripts (about 3.7 characters per token); the rest of the first prompt is Claude Code's own tool definitions. Cost = the startup context written to the cache once per session plus re-read on every later API call, at API prices.</div></div>`;
+}
+/* ── History -> FAILURES ── */
+let _failDays=30;
+/* Pure: 'mcp__claude_ai_Gmail__create_draft' -> 'Gmail · create_draft'. */
+function _failToolName(t){
+  const m=/^mcp__(.+?)__(.+)$/.exec(String(t||''));
+  if(!m) return String(t||'?');
+  const server=m[1].replace(/^claude_ai_/,'').replace(/^plugin_[^_]+_/,'').replace(/_/g,' ');
+  return server+' · '+m[2];
+}
+/* Pure: the FAILURES tab from GET /failure_map -- which tool calls fail most,
+   why, what that lost (time + the next turn's cost), and a replay link to the
+   latest case. */
+function _failureMapHtml(d){
+  d=d||{};
+  if(d.error) return `<div class="conv-empty">The failure map failed — see Health → background errors.</div>`;
+  if(!d.calls) return `<div class="conv-empty">No tool calls in this period.</div>`;
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const dur=s=>{ s=Math.round(Number(s)||0); return s<60?s+'s':s<3600?Math.round(s/60)+' min':(s/3600).toFixed(1)+' h'; };
+  const kpi=(v,l,tip)=>`<div class="hist-kpi" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const kpis=[
+    kpi(`${(d.failed||0).toLocaleString()} <span class="fm-rate">${d.rate}%</span>`,'Failed calls',`${(d.failed||0).toLocaleString()} of ${d.calls.toLocaleString()} tool calls came back as an error, in ${d.sessions} sessions`),
+    kpi(dur(d.secs),'Time lost','The failed calls\' run time plus Claude\'s next turn reacting to them (idle gaps over 10 min left out)'),
+    kpi(money(d.cost),'Cost of reacting','What the API calls that answered the failures cost'),
+    kpi((d.denied||0).toLocaleString(),'Denied','Calls you, a hook or auto mode said no to — decisions, not breakages (listed at the bottom)'),
+  ].join('');
+  if(!d.failed) return `<div class="hist-analytics">${kpis}</div><div class="conv-empty">No failed tool calls in this period.</div>`;
+  const md=t=>escHtml(t).replace(/`([^`]+)`/g,'<code>$1</code>');
+  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(`${t.reason} (${_failToolName(t.tool)}${t.target?' · '+t.target:''}): ${t.count}×`)}</b>${t.cost_month?`<span class="adv-save">~${money(t.cost_month)} / month</span>`:''}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
+  const bar=(v,max)=>`<span class="cc-bar"><span style="width:${(v/Math.max(max,1)*100).toFixed(1)}%"></span></span>`;
+  const tmax=Math.max(...(d.top||[]).map(g=>g.count),1);
+  const replay=g=>g.last_sid?`<button class="chg-btn rp-btn" onclick="openReplay(${jsq(g.last_sid)},'',${jsq(g.last_label||g.last_sid.slice(0,8))},'errors')" title="Replay the latest session with this failure, failed steps only">▶</button>`:'';
+  const top=(d.top||[]).map(g=>`<tr><td class="cache-name"><b>${escHtml(_failToolName(g.tool))}</b>${g.target?`<span class="cc-repo">${escHtml(g.target)}</span>`:''}
+      <div class="fm-reason">${escHtml(g.reason)}</div>${g.example?`<div class="fm-ex" title="${escHtml(g.example)}">${escHtml(g.example)}</div>`:''}</td>
+      <td class="num cc-cost">${bar(g.count,tmax)}${g.count}×</td><td class="num cache-opt">${g.sessions}</td>
+      <td class="num">${dur(g.secs)}</td><td class="num cache-opt">${money(g.cost)}</td><td class="num">${replay(g)}</td></tr>`).join('');
+  const small=(rows,label,name)=>{
+    const max=Math.max(...rows.map(g=>g.count),1);
+    return rows.map(g=>`<tr><td class="cache-name">${escHtml(name(g))}</td><td class="num cc-cost">${bar(g.count,max)}${g.count}×</td><td class="num">${dur(g.secs)}</td><td class="num cache-opt">${money(g.cost)}</td></tr>`).join('');
+  };
+  const table=(head,rows)=>rows?`<div class="adv-table"><table class="cache-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`:'';
+  const sec=t=>`<div class="ctx-sec">${t}</div>`;
+  const head4=n=>`<th>${n}</th><th class="num">Failed</th><th class="num">Lost</th><th class="num cache-opt">Cost</th>`;
+  const denied=(d.denied_rows||[]).map(g=>`<tr><td class="cache-name">${escHtml(g.reason)}</td><td class="num">${g.count}×</td><td class="num cache-opt">${g.sessions}</td><td class="num">${replay(g)}</td></tr>`).join('');
+  return `<div class="ctx-wrap"><div class="hist-analytics">${kpis}</div>
+    ${tips?`<div class="adv-tips">${tips}</div>`:''}
+    ${sec('Most frequent failures')}${table('<th>Tool · what failed</th><th class="num">Times</th><th class="num cache-opt">Sessions</th><th class="num">Lost</th><th class="num cache-opt">Cost</th><th class="num">Replay</th>',top)}
+    <div class="fm-cols"><div>${sec('By reason')}${table(head4('Reason'),small(d.by_reason||[],'Reason',g=>g.reason))}</div>
+      <div>${sec('By tool')}${table(head4('Tool'),small(d.by_tool||[],'Tool',g=>_failToolName(g.tool)))}</div></div>
+    ${denied?sec('Denied (not failures)')+table('<th>Why</th><th class="num">Times</th><th class="num cache-opt">Sessions</th><th class="num">Replay</th>',denied):''}
+    <div class="cl-help" style="margin-top:8px">From your transcripts, main sessions and subagents. Lost = the failed call's run time plus Claude's next turn reacting to it, and that turn's cost; ▶ opens the latest case in Replay.</div></div>`;
 }
 /* ── History -> CLIENTS ── */
 let _clientsMonth='', _clientsData=null, _clientsEdit=false;
@@ -18697,6 +19076,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("model_advice", e)
                 reply = {"error": "model advice failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/failure_map":
+            from urllib.parse import urlparse, parse_qs
+            try:
+                days = int((parse_qs(urlparse(self.path).query).get("days") or ["30"])[0])
+            except ValueError:
+                days = 30
+            days = 30 if days not in (7, 30, 90) else days
+            try:
+                reply = _failure_map(days)
+            except Exception as e:
+                _log_bg_error("failure_map", e)
+                reply = {"error": "failure map failed"}
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/context_report":
             from urllib.parse import urlparse, parse_qs
