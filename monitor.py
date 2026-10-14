@@ -7488,6 +7488,294 @@ def _model_advice(days, now=None):
     return report
 
 
+# ── Startup context (History -> CONTEXT) ──────────────────────────────────
+# What every session carries before your first word. The prompt of a
+# session's first API call is everything Claude Code sends up front; the
+# transcript records most of its parts as attachments (skills listing per
+# plugin, deferred tool names, MCP server instructions, agent types,
+# CLAUDE.md / memory files, system prompt) -- the rest is Claude Code's
+# built-in tool definitions. That prompt is written to the cache once and
+# re-read on every later API call, so a few thousand tokens of unused
+# skills or MCP tools add up over hundreds of calls. MCP servers that
+# connect after the first call still add their tools from then on, so those
+# deltas are counted from the whole session.
+_CTX_CHARS_PER_TOKEN = 3.7
+_CTX_CACHE_S = 15 * 60
+_CTX_LATE_MARKERS = (b'"Skill"', b"command-name", b"mcp__", b"_delta")   # lines worth parsing after the first call
+_CTX_MSG_ID = re.compile(rb'"id":"(msg_[^"]+)"')
+_CTX_REQ_ID = re.compile(rb'"requestId":"([^"]+)"')
+_ctx_cache = {}
+
+
+def _ctx_tokens(chars) -> int:
+    return int(round((chars or 0) / _CTX_CHARS_PER_TOKEN))
+
+
+def _ctx_mcp_key(name) -> str:
+    """'claude.ai Vercel' (instructions) and 'claude_ai_Vercel' (tool names) -> one key."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def _ctx_mcp_label(seg) -> str:
+    """Tool-name segment -> a readable server name: 'claude_ai_Google_Drive'
+    -> 'claude.ai Google Drive', 'plugin_design_figma' -> 'figma (design plugin)'."""
+    if seg.startswith("claude_ai_"):
+        return "claude.ai " + seg[10:].replace("_", " ")
+    bits = seg.split("_", 2)
+    if bits[0] == "plugin" and len(bits) == 3:
+        return f"{bits[2]} ({bits[1]} plugin)"
+    return seg
+
+
+def _ctx_plugin(skill) -> str:
+    """'vercel:deploy' -> 'vercel'; a skill without a plugin prefix -> '(no plugin)'."""
+    skill = str(skill or "").lstrip("/")
+    return skill.split(":", 1)[0] if ":" in skill else "(no plugin)"
+
+
+def _ctx_scan_lines(lines):
+    """Pure: one main transcript's lines -> its startup context, or None
+    when it never reached an API call.
+    parts {name: chars} from the attachments before the first call;
+    skills {plugin: [count, chars]}; files {path: [kind, chars]};
+    mcp {key: [label, chars]} over the whole session; skill_uses /
+    mcp_uses {plugin|key: n} (Skill tool, /plugin:skill commands, MCP tools)."""
+    parts, skills, files, mcp, uses, mcp_uses = {}, {}, {}, {}, {}, {}
+    first = None
+    model, cwd, prompt_chars = "", "", 0
+    calls = set()
+
+    def add_mcp(key, label, n, named=False):
+        m = mcp.setdefault(key, [label, 0])
+        if named:   # the name the server gives itself in its instructions wins
+            m[0] = label
+        m[1] += n
+
+    for raw in lines:
+        if first is not None and not any(k in raw for k in _CTX_LATE_MARKERS):
+            if b'"usage"' in raw and b'"isSidechain":true' not in raw:   # just count the call, no JSON parse
+                mi, ri = _CTX_MSG_ID.search(raw), _CTX_REQ_ID.search(raw)
+                calls.add((mi.group(1).decode() if mi else "", ri.group(1).decode() if ri else ""))
+            continue
+        try:
+            o = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(o, dict) or o.get("isSidechain"):
+            continue
+        cwd = cwd or str(o.get("cwd") or "")
+        msg = o.get("message") if isinstance(o.get("message"), dict) else {}
+        if o.get("type") == "assistant":
+            if msg.get("usage"):
+                calls.add((msg.get("id") or "", o.get("requestId") or ""))
+                if first is None:
+                    u = msg["usage"]
+                    first = sum((u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                         "cache_read_input_tokens"))
+                    model = msg.get("model") or ""
+            for b in msg.get("content") or []:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                name = str(b.get("name") or "")
+                if name == "Skill":
+                    plug = _ctx_plugin((b.get("input") or {}).get("skill"))
+                    uses[plug] = uses.get(plug, 0) + 1
+                elif name.startswith("mcp__") and name.count("__") >= 2:
+                    key = _ctx_mcp_key(name.split("__")[1])
+                    mcp_uses[key] = mcp_uses.get(key, 0) + 1
+            continue
+        if o.get("type") == "user" and isinstance(msg.get("content"), str):
+            text = msg["content"]
+            for cmd in re.findall(r"<command-name>/?([^<\s]+)</command-name>", text):
+                if ":" in cmd:
+                    plug = _ctx_plugin(cmd)
+                    uses[plug] = uses.get(plug, 0) + 1
+            if first is None and not o.get("isMeta"):
+                prompt_chars += len(text)
+        a = o.get("attachment") if isinstance(o.get("attachment"), dict) else None
+        if not a:
+            continue
+        t = a.get("type")
+        # MCP tools and instructions: any time in the session
+        if t == "deferred_tools_delta":
+            for line in a.get("addedLines") or []:
+                line = str(line)
+                name = line.split(None, 1)[0] if line.strip() else ""
+                if name.startswith("mcp__") and name.count("__") >= 2:
+                    seg = name.split("__")[1]
+                    add_mcp(_ctx_mcp_key(seg), _ctx_mcp_label(seg), len(line) + 1)
+            if first is None:
+                parts["deferred tool names"] = parts.get("deferred tool names", 0) + \
+                    sum(len(str(x)) + 1 for x in a.get("addedLines") or [])
+            continue
+        if t == "mcp_instructions_delta":
+            names = a.get("addedNames") or []
+            blocks = a.get("addedBlocks") or []
+            for i, blk in enumerate(blocks):
+                label = str(names[i]) if i < len(names) else ""
+                if not label:
+                    mm = re.match(r"\s*##\s*(.+)", str(blk))
+                    label = mm.group(1).strip() if mm else "?"
+                add_mcp(_ctx_mcp_key(label), label, len(str(blk)), named=True)
+            if first is None:
+                parts["MCP server instructions"] = parts.get("MCP server instructions", 0) + \
+                    sum(len(str(x)) for x in blocks)
+            continue
+        if first is not None:
+            continue
+        if t == "skill_listing":
+            content = str(a.get("content") or "")
+            cur = None
+            for line in content.splitlines():
+                if line.startswith("- "):
+                    head = line[2:].split(": ", 1)[0]
+                    cur = skills.setdefault(_ctx_plugin(head), [0, 0])
+                    cur[0] += 1
+                if cur is not None:   # a description's continuation lines belong to its skill
+                    cur[1] += len(line) + 1
+            parts["skills"] = parts.get("skills", 0) + len(content)
+        elif t == "agent_listing_delta":
+            parts["agent types"] = parts.get("agent types", 0) + sum(len(str(x)) + 1 for x in a.get("addedLines") or [])
+        elif t == "instructions":
+            for fi in a.get("files") or []:
+                if isinstance(fi, dict):
+                    n = len(str(fi.get("content") or ""))
+                    files[str(fi.get("path") or "?")] = [str(fi.get("type") or ""), n]
+                    parts["CLAUDE.md & memory"] = parts.get("CLAUDE.md & memory", 0) + n
+        elif t == "prompt_snapshot":
+            parts["system prompt"] = sum(len(x) for x in a.get("systemPrompt") or [] if isinstance(x, str))
+        elif t == "environment":
+            parts["environment"] = len(json.dumps(a.get("snapshot") or {}))
+    if not first:
+        return None
+    return {"first": first, "model": model, "cwd": cwd, "calls": len(calls), "prompt_chars": prompt_chars,
+            "parts": parts, "skills": skills, "files": files, "mcp": mcp,
+            "skill_uses": uses, "mcp_uses": mcp_uses}
+
+
+def _ctx_report(sessions, days) -> dict:
+    """Pure: scanned sessions -> the CONTEXT tab. A session's startup costs
+    one cache write plus a cache read on every later call (_calc_cost on its
+    model); a part's cost is its share of the startup tokens actually paid."""
+    if not sessions:
+        return {"days": days, "sessions": 0}
+    month = 30 / max(1, days)
+    tot_cost = 0.0
+    parts_tok, skills_agg, files_agg, mcp_agg, uses, mcp_uses, projects = {}, {}, {}, {}, {}, {}, {}
+    starts = []
+    for s in sessions:
+        start = max(0, s["first"] - _ctx_tokens(s["prompt_chars"]))
+        reads = start * max(0, s["calls"] - 1)
+        cost = _calc_cost(0, 0, start, 0, s["model"]) + _calc_cost(0, 0, 0, reads, s["model"])
+        tot_cost += cost
+        starts.append(start)
+        known = 0
+        for k, ch in s["parts"].items():
+            t = _ctx_tokens(ch)
+            known += t
+            parts_tok[k] = parts_tok.get(k, 0) + t
+        parts_tok["built-in tools & rest"] = parts_tok.get("built-in tools & rest", 0) + max(0, start - known)
+        for plug, (n, ch) in s["skills"].items():
+            g = skills_agg.setdefault(plug, {"plugin": plug, "skills": 0, "total": 0, "sessions": 0})
+            g["skills"] = max(g["skills"], n)
+            g["total"] += _ctx_tokens(ch)
+            g["sessions"] += 1
+        for path, (kind, ch) in s["files"].items():
+            g = files_agg.setdefault(path, {"path": path, "kind": kind, "tokens": 0, "total": 0, "sessions": 0})
+            g["tokens"] = max(g["tokens"], _ctx_tokens(ch))
+            g["total"] += _ctx_tokens(ch)
+            g["sessions"] += 1
+        for key, (label, ch) in s["mcp"].items():
+            g = mcp_agg.setdefault(key, {"server": label, "total": 0, "sessions": 0})
+            g["total"] += _ctx_tokens(ch)
+            g["sessions"] += 1
+        for plug, n in s["skill_uses"].items():
+            uses[plug] = uses.get(plug, 0) + n
+        for key, n in s["mcp_uses"].items():
+            mcp_uses[key] = mcp_uses.get(key, 0) + n
+        name = os.path.basename(s["cwd"].rstrip("\\/")) or "?"
+        p = projects.setdefault(name, {"project": name, "sessions": 0, "tokens": 0, "cost": 0.0, "calls": 0})
+        p["sessions"] += 1
+        p["tokens"] += start
+        p["calls"] += s["calls"]
+        p["cost"] += cost
+    n = len(sessions)
+    all_start = max(1, sum(starts))
+    per_tok = tot_cost / all_start   # $ per startup token, as actually paid (writes + re-reads)
+
+    breakdown = sorted(({"part": k, "tokens": int(v / n), "share": round(v / all_start * 100, 1)}
+                        for k, v in parts_tok.items() if v), key=lambda r: -r["tokens"])
+    skills_rows = sorted(({"plugin": g["plugin"], "skills": g["skills"], "sessions": g["sessions"],
+                           "tokens": int(g["total"] / g["sessions"]), "uses": uses.get(g["plugin"], 0),
+                           "cost": round(per_tok * g["total"], 2)} for g in skills_agg.values()),
+                         key=lambda g: -g["tokens"])
+    mcp_rows = sorted(({"server": g["server"], "sessions": g["sessions"], "tokens": int(g["total"] / g["sessions"]),
+                        "uses": mcp_uses.get(k, 0), "cost": round(per_tok * g["total"], 2)}
+                       for k, g in mcp_agg.items()), key=lambda g: -g["tokens"])
+    files_rows = sorted(({"path": f["path"], "kind": f["kind"], "tokens": f["tokens"], "sessions": f["sessions"],
+                          "cost": round(per_tok * f["total"], 2)} for f in files_agg.values()),
+                        key=lambda f: -f["tokens"])
+
+    tips = []
+    for g in skills_rows:
+        if g["plugin"] != "(no plugin)" and not g["uses"] and g["tokens"] >= 300:
+            tips.append({"kind": "plugin", "saving_month": round(g["cost"] * month, 2),
+                         "title": f"Unused plugin: {g['plugin']}",
+                         "detail": f"It lists {g['skills']} skill{'s' if g['skills'] != 1 else ''} (~{g['tokens']:,} tokens) "
+                                   f"in every session and none was used in {days} days. Disable it with `/plugin`."})
+    for g in mcp_rows:
+        if not g["uses"] and g["tokens"] >= 300:
+            tips.append({"kind": "mcp", "saving_month": round(g["cost"] * month, 2),
+                         "title": f"Unused MCP server: {g['server']}",
+                         "detail": f"Its tool names and instructions add ~{g['tokens']:,} tokens to every session and no "
+                                   f"tool of it was called in {days} days. Disconnect it (`/mcp`, or the connector in claude.ai settings)."})
+    for f in files_rows:
+        if f["tokens"] >= 1500:
+            tips.append({"kind": "file", "saving_month": round(f["cost"] * 0.5 * month, 2),
+                         "title": f"Big instructions file: {os.path.basename(f['path'])}",
+                         "detail": f"~{f['tokens']:,} tokens loaded into every session it applies to. Keep it to short pointers "
+                                   "and move the detail into files Claude reads when needed; halving it saves the amount shown."})
+    tips.sort(key=lambda t: -t["saving_month"])
+    tips = [t for t in tips if t["saving_month"] >= 0.01][:8]
+    if not tips:
+        tips.append({"kind": "fine", "saving_month": 0, "title": "Your startup context already looks lean",
+                     "detail": "No unused plugin or MCP server and no oversized instructions file in this period."})
+    return {
+        "days": days, "sessions": n, "monthly_factor": round(month, 3),
+        "avg_tokens": int(sum(starts) / n), "max_tokens": max(starts),
+        "avg_calls": round(sum(s["calls"] for s in sessions) / n, 1), "cost": round(tot_cost, 2),
+        "breakdown": breakdown, "skills": skills_rows, "mcp": mcp_rows[:20], "files": files_rows[:20],
+        "projects": sorted(({**p, "avg_tokens": int(p["tokens"] / p["sessions"]), "cost": round(p["cost"], 2)}
+                            for p in projects.values()), key=lambda p: -p["cost"])[:15],
+        "tips": tips,
+    }
+
+
+def _context_report(days, now=None):
+    """GET /context_report: scan the main transcripts of the last `days` (cached 15 min)."""
+    now = now or time.time()
+    hit = _ctx_cache.get(days)
+    if hit and now - hit[0] < _CTX_CACHE_S:
+        return hit[1]
+    base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    since = now - days * 86400
+    sessions = []
+    for f in glob.glob(os.path.join(base, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(f) < since:
+                continue
+            with open(f, "rb") as fh:
+                s = _ctx_scan_lines(fh)
+        except OSError:
+            continue
+        if s:
+            sessions.append(s)
+    report = _ctx_report(sessions, days)
+    report["computed_at"] = now
+    _ctx_cache[days] = (now, report)
+    return report
+
+
 def _client_report_print_html(report, client):
     """A plain, printable page (browser -> Save as PDF) for one client's month."""
     import html as _html
@@ -8956,6 +9244,9 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .adv-tip-body code { font:400 10px var(--font2);background:rgba(var(--c-rgb),.1);padding:0 3px;border-radius:3px; }
 .adv-dim { color:var(--t3); }
 .adv-table { overflow-x:auto; }
+.ctx-wrap { flex-shrink:0; }
+.ctx-sec { margin:14px 0 4px;font:700 9px var(--font2);letter-spacing:.12em;text-transform:uppercase;color:var(--t3); }
+.ctx-unused { color:var(--o); }
 .cl-wrap { display:flex;flex-direction:column;gap:12px;padding:4px 0 20px; }
 .cl-bar { display:flex;align-items:center;gap:12px;flex-wrap:wrap; }
 .cl-month { font:400 12px var(--font2);padding:4px 8px;border-radius:7px;border:1px solid rgba(var(--c-rgb),.25);background:var(--bay,transparent);color:var(--t); }
@@ -13827,8 +14118,10 @@ async function renderHistory(){
         <div class="adp-tab ${_histTab==='commits'?'active':''}" onclick="_histTab='commits';renderHistory()" title="What each git commit Claude made cost">COMMITS</div>
         <div class="adp-tab ${_histTab==='clients'?'active':''}" onclick="_histTab='clients';renderHistory()" title="Monthly Claude Code spend per client, for invoicing">CLIENTS</div>
         <div class="adp-tab ${_histTab==='models'?'active':''}" onclick="_histTab='models';renderHistory()" title="Which work each model's spend went to, and what a cheaper model would save">MODELS</div>
+        <div class="adp-tab ${_histTab==='context'?'active':''}" onclick="_histTab='context';renderHistory()" title="What every session loads before your first message (skills, MCP tools, CLAUDE.md) and what re-reading it costs">CONTEXT</div>
       </div>
       ${_histTab==='models'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_adviceDays===d?'active':''}" onclick="_adviceDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
+      ${_histTab==='context'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_ctxDays===d?'active':''}" onclick="_ctxDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='cache'||_histTab==='commits'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[0,'ALL']].map(([d,l])=>`<div class="adp-tab ${_cacheDays===d?'active':''}" onclick="_cacheDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='search'?`<input type="search" id="conv-search-input" class="conv-input" placeholder="Search past conversations…" value="${escHtml(_convQuery)}" oninput="setConvSearch(this.value)" autocomplete="off">`:''}
       ${_histTab==='sessions'?`<input type="text" id="hist-search-input" placeholder="Filter by name, project, id, or tag..." value="${escHtml(_histSearchQuery)}" oninput="setHistSearch(this.value)" style="font-family:var(--font2);font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:var(--t);margin-left:10px;width:150px">
@@ -13864,6 +14157,14 @@ async function renderHistory(){
   </div>`;
 
   const body=document.getElementById('hist-body');
+  if(_histTab==='context'){
+    body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
+    try{
+      const d=await fetch('/context_report?days='+_ctxDays).then(r=>r.json());
+      if(gen===_histRenderGen) body.innerHTML=_contextReportHtml(d);
+    }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the context report.</div>'; }
+    return;
+  }
   if(_histTab==='models'){
     body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
     try{
@@ -14602,6 +14903,47 @@ function _modelAdviceHtml(d){
     <div class="adv-tips">${tips}</div>
     <div class="adv-table"><table class="cache-table"><thead><tr><th>Work</th><th>Model</th><th class="num cache-opt">Calls</th><th class="num">Cost</th><th class="num">On Sonnet</th><th class="num cache-opt">On Haiku</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="cl-help" style="margin-top:8px">Each API call is sorted by the tools it used and re-priced with the same tokens. Another model would use a different number of tokens, so treat these as estimates.</div>`;
+}
+/* ── History -> CONTEXT ── */
+let _ctxDays=30;
+/* Pure: the CONTEXT tab from GET /context_report -- what every session
+   carries before your first message, what re-reading it costs, and tips. */
+function _contextReportHtml(d){
+  d=d||{};
+  if(d.error) return `<div class="conv-empty">The context report failed — see Health → background errors.</div>`;
+  if(!d.sessions) return `<div class="conv-empty">No Claude Code sessions in this period.</div>`;
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const tok=v=>'~'+(Number(v)||0).toLocaleString();
+  const kpi=(v,l,tip)=>`<div class="hist-kpi" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const best=(d.tips||[]).reduce((a,t)=>a+(t.saving_month||0),0);
+  const kpis=[
+    kpi(tok(d.avg_tokens),'Tokens at start',`Average size of a session's first prompt before your message (largest: ${(d.max_tokens||0).toLocaleString()})`),
+    kpi(money(d.cost),'Startup cost',`Writing that context to the cache once per session and re-reading it on every later call (${d.avg_calls} calls per session on average), ${d.sessions} sessions in ${d.days} days`),
+    kpi(best?'~'+money(best):'—','Could save / month','Sum of the suggestions below, scaled to 30 days'),
+  ].join('');
+  const md=t=>escHtml(t).replace(/`([^`]+)`/g,'<code>$1</code>');
+  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(t.title)}</b>${t.saving_month?`<span class="adv-save">~${money(t.saving_month)} / month</span>`:''}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
+  const partLabel={'built-in tools & rest':'Claude Code built-in tools & rest','skills':'Skills listing','deferred tool names':'Deferred tool names (mostly MCP)',
+    'system prompt':'System prompt','MCP server instructions':'MCP server instructions','agent types':'Agent types','CLAUDE.md & memory':'CLAUDE.md & memory','environment':'Environment'};
+  const bar=(v,max)=>`<span class="cc-bar"><span style="width:${(v/Math.max(max,1)*100).toFixed(1)}%"></span></span>`;
+  const bmax=Math.max(...(d.breakdown||[]).map(b=>b.tokens),1);
+  const parts=(d.breakdown||[]).map(b=>`<tr><td class="cache-name">${escHtml(partLabel[b.part]||b.part)}</td><td class="num cc-cost">${bar(b.tokens,bmax)}${tok(b.tokens)}</td><td class="num cache-opt">${Number(b.share).toFixed(0)}%</td></tr>`).join('');
+  const used=n=>n?`<span>${n.toLocaleString()}×</span>`:'<span class="ctx-unused">never</span>';
+  const table=(head,rows)=>rows?`<div class="adv-table"><table class="cache-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`:'';
+  const section=t=>`<div class="ctx-sec">${t}</div>`;
+  const skills=(d.skills||[]).map(g=>`<tr><td class="cache-name">${escHtml(g.plugin==='(no plugin)'?'Built-in & personal':g.plugin)}</td><td class="num cache-opt">${g.skills}</td><td class="num">${tok(g.tokens)}</td><td class="num">${used(g.uses)}</td><td class="num">${money(g.cost)}</td></tr>`).join('');
+  const mcp=(d.mcp||[]).filter(g=>g.cost>=0.01).map(g=>`<tr><td class="cache-name">${escHtml(g.server)}</td><td class="num">${tok(g.tokens)}</td><td class="num">${used(g.uses)}</td><td class="num">${money(g.cost)}</td></tr>`).join('');
+  const base=p=>String(p).split(/[\\/]/).slice(-3).join('/');
+  const files=(d.files||[]).filter(f=>f.tokens>=20).map(f=>`<tr><td class="cache-name" title="${escHtml(f.path)}">${escHtml(base(f.path))}${f.kind?`<span class="cc-repo">${escHtml(f.kind)}</span>`:''}</td><td class="num">${tok(f.tokens)}</td><td class="num cache-opt">${f.sessions}</td><td class="num">${money(f.cost)}</td></tr>`).join('');
+  const projects=(d.projects||[]).map(p=>`<tr><td class="cache-name">${escHtml(p.project)}</td><td class="num cache-opt">${p.sessions}</td><td class="num">${tok(p.avg_tokens)}</td><td class="num cache-opt">${p.calls.toLocaleString()}</td><td class="num">${money(p.cost)}</td></tr>`).join('');
+  return `<div class="ctx-wrap"><div class="hist-analytics">${kpis}</div>
+    <div class="adv-tips">${tips}</div>
+    ${section('What a session starts with')}${table('<th>Part</th><th class="num">Tokens</th><th class="num cache-opt">Share</th>',parts)}
+    ${section('Skills by plugin')}${table('<th>Plugin</th><th class="num cache-opt">Skills</th><th class="num">Tokens</th><th class="num">Used</th><th class="num">Cost</th>',skills)}
+    ${mcp?section('MCP servers')+table('<th>Server</th><th class="num">Tokens</th><th class="num">Tool calls</th><th class="num">Cost</th>',mcp):''}
+    ${files?section('CLAUDE.md & memory files')+table('<th>File</th><th class="num">Tokens</th><th class="num cache-opt">Sessions</th><th class="num">Cost</th>',files):''}
+    ${section('By project')}${table('<th>Project</th><th class="num cache-opt">Sessions</th><th class="num">At start</th><th class="num cache-opt">Calls</th><th class="num">Cost</th>',projects)}
+    <div class="cl-help" style="margin-top:8px">Sizes come from your transcripts (about 3.7 characters per token); the rest of the first prompt is Claude Code's own tool definitions. Cost = the startup context written to the cache once per session plus re-read on every later API call, at API prices.</div></div>`;
 }
 /* ── History -> CLIENTS ── */
 let _clientsMonth='', _clientsData=null, _clientsEdit=false;
@@ -18355,6 +18697,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("model_advice", e)
                 reply = {"error": "model advice failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/context_report":
+            from urllib.parse import urlparse, parse_qs
+            try:
+                days = int((parse_qs(urlparse(self.path).query).get("days") or ["30"])[0])
+            except ValueError:
+                days = 30
+            days = 30 if days not in (7, 30, 90) else days
+            try:
+                reply = _context_report(days)
+            except Exception as e:
+                _log_bg_error("context_report", e)
+                reply = {"error": "context report failed"}
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/cache_stats":
             self._get_cache_stats()
