@@ -13,7 +13,8 @@ c = Checker()
 ns = exec_functions(["_MODEL_PRICING", "_CACHE_WRITE_1H_MULT", "_model_pricing", "_calc_cost",
                      "_CTX_CHARS_PER_TOKEN", "_CTX_CACHE_S", "_CTX_LATE_MARKERS", "_CTX_MSG_ID", "_CTX_REQ_ID",
                      "_ctx_cache", "_ctx_tokens", "_ctx_mcp_key", "_ctx_mcp_label", "_ctx_plugin",
-                     "_ctx_scan_lines", "_ctx_report", "_context_report"],
+                     "_ctx_scan_lines", "_ctx_report", "_context_report",
+                     "_fix_paths", "_fix_read_json", "_fix_installed_plugins", "_fix_for_plugin"],
                     {"json": json, "re": re, "os": os, "glob": glob, "time": time})
 
 lbl, key, plug = ns["_ctx_mcp_label"], ns["_ctx_mcp_key"], ns["_ctx_plugin"]
@@ -120,6 +121,14 @@ try:
     os.environ["USERPROFILE"] = os.environ["HOME"] = home
     rep = ns["_context_report"](30)
     c.check("scan: main transcripts in the period only", rep["sessions"] == 1)
+    os.makedirs(os.path.join(home, ".claude", "plugins"))
+    with open(os.path.join(home, ".claude", "plugins", "installed_plugins.json"), "w") as fh:
+        json.dump({"version": 2, "plugins": {"vercel@claude-plugins-official": [{}]}}, fh)
+    c.check("installed plugins by name", ns["_fix_installed_plugins"]() == {"vercel": "vercel@claude-plugins-official"})
+    fp = ns["_fix_for_plugin"]
+    c.check("plugin fix: installed -> settings, synced -> manual steps",
+            fp("vercel", {"vercel": "vercel@x"}) == {"kind": "plugin", "target": "vercel@x"}
+            and fp("design", {})["kind"] == "manual" and "claude.ai" in fp("design", {})["steps"])
     os.remove(os.path.join(d, "sid.jsonl"))
     c.check("cached", ns["_context_report"](30)["sessions"] == 1)
     c.check("cache expires", ns["_context_report"](30, now=time.time() + 16 * 60)["sessions"] == 0)

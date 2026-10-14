@@ -6,7 +6,7 @@ const { readMonitorSource, extractFunction } = require('./lib/extract');
 const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
-for (const f of ['escHtml', 'jsq', '_failToolName', '_failureMapHtml'])
+for (const f of ['escHtml', 'jsq', '_fixBtnHtml', '_failToolName', '_failureMapHtml'])
   eval(extractFunction(src, f));
 
 const c = new Checker();

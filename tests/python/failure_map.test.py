@@ -17,7 +17,7 @@ ns = exec_functions(["_MODEL_PRICING", "_CACHE_WRITE_1H_MULT", "_model_pricing",
                      "_replay_result_text", "_FAIL_CACHE_S", "_FAIL_GAP_CAP_S", "_FAIL_TOOL_ID", "_FAIL_RESULT_ID",
                      "_FAIL_IS_ERROR", "_FAIL_ASSISTANT", "_FAIL_SHELLS", "_FAIL_TRIVIAL", "_FAIL_SUBCMD", "_FAIL_REASONS", "_fail_reason",
                      "_fail_target", "_fail_scan_lines", "_fail_report", "_FAIL_HINTS", "_fail_files",
-                     "_failure_map", "_fail_cache"],
+                     "_failure_map", "_fail_cache", "_FIX_FOR_REASON"],
                     {"json": json, "re": re, "os": os, "glob": glob, "time": time, "datetime": datetime,
                      "TRANSCRIPT_INDEX_DB": "/nonexistent/x.db", "_log_bg_error": lambda *a: None})
 
@@ -108,6 +108,9 @@ many = {"calls": 10, "fails": [dict(f[1], sid="e%d" % i) for i in range(3)]}
 tips = ns["_fail_report"]([many], 7)["tips"]
 c.check("tip with hint + monthly scaling", len(tips) == 1 and "CRLF" in tips[0]["detail"]
         and abs(tips[0]["cost_month"] - round(f[1]["cost"] * 3 * 30 / 7, 2)) < 0.011)
+c.check("no fix for a reason without one", "fix" not in tips[0])
+enc = {"calls": 10, "fails": [dict(f[1], sid="u%d" % i, reason="Python UnicodeEncodeError") for i in range(3)]}
+c.check("fix attached for a known reason", ns["_fail_report"]([enc], 30)["tips"][0]["fix"] == {"kind": "env", "target": "PYTHONIOENCODING"})
 c.check("empty", ns["_fail_report"]([], 30)["calls"] == 0)
 
 # ── _failure_map over a fake home, subagents mapped to their session ──

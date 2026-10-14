@@ -7488,6 +7488,306 @@ def _model_advice(days, now=None):
     return report
 
 
+# ── One-click fixes (tips in History -> CONTEXT / FAILURES) ────────────────
+# A tip can carry a fix: a small, allowlisted change to Claude Code's own
+# config that AOC previews, applies (backup first) and can undo:
+#   plugin -- enabledPlugins["<name>@<marketplace>"] = false in ~/.claude/settings.json
+#             (installed plugins only; plugins synced from your claude.ai account
+#             are managed there, so those tips get a 'manual' fix with steps)
+#   mcp    -- add the server to projects[<folder>].disabledMcpServers in
+#             ~/.claude.json for every folder Claude Code knows (what /mcp's
+#             toggle writes; new folders start with the server on)
+#   env    -- an allowlisted env var in settings.json "env" (all of Claude's shells)
+#   note   -- an allowlisted line appended to ~/.claude/CLAUDE.md
+# Every apply is logged in fixes.json with what it changed; undo reverts
+# exactly that (and leaves alone a value you changed by hand since).
+FIXES_FILE = os.path.join(AOC_DATA_DIR, "fixes.json")
+_FIX_ENV = {"PYTHONIOENCODING": "utf-8"}
+_FIX_NOTES = {
+    "heredoc": "- For multi-line scripts, write the script to a file (Write tool) and run the file -- "
+               "don't pass long heredocs or nested quotes to the shell.",
+    "utf8_open": "- On this Windows machine, open text files in Python with encoding='utf-8' "
+                 "(the default code page is not UTF-8).",
+}
+_FIX_LOCK = threading.Lock()
+
+
+def _fix_paths():
+    home = os.path.expanduser("~")
+    return {"settings": os.path.join(home, ".claude", "settings.json"),
+            "claude_json": os.path.join(home, ".claude.json"),
+            "claude_md": os.path.join(home, ".claude", "CLAUDE.md"),
+            "plugins": os.path.join(home, ".claude", "plugins", "installed_plugins.json")}
+
+
+def _fix_key(fix) -> str:
+    """Pure: one identity per fix target, e.g. 'plugin:vercel@claude-plugins-official'."""
+    fix = fix if isinstance(fix, dict) else {}
+    return f"{fix.get('kind', '')}:{fix.get('target', '')}"
+
+
+def _fix_read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, type(default)) else default
+    except FileNotFoundError:
+        return default
+
+
+def _fix_installed_plugins() -> dict:
+    """{'vercel': 'vercel@claude-plugins-official', ...} for locally installed plugins."""
+    data = _fix_read_json(_fix_paths()["plugins"], {})
+    out = {}
+    for pid in (data.get("plugins") or {}):
+        out.setdefault(str(pid).split("@", 1)[0], str(pid))
+    return out
+
+
+def _fix_for_plugin(name, installed) -> dict:
+    """Pure: the fix for an unused plugin's tip."""
+    pid = installed.get(name)
+    if pid:
+        return {"kind": "plugin", "target": pid}
+    return {"kind": "manual", "target": name,
+            "steps": f"The {name} plugin comes from your claude.ai account, not from this PC. Turn it off in "
+                     "claude.ai settings (plugins / capabilities), or ask your organization's admin."}
+
+
+_FIX_FOR_REASON = {"Python UnicodeEncodeError": {"kind": "env", "target": "PYTHONIOENCODING"},
+                   "Shell quoting error": {"kind": "note", "target": "heredoc"},
+                   "Python UnicodeDecodeError": {"kind": "note", "target": "utf8_open"}}
+
+
+def _fix_plan(fix, settings, claude_json, claude_md):
+    """Pure: an allowlisted fix + the current file contents -> {"ok", "title",
+    "changes": [...]} or {"ok": False, "error"}. A change is
+    {"file", "op": "set"|"list_add"|"line_add", "path", "before", "after"|"item"|"text"}."""
+    fix = fix if isinstance(fix, dict) else {}
+    kind, target = str(fix.get("kind") or ""), str(fix.get("target") or "")
+    if kind == "plugin":
+        if not re.match(r"^[\w.-]{1,80}@[\w.-]{1,80}$", target):
+            return {"ok": False, "error": "unknown plugin"}
+        cur = (settings.get("enabledPlugins") or {}).get(target)
+        if cur is False:
+            return {"ok": False, "error": "already off"}
+        return {"ok": True, "title": f"Turn off the {target.split('@')[0]} plugin",
+                "changes": [{"file": "settings", "op": "set", "path": ["enabledPlugins", target],
+                             "before": cur, "after": False}]}
+    if kind == "mcp":
+        if not re.match(r"^[\w .:()/-]{1,80}$", target):
+            return {"ok": False, "error": "unknown server"}
+        changes = []
+        for folder, cfg in sorted((claude_json.get("projects") or {}).items()):
+            cur = cfg.get("disabledMcpServers") if isinstance(cfg, dict) else None
+            if isinstance(cur, list) and target in cur:
+                continue
+            changes.append({"file": "claude_json", "op": "list_add", "path": ["projects", folder, "disabledMcpServers"],
+                            "before": cur if isinstance(cur, list) else None, "item": target})
+        if not changes:
+            return {"ok": False, "error": "already off in every folder"}
+        return {"ok": True, "title": f"Turn off the MCP server {target}", "changes": changes}
+    if kind == "env":
+        if target not in _FIX_ENV:
+            return {"ok": False, "error": "unknown setting"}
+        cur = (settings.get("env") or {}).get(target)
+        if cur == _FIX_ENV[target]:
+            return {"ok": False, "error": "already set"}
+        return {"ok": True, "title": f"Set {target}={_FIX_ENV[target]} for Claude's shells",
+                "changes": [{"file": "settings", "op": "set", "path": ["env", target], "before": cur,
+                             "after": _FIX_ENV[target]}]}
+    if kind == "note":
+        text = _FIX_NOTES.get(target)
+        if not text:
+            return {"ok": False, "error": "unknown note"}
+        if text in (claude_md or ""):
+            return {"ok": False, "error": "already in CLAUDE.md"}
+        return {"ok": True, "title": "Add a line to your CLAUDE.md",
+                "changes": [{"file": "claude_md", "op": "line_add", "path": [], "text": text}]}
+    return {"ok": False, "error": "this tip has no automatic fix"}
+
+
+def _fix_get(obj, path):
+    for k in path:
+        obj = obj.get(k) if isinstance(obj, dict) else None
+    return obj
+
+
+def _fix_set(obj, path, value):
+    """Set (value not None) or delete (None) obj[path...]; parents created as needed."""
+    for k in path[:-1]:
+        if not isinstance(obj.get(k), dict):
+            obj[k] = {}
+        obj = obj[k]
+    if value is None:
+        obj.pop(path[-1], None)
+    else:
+        obj[path[-1]] = value
+
+
+def _fix_do(changes, docs, undo=False):
+    """Pure-ish: apply (or revert) changes to in-memory docs {"settings": dict,
+    "claude_json": dict, "claude_md": str}. Returns the changes skipped on undo
+    because the value was changed by hand since."""
+    skipped = []
+    for ch in changes:
+        f, op, path = ch["file"], ch["op"], ch.get("path") or []
+        if op == "line_add":
+            text = ch["text"]
+            md = docs.get(f) or ""
+            if undo:
+                lines = md.split("\n")
+                if text in lines:
+                    lines.remove(text)
+                    docs[f] = "\n".join(lines)
+            else:
+                docs[f] = (md.rstrip("\n") + "\n\n" if md.strip() else "") + text + "\n"
+            continue
+        doc = docs[f]
+        cur = _fix_get(doc, path)
+        if op == "set":
+            if undo:
+                if cur == ch["after"]:
+                    _fix_set(doc, path, ch["before"])
+                else:
+                    skipped.append(ch)
+            else:
+                _fix_set(doc, path, ch["after"])
+        elif op == "list_add":
+            lst = list(cur) if isinstance(cur, list) else []
+            if undo:
+                if ch["item"] in lst:
+                    lst.remove(ch["item"])
+                _fix_set(doc, path, None if (not lst and ch.get("before") is None) else lst)
+            elif ch["item"] not in lst:
+                _fix_set(doc, path, lst + [ch["item"]])
+    return skipped
+
+
+def _fix_load_docs(paths):
+    md = ""
+    try:
+        with open(paths["claude_md"], encoding="utf-8") as f:
+            md = f.read()
+    except FileNotFoundError:
+        pass
+    return {"settings": _fix_read_json(paths["settings"], {}), "claude_json": _fix_read_json(paths["claude_json"], {}),
+            "claude_md": md}
+
+
+def _fix_write(paths, docs, files, stamp):
+    """Back up then atomically replace each touched file. ~/.claude.json is
+    rewritten by running sessions too, so it's re-read after a moment and the
+    write retried if a session put back its own copy."""
+    import shutil
+    for f in files:
+        p = paths[f]
+        eol, final, ascii_only = "\n", True, False   # keep the file's own line endings, final newline, \u escapes
+        if os.path.exists(p):
+            with open(p, "rb") as fh:
+                raw = fh.read()
+            eol = "\r\n" if b"\r\n" in raw else "\n"
+            final = not raw or raw.endswith(b"\n")
+            ascii_only = bool(raw) and max(raw) < 128 and b"\\u" in raw
+            shutil.copy2(p, f"{p}.bak-aoc-fix-{stamp}")
+            olds = sorted(glob.glob(glob.escape(p) + ".bak-aoc-fix-*"))
+            for old in olds[:-5]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        text = docs[f] if f == "claude_md" else json.dumps(docs[f], indent=2, ensure_ascii=ascii_only)
+        text = text.rstrip("\n") + ("\n" if final or f == "claude_md" else "")
+        tmp = p + ".aoc-tmp"
+        with open(tmp, "w", encoding="utf-8", newline=eol) as fh:
+            fh.write(text)
+        os.replace(tmp, p)
+
+
+def _fix_load_log():
+    data = _fix_read_json(FIXES_FILE, {})
+    return data.get("applied") if isinstance(data.get("applied"), list) else []
+
+
+def _fix_save_log(applied):
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = FIXES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"applied": applied[-200:]}, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, FIXES_FILE)
+
+
+def _fix_settle(paths, changes, retries=3, wait=2.0):
+    """Re-read ~/.claude.json after `wait` s; re-apply when a running session
+    overwrote it. True when the change stuck."""
+    for _ in range(retries):
+        time.sleep(wait)
+        docs = _fix_load_docs(paths)
+        probe = {"claude_json": json.loads(json.dumps(docs["claude_json"]))}
+        _fix_do([c for c in changes if c["file"] == "claude_json"], probe)
+        if probe["claude_json"] == docs["claude_json"]:
+            return True
+        _fix_write(paths, probe | {k: v for k, v in docs.items() if k != "claude_json"}, ["claude_json"],
+                   time.strftime("%Y%m%d-%H%M%S"))
+    return False
+
+
+def _fix_preview(fix):
+    paths = _fix_paths()
+    docs = _fix_load_docs(paths)
+    plan = _fix_plan(fix, docs["settings"], docs["claude_json"], docs["claude_md"])
+    if plan.get("ok"):
+        plan["files"] = sorted({paths[c["file"]] for c in plan["changes"]})
+    return plan
+
+
+def _fix_apply(fix, settle=True):
+    with _FIX_LOCK:
+        paths = _fix_paths()
+        docs = _fix_load_docs(paths)
+        plan = _fix_plan(fix, docs["settings"], docs["claude_json"], docs["claude_md"])
+        if not plan.get("ok"):
+            return plan
+        _fix_do(plan["changes"], docs)
+        files = sorted({c["file"] for c in plan["changes"]})
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        _fix_write(paths, docs, files, stamp)
+        rec = {"id": f"fx{int(time.time() * 1000)}", "key": _fix_key(fix), "kind": fix["kind"],
+               "target": fix["target"], "title": plan["title"], "changes": plan["changes"], "at": time.time()}
+        stuck = True
+        if settle and "claude_json" in files:
+            stuck = _fix_settle(paths, plan["changes"])
+        applied = [r for r in _fix_load_log() if r.get("key") != rec["key"]]
+        _fix_save_log(applied + [rec])
+        return {"ok": True, "record": rec, "stuck": stuck}
+
+
+def _fix_undo(fix_id, settle=True):
+    with _FIX_LOCK:
+        applied = _fix_load_log()
+        rec = next((r for r in applied if r.get("id") == fix_id), None)
+        if rec is None:
+            return {"ok": False, "error": "not found"}
+        paths = _fix_paths()
+        docs = _fix_load_docs(paths)
+        skipped = _fix_do(rec["changes"], docs, undo=True)
+        files = sorted({c["file"] for c in rec["changes"]})
+        _fix_write(paths, docs, files, time.strftime("%Y%m%d-%H%M%S"))
+        if settle and "claude_json" in files:
+            for _ in range(3):
+                time.sleep(2.0)
+                again = _fix_load_docs(paths)
+                left = [c for c in rec["changes"] if c["file"] == "claude_json"
+                        and rec["target"] in (_fix_get(again["claude_json"], c["path"]) or [])]
+                if not left:
+                    break
+                _fix_do(left, again, undo=True)
+                _fix_write(paths, again, ["claude_json"], time.strftime("%Y%m%d-%H%M%S"))
+        _fix_save_log([r for r in applied if r.get("id") != fix_id])
+        return {"ok": True, "skipped": len(skipped)}
+
+
 # ── Startup context (History -> CONTEXT) ──────────────────────────────────
 # What every session carries before your first word. The prompt of a
 # session's first API call is everything Claude Code sends up front; the
@@ -7719,13 +8019,13 @@ def _ctx_report(sessions, days) -> dict:
     tips = []
     for g in skills_rows:
         if g["plugin"] != "(no plugin)" and not g["uses"] and g["tokens"] >= 300:
-            tips.append({"kind": "plugin", "saving_month": round(g["cost"] * month, 2),
+            tips.append({"kind": "plugin", "plugin": g["plugin"], "saving_month": round(g["cost"] * month, 2),
                          "title": f"Unused plugin: {g['plugin']}",
                          "detail": f"It lists {g['skills']} skill{'s' if g['skills'] != 1 else ''} (~{g['tokens']:,} tokens) "
                                    f"in every session and none was used in {days} days. Disable it with `/plugin`."})
     for g in mcp_rows:
         if not g["uses"] and g["tokens"] >= 300:
-            tips.append({"kind": "mcp", "saving_month": round(g["cost"] * month, 2),
+            tips.append({"kind": "mcp", "server": g["server"], "saving_month": round(g["cost"] * month, 2),
                          "title": f"Unused MCP server: {g['server']}",
                          "detail": f"Its tool names and instructions add ~{g['tokens']:,} tokens to every session and no "
                                    f"tool of it was called in {days} days. Disconnect it (`/mcp`, or the connector in claude.ai settings)."})
@@ -7771,6 +8071,13 @@ def _context_report(days, now=None):
         if s:
             sessions.append(s)
     report = _ctx_report(sessions, days)
+    installed = _fix_installed_plugins()
+    for t in report.get("tips") or []:
+        if t.get("kind") == "plugin":
+            t["fix"] = _fix_for_plugin(t["plugin"], installed)
+        elif t.get("kind") == "mcp":
+            m = re.match(r"^(.+) \(([\w-]+) plugin\)$", t["server"])   # 'figma (design plugin)' -> plugin:design:figma
+            t["fix"] = {"kind": "mcp", "target": f"plugin:{m.group(2)}:{m.group(1)}" if m else t["server"]}
     report["computed_at"] = now
     _ctx_cache[days] = (now, report)
     return report
@@ -7999,7 +8306,8 @@ def _fail_report(scans, days) -> dict:
         hint = _FAIL_HINTS.get(g["reason"])
         if hint and g["count"] >= 3:
             tips.append({"reason": g["reason"], "tool": g["tool"], "target": g["target"], "count": g["count"],
-                         "detail": hint, "cost_month": round(g["cost"] * month, 2)})
+                         "detail": hint, "cost_month": round(g["cost"] * month, 2),
+                         **({"fix": _FIX_FOR_REASON[g["reason"]]} if g["reason"] in _FIX_FOR_REASON else {})})
     seen = set()
     tips = [t for t in tips if not (t["detail"] in seen or seen.add(t["detail"]))][:5]
     return {
@@ -9558,6 +9866,17 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .adv-dim { color:var(--t3); }
 .adv-table { overflow-x:auto; }
 .ctx-wrap { flex-shrink:0; }
+.fx-btn { font-size:9px;padding:2px 9px; }
+.adv-tip-head .fx-btn:first-of-type, .adv-tip-head .fx-done, .adv-tip-head .fx-dim { margin-left:8px; }
+.fx-go { border-color:rgba(var(--c-rgb),.5);color:var(--c); }
+.fx-done { font:700 10px var(--font2);color:var(--g); }
+.fx-dim { font:400 10px var(--font2);color:var(--t3); }
+.fx-box { max-width:640px; }
+.fx-plan { padding:14px 16px;display:flex;flex-direction:column;gap:10px;font-size:12px;color:var(--t2); }
+.fx-title { font-size:13px;color:var(--t);font-weight:700; }
+.fx-files code, .fx-list code { font:400 10px var(--font2);background:rgba(var(--c-rgb),.1);padding:1px 4px;border-radius:3px;word-break:break-all; }
+.fx-list { margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px; }
+.fx-actions { display:flex;justify-content:flex-end;gap:8px; }
 .fm-rate { font-size:.55em;color:var(--t3);margin-left:4px; }
 .fm-reason { font-size:11px;color:var(--t2);margin-top:2px; }
 .fm-ex { font:400 10px var(--font2);color:var(--t3);margin-top:2px;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
@@ -14480,16 +14799,16 @@ async function renderHistory(){
   if(_histTab==='failures'){
     body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
     try{
-      const d=await fetch('/failure_map?days='+_failDays).then(r=>r.json());
-      if(gen===_histRenderGen) body.innerHTML=_failureMapHtml(d);
+      const [d]=await Promise.all([fetch('/failure_map?days='+_failDays).then(r=>r.json()), _fixesLoad()]);
+      if(gen===_histRenderGen) body.innerHTML=_failureMapHtml(d, _fixesApplied, _fixLocal());
     }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the failure map.</div>'; }
     return;
   }
   if(_histTab==='context'){
     body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
     try{
-      const d=await fetch('/context_report?days='+_ctxDays).then(r=>r.json());
-      if(gen===_histRenderGen) body.innerHTML=_contextReportHtml(d);
+      const [d]=await Promise.all([fetch('/context_report?days='+_ctxDays).then(r=>r.json()), _fixesLoad()]);
+      if(gen===_histRenderGen) body.innerHTML=_contextReportHtml(d, _fixesApplied, _fixLocal());
     }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the context report.</div>'; }
     return;
   }
@@ -15232,11 +15551,68 @@ function _modelAdviceHtml(d){
     <div class="adv-table"><table class="cache-table"><thead><tr><th>Work</th><th>Model</th><th class="num cache-opt">Calls</th><th class="num">Cost</th><th class="num">On Sonnet</th><th class="num cache-opt">On Haiku</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="cl-help" style="margin-top:8px">Each API call is sorted by the tools it used and re-priced with the same tokens. Another model would use a different number of tokens, so treat these as estimates.</div>`;
 }
+/* ── One-click fixes on CONTEXT / FAILURES tips ── */
+let _fixesApplied={};
+const _fixLocal=()=>['127.0.0.1','localhost','[::1]'].includes(location.hostname);
+async function _fixesLoad(){
+  try{ const d=await fetch('/fixes').then(r=>r.json()); _fixesApplied={}; (d.applied||[]).forEach(r=>{ _fixesApplied[r.key]=r; }); }
+  catch(e){ /* keep the last known state */ }
+}
+/* Pure: the button on a tip -- Fix… / ✓ Fixed + Undo / manual steps / local-only hint. */
+function _fixBtnHtml(fix, applied, local){
+  if(!fix||!fix.kind) return '';
+  if(fix.kind==='manual') return `<button class="adp-btn fx-btn" onclick="_fixManual(${jsq(fix.steps||'')})" title="This one can't be changed from this PC">How to turn off</button>`;
+  const rec=(applied||{})[fix.kind+':'+fix.target];
+  if(rec) return `<span class="fx-done" title="${escHtml(rec.title||'')}">✓ Fixed</span><button class="adp-btn fx-btn" onclick="_fixUndo(${jsq(rec.id)})" title="Put back what this fix changed">Undo</button>`;
+  if(!local) return `<span class="fx-dim" title="Fixes change Claude Code's config files, so they run only from the dashboard on this PC">Fix on the PC</span>`;
+  return `<button class="adp-btn fx-btn fx-go" onclick="_fixOpen(${jsq(JSON.stringify({kind:fix.kind,target:fix.target}))})" title="Preview the change, then apply it (backup first, undo any time)">Fix…</button>`;
+}
+/* Pure: a fix preview -- what changes in which file. */
+function _fixPlanHtml(p){
+  if(!p||!p.ok) return `<div class="chg-empty">${escHtml((p&&p.error)||'Could not prepare the fix.')}</div>`;
+  const val=v=>v===undefined||v===null?'(not set)':JSON.stringify(v);
+  const rows=(p.changes||[]).map(c=>{
+    if(c.op==='line_add') return `<li><b>CLAUDE.md</b> + <code>${escHtml(c.text)}</code></li>`;
+    const where=c.file==='claude_json'?`projects["${escHtml(c.path[1])}"].disabledMcpServers`:escHtml(c.path.join('.'));
+    if(c.op==='list_add') return `<li><code>${where}</code>: ${escHtml(val(c.before))} → add <code>${escHtml(c.item)}</code></li>`;
+    return `<li><code>${where}</code>: ${escHtml(val(c.before))} → <code>${escHtml(val(c.after))}</code></li>`;
+  }).join('');
+  return `<div class="fx-plan"><div class="fx-title">${escHtml(p.title)}</div>
+    <div class="fx-files">${(p.files||[]).map(f=>`<code>${escHtml(f)}</code>`).join(' ')}</div>
+    <ul class="fx-list">${rows}</ul>
+    <div class="cl-help">AOC backs the file up first; Undo puts it back. Takes effect in Claude Code sessions you start after this.</div>
+    <div class="fx-actions"><button class="adp-btn" onclick="this.closest('.diff-overlay').remove()">Cancel</button><button class="adp-btn cl-save" onclick="_fixApply(this)">Apply</button></div></div>`;
+}
+let _fixPending=null;
+async function _fixOpen(fixJson){
+  _fixPending=JSON.parse(fixJson);
+  const o=_overlay('Fix', '<div class="chg-empty">Checking…</div>', 'chg-box fx-box');
+  let p; try{ p=await fetch('/fixes/preview',{method:'POST',body:JSON.stringify(_fixPending)}).then(r=>r.json()); }catch(e){ p={ok:false,error:'Could not reach AOC.'}; }
+  o.querySelector('.chg-body').innerHTML=_fixPlanHtml(p);
+}
+async function _fixApply(btn){
+  btn.disabled=true; btn.textContent='Applying…';
+  let r; try{ r=await fetch('/fixes/apply',{method:'POST',body:JSON.stringify(_fixPending)}).then(x=>x.json()); }catch(e){ r={ok:false,error:'Could not reach AOC.'}; }
+  const o=btn.closest('.diff-overlay'); if(o) o.remove();
+  if(r.ok) showToast(r.stuck===false?'warning':'success', r.stuck===false?'Fixed, but a running session may undo it':'Fixed',
+    r.stuck===false?'A Claude Code session rewrote ~/.claude.json. Close running sessions and apply the fix again.':'Takes effect in Claude Code sessions you start from now on.');
+  else showToast('error','Fix not applied', r.error||'failed');
+  await _fixesLoad(); renderHistory();
+}
+async function _fixUndo(id){
+  let r; try{ r=await fetch('/fixes/undo',{method:'POST',body:JSON.stringify({id})}).then(x=>x.json()); }catch(e){ r={ok:false,error:'Could not reach AOC.'}; }
+  if(r.ok) showToast('success','Undone', r.skipped?`${r.skipped} value(s) you changed by hand since were left as they are.`:'The change is back to how it was.');
+  else showToast('error','Undo failed', r.error||'failed');
+  await _fixesLoad(); renderHistory();
+}
+function _fixManual(steps){
+  _overlay('How to turn it off', `<div class="fx-plan"><div class="adv-tip-body">${escHtml(steps)}</div></div>`, 'chg-box fx-box');
+}
 /* ── History -> CONTEXT ── */
 let _ctxDays=30;
 /* Pure: the CONTEXT tab from GET /context_report -- what every session
    carries before your first message, what re-reading it costs, and tips. */
-function _contextReportHtml(d){
+function _contextReportHtml(d, applied, local){
   d=d||{};
   if(d.error) return `<div class="conv-empty">The context report failed — see Health → background errors.</div>`;
   if(!d.sessions) return `<div class="conv-empty">No Claude Code sessions in this period.</div>`;
@@ -15250,7 +15626,7 @@ function _contextReportHtml(d){
     kpi(best?'~'+money(best):'—','Could save / month','Sum of the suggestions below, scaled to 30 days'),
   ].join('');
   const md=t=>escHtml(t).replace(/`([^`]+)`/g,'<code>$1</code>');
-  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(t.title)}</b>${t.saving_month?`<span class="adv-save">~${money(t.saving_month)} / month</span>`:''}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
+  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(t.title)}</b>${t.saving_month?`<span class="adv-save">~${money(t.saving_month)} / month</span>`:''}${_fixBtnHtml(t.fix,applied,local)}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
   const partLabel={'built-in tools & rest':'Claude Code built-in tools & rest','skills':'Skills listing','deferred tool names':'Deferred tool names (mostly MCP)',
     'system prompt':'System prompt','MCP server instructions':'MCP server instructions','agent types':'Agent types','CLAUDE.md & memory':'CLAUDE.md & memory','environment':'Environment'};
   const bar=(v,max)=>`<span class="cc-bar"><span style="width:${(v/Math.max(max,1)*100).toFixed(1)}%"></span></span>`;
@@ -15285,7 +15661,7 @@ function _failToolName(t){
 /* Pure: the FAILURES tab from GET /failure_map -- which tool calls fail most,
    why, what that lost (time + the next turn's cost), and a replay link to the
    latest case. */
-function _failureMapHtml(d){
+function _failureMapHtml(d, applied, local){
   d=d||{};
   if(d.error) return `<div class="conv-empty">The failure map failed — see Health → background errors.</div>`;
   if(!d.calls) return `<div class="conv-empty">No tool calls in this period.</div>`;
@@ -15300,7 +15676,7 @@ function _failureMapHtml(d){
   ].join('');
   if(!d.failed) return `<div class="hist-analytics">${kpis}</div><div class="conv-empty">No failed tool calls in this period.</div>`;
   const md=t=>escHtml(t).replace(/`([^`]+)`/g,'<code>$1</code>');
-  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(`${t.reason} (${_failToolName(t.tool)}${t.target?' · '+t.target:''}): ${t.count}×`)}</b>${t.cost_month?`<span class="adv-save">~${money(t.cost_month)} / month</span>`:''}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
+  const tips=(d.tips||[]).map(t=>`<div class="adv-tip"><div class="adv-tip-head"><b>${escHtml(`${t.reason} (${_failToolName(t.tool)}${t.target?' · '+t.target:''}): ${t.count}×`)}</b>${t.cost_month?`<span class="adv-save">~${money(t.cost_month)} / month</span>`:''}${_fixBtnHtml(t.fix,applied,local)}</div><div class="adv-tip-body">${md(t.detail)}</div></div>`).join('');
   const bar=(v,max)=>`<span class="cc-bar"><span style="width:${(v/Math.max(max,1)*100).toFixed(1)}%"></span></span>`;
   const tmax=Math.max(...(d.top||[]).map(g=>g.count),1);
   const replay=g=>g.last_sid?`<button class="chg-btn rp-btn" onclick="openReplay(${jsq(g.last_sid)},'',${jsq(g.last_label||g.last_sid.slice(0,8))},'errors')" title="Replay the latest session with this failure, failed steps only">▶</button>`:'';
@@ -19077,6 +19453,9 @@ class Handler(BaseHTTPRequestHandler):
                 _log_bg_error("model_advice", e)
                 reply = {"error": "model advice failed"}
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/fixes":
+            applied = [{k: r.get(k) for k in ("id", "key", "title", "at")} for r in _fix_load_log()]
+            self._serve(200, "application/json", json.dumps({"applied": applied}, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/failure_map":
             from urllib.parse import urlparse, parse_qs
             try:
@@ -19433,6 +19812,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if path_no_qs == "/update":
             self._post_update(body)
+
+        elif path_no_qs in ("/fixes/preview", "/fixes/apply", "/fixes/undo"):
+            # changes Claude Code's own config files: only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"local only"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/fixes/undo":
+                    reply = _fix_undo(str(data.get("id") or ""))
+                else:
+                    fix = {"kind": str(data.get("kind") or ""), "target": str(data.get("target") or "")}
+                    reply = _fix_preview(fix) if path_no_qs == "/fixes/preview" else _fix_apply(fix)
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("fixes", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
 
         elif path_no_qs == "/focus_session":
             # a desktop action: only from this machine itself, never through
