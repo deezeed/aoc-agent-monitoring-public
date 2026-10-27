@@ -17,7 +17,7 @@ ns = exec_functions(["_MODEL_PRICING", "_CACHE_WRITE_1H_MULT", "_model_pricing",
                      "_replay_result_text", "_FAIL_CACHE_S", "_FAIL_GAP_CAP_S", "_FAIL_TOOL_ID", "_FAIL_RESULT_ID",
                      "_FAIL_IS_ERROR", "_FAIL_ASSISTANT", "_FAIL_SHELLS", "_FAIL_TRIVIAL", "_FAIL_SUBCMD", "_FAIL_REASONS", "_fail_reason",
                      "_fail_target", "_fail_scan_lines", "_fail_report", "_FAIL_HINTS", "_fail_files",
-                     "_failure_map", "_fail_cache", "_FIX_FOR_REASON"],
+                     "_failure_map", "_fail_cache", "_fail_scans", "_fail_scan_cache", "_session_titles", "_FIX_FOR_REASON"],
                     {"json": json, "re": re, "os": os, "glob": glob, "time": time, "datetime": datetime,
                      "TRANSCRIPT_INDEX_DB": "/nonexistent/x.db", "_log_bg_error": lambda *a: None})
 

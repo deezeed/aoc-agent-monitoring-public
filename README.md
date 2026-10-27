@@ -159,6 +159,7 @@ otherwise `?token=`/`X-AOC-Token` — see **Security model** below).
 | GET | `/analytics` | Aggregates behind History → Analytics (by day/project/model/...) |
 | GET | `/search_transcripts?q=` | Full-text search over past conversations (History → Conversations) |
 | GET | `/cache_stats?days=7\|30\|0` | Prompt-cache / spend breakdown behind History → Cache |
+| GET | `/permission_advice?days=7\|30\|90` | History → Permissions: prompts that hold you up, safe allow rules for them (one-click, with undo), broad risky rules you already have. Every prompt is logged in `%LOCALAPPDATA%\AOC\permission_log.jsonl` (90 days) |
 | GET | `/export_costs.csv`, `/export_costs_by_model.csv`, `/export_costs_by_subagent_type.csv` | CSV cost reports (`?from=&to=`) |
 | GET | `/errors` | Persistent cross-session error list (backs the ERRORS panel) |
 | GET | `/diag` | Self-diagnostics — uptime, threads, memory, DB/backup size |
