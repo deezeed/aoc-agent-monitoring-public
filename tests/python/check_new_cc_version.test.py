@@ -18,7 +18,7 @@ def make_ns(known=None):
         "_known_cc_versions": set(known or []),
         "_known_cc_versions_lock": threading.Lock(),
         "_save_known_cc_versions": lambda versions: saved.append(set(versions)),
-        "_show_native_toast": lambda title, msg: toasts.append((title, msg)),
+        "_show_native_toast": lambda title, msg, **k: toasts.append((title, msg)),
     })
     return ns, toasts, saved
 

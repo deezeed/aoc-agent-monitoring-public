@@ -21,7 +21,7 @@ ns = exec_functions(
      "_queue_tick"],
     {"os": os, "json": json, "time": time, "threading": threading, "_secrets": secrets,
      "AOC_DATA_DIR": os.path.join(data_dir, "AOC"),
-     "_show_native_toast": lambda t, m: toasts.append((t, m)),
+     "_show_native_toast": lambda t, m, **k: toasts.append((t, m)),
      "_log_bg_error": lambda *a: None})
 
 ok_view = {"windows": [{"kind": "five_hour", "pct": 40.0, "status": "ok"}, {"kind": "seven_day", "pct": 10.0, "status": "ok"}]}

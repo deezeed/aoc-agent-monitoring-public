@@ -305,7 +305,8 @@ def _check_new_cc_version(version: str):
         _show_native_toast(
             "AOC",
             f"New Claude Code version detected: {version} -- if agent tracking looks off, "
-            "the transcript/hook format may have changed."
+            "the transcript/hook format may have changed.",
+            kind="cc_version",
         )
     except Exception:
         pass  # _show_native_toast defined later in module; see docstring above for why this is safe to ignore
@@ -1561,7 +1562,7 @@ def _backup_history_db():
                 # (module still loading when this runs at startup, extremely
                 # unlikely given how rare an actual corruption is), the outer
                 # except below absorbs it same as any other failure here.
-                _show_native_toast("AOC Backup", "History DB backup failed integrity check -- see backups/ folder")
+                _show_native_toast("AOC Backup", "History DB backup failed integrity check -- see backups/ folder", kind="backup")
         except Exception:
             pass
         # globals().get(...) rather than a direct _notify_settings reference:
@@ -1770,7 +1771,7 @@ def _sanitize_webhook_events(events: dict) -> dict:
     sending all seven (cost_spike added later) and every background
     worker already reading them (confirmed dead: aoc_webhook_settings.json
     had never once contained those three keys)."""
-    return {
+    out = {
         "done": bool(events.get("done", True)),
         "error": bool(events.get("error", True)),
         "stuck": bool(events.get("stuck", False)),
@@ -1781,6 +1782,13 @@ def _sanitize_webhook_events(events: dict) -> dict:
         "budget_alert": bool(events.get("budget_alert", False)),
         "rate_limit": bool(events.get("rate_limit", False)),
     }
+    # Split toggles from the notification center: kept only once set, so a
+    # missing one keeps following its older key (session_loop <- stuck,
+    # budget_cap <- budget_alert; see _NOTIFY_TYPES "legacy").
+    for k in ("session_loop", "budget_cap"):
+        if k in events:
+            out[k] = bool(events[k])
+    return out
 
 def _save_webhook_settings(data: dict):
     global _webhook_settings
@@ -1898,6 +1906,273 @@ def _notification_suppressed(project: str) -> bool:
     if project and project in (cfg.get("muted_projects") or []):
         return True
     return _in_quiet_hours(cfg.get("quiet_start", ""), cfg.get("quiet_end", ""))
+
+# ── Notification center: every alert AOC sends, one row per type ──────────
+# One entry per notification type. Adding a type = one row here plus a
+# kind= on the call that fires it (_show_native_toast / _push_notify /
+# _notify_webhook); Settings -> Notify lists, toggles and tests it from this
+# table. Channels: toast (Windows), push (phones, see PHONE PUSH), webhook.
+#   webhook: key in the webhook settings' "events" map; legacy: an older
+#            key whose value a missing new key inherits (split toggles).
+#   quiet:   quiet hours + muted projects apply. Off for things you asked
+#            to be told about right away (held prompts) or that are
+#            account-level housekeeping (updates, digest).
+#   default: toast/push state until changed in Settings.
+_NOTIFY_TYPES = [
+    {"key": "done", "group": "Agents", "label": "Agent finished", "channels": ("toast", "push", "webhook"),
+     "webhook": "done", "sample": ("✓ Sample agent", "Completed successfully")},
+    {"key": "error", "group": "Agents", "label": "Agent error", "channels": ("toast", "push", "webhook"),
+     "webhook": "error", "sample": ("✗ Sample agent", "Tool failed: example error")},
+    {"key": "stuck", "group": "Agents", "label": "Agent stalled (no task progress 5 min)", "channels": ("toast", "push", "webhook"),
+     "webhook": "stuck", "sample": ("⏸ Sample agent", "No task progress for 5+ min")},
+    {"key": "session_loop", "group": "Sessions", "label": "Session looks stuck (going round in circles)", "channels": ("toast", "push", "webhook"),
+     "webhook": "session_loop", "legacy": "stuck", "sample": ("⟳ Sample session looks stuck", "Same command failed 3 times")},
+    {"key": "waiting_nudge", "group": "Sessions", "label": "Waiting on you for 2 h+", "channels": ("toast", "push", "webhook"),
+     "webhook": "waiting_nudge", "sample": ("⏳ Sample session", "Waiting on you for 2h 5m")},
+    {"key": "cache_expiry", "group": "Sessions", "label": "Prompt cache about to go cold", "channels": ("toast", "push"),
+     "sample": ("❄ Sample session · cache cold in 8 min", "Reply now, or the next message costs ~$1.20 more")},
+    {"key": "permission", "group": "Sessions", "label": "Held permission prompt (Remote approve)", "channels": ("push",),
+     "quiet": False, "sample": ("🔐 Sample session needs your OK", "Bash: npm test")},
+    {"key": "reply", "group": "Sessions", "label": "Turn held for your reply (Reply from phone)", "channels": ("push",),
+     "quiet": False, "sample": ("💬 Sample session asks", "Should I commit this?")},
+    {"key": "queue", "group": "Sessions", "label": "Queued task started / failed", "channels": ("toast", "push"),
+     "quiet": False, "sample": ("▶ Queued task started · project", "Run the tests and fix failures")},
+    {"key": "burn_spike", "group": "Cost", "label": "Token burn spike", "channels": ("toast", "push", "webhook"),
+     "webhook": "burn_spike", "sample": ("⚡ Sample session", "Burn spike: 42000 tok/min (avg 9000)")},
+    {"key": "cost_spike", "group": "Cost", "label": "Session cost spike vs project average", "channels": ("toast", "push", "webhook"),
+     "webhook": "cost_spike", "sample": ("💰 Sample session", "Cost spike: $12.40 (project avg $3.10)")},
+    {"key": "budget_alert", "group": "Cost", "label": "Monthly project budget exceeded", "channels": ("toast", "push", "webhook"),
+     "webhook": "budget_alert", "sample": ("💸 project", "Monthly budget exceeded: $52.00 of $50.00")},
+    {"key": "budget_cap", "group": "Cost", "label": "Hard budget cap reached (tool calls blocked)", "channels": ("toast", "push", "webhook"),
+     "webhook": "budget_cap", "legacy": "budget_alert", "quiet": False, "sample": ("⛔ Budget cap · Sample session", "$5.02 of $5.00 -- tool calls are blocked")},
+    {"key": "rate_limit", "group": "Cost", "label": "Plan limit (5 h / weekly)", "channels": ("toast", "push", "webhook"),
+     "webhook": "rate_limit", "sample": ("Plan limit · 5-hour at 80 %", "Resets in 1h 20m")},
+    {"key": "weekly_digest", "group": "Cost", "label": "Cost / activity digest", "channels": ("toast", "push", "webhook"),
+     "webhook": "weekly_digest", "quiet": False, "sample": ("AOC Digest", "12 sessions, $48.20 (+5% vs last week), 1 errors this week")},
+    {"key": "update", "group": "AOC", "label": "AOC update available", "channels": ("toast", "push"),
+     "quiet": False, "sample": ("AOC", "AOC 1.0.999 is available.")},
+    {"key": "cc_version", "group": "AOC", "label": "New Claude Code version seen", "channels": ("toast", "push"),
+     "quiet": False, "sample": ("AOC", "New Claude Code version detected: 9.9.9")},
+    {"key": "backup", "group": "AOC", "label": "History backup failed its check", "channels": ("toast", "push"),
+     "quiet": False, "sample": ("AOC Backup", "History DB backup failed integrity check")},
+]
+_NOTIFY_BY_KEY = {t["key"]: t for t in _NOTIFY_TYPES}
+_NOTIFY_CHANNELS = ("toast", "push", "webhook")
+
+
+def _notify_type_on(kind, channel, notify_cfg, webhook_cfg) -> bool:
+    """Pure: the user's toggle for (type, channel), defaults included --
+    ignores quiet hours. Unknown types (a caller not migrated yet) keep the
+    old behaviour: toast + push on, no webhook."""
+    t = _NOTIFY_BY_KEY.get(kind)
+    if t is None:
+        return channel != "webhook"
+    if channel not in t["channels"]:
+        return False
+    if channel == "webhook":
+        ev = (webhook_cfg or {}).get("events") or {}
+        if t["webhook"] in ev:
+            return bool(ev[t["webhook"]])
+        if t.get("legacy") in ev:
+            return bool(ev[t["legacy"]])
+        return t["webhook"] in ("done", "error")
+    ch = ((notify_cfg or {}).get("channels") or {}).get(kind) or {}
+    return bool(ch.get(channel, (t.get("default") or {}).get(channel, True)))
+
+
+def _notify_gate(kind, channel, project="", notify_cfg=None, webhook_cfg=None, now_hm=None):
+    """Pure-ish: (send?, reason) for one notification on one channel --
+    the type's toggle, then muted project, then quiet hours (both skipped
+    for types with quiet=False). Config defaults to the live settings."""
+    ncfg = _notify_settings if notify_cfg is None else notify_cfg
+    wcfg = _webhook_settings if webhook_cfg is None else webhook_cfg
+    t = _NOTIFY_BY_KEY.get(kind) or {}
+    if channel not in _NOTIFY_CHANNELS:
+        return False, "unknown channel"
+    if t and channel not in t["channels"]:
+        return False, "not available"
+    if not _notify_type_on(kind, channel, ncfg, wcfg):
+        return False, "off"
+    if channel == "webhook" and not (wcfg or {}).get("url"):
+        return False, "no webhook url"
+    if t.get("quiet", True):
+        if project and project in (ncfg.get("muted_projects") or []):
+            return False, "muted project"
+        qs, qe = ncfg.get("quiet_start", ""), ncfg.get("quiet_end", "")
+        if now_hm is not None:
+            if qs and qe and ((qs <= now_hm < qe) if qs <= qe else (now_hm >= qs or now_hm < qe)):
+                return False, "quiet hours"
+        elif _in_quiet_hours(qs, qe):
+            return False, "quiet hours"
+    return True, ""
+
+
+def _sanitize_notify_channels(channels) -> dict:
+    """Whitelist {type: {toast|push: bool}} -- webhook toggles live in the
+    webhook settings file, as before."""
+    out = {}
+    for kind, ch in (channels or {}).items() if isinstance(channels, dict) else ():
+        t = _NOTIFY_BY_KEY.get(kind)
+        if not t or not isinstance(ch, dict):
+            continue
+        row = {c: bool(ch[c]) for c in ("toast", "push") if c in ch and c in t["channels"]}
+        if row:
+            out[kind] = row
+    return out
+
+
+# Recent notifications, newest last: in memory + a small ring on disk so the
+# list survives restarts.
+NOTIFY_LOG_FILE = os.path.join(AOC_DATA_DIR, "notify_log.json")
+_NOTIFY_LOG_MAX = 100
+_notify_log_lock = threading.Lock()
+_notify_log = []
+
+
+def _notify_log_load():
+    data = _load_json_file(NOTIFY_LOG_FILE)
+    if isinstance(data, list):
+        _notify_log[:] = [e for e in data if isinstance(e, dict)][-_NOTIFY_LOG_MAX:]
+
+
+def _notify_log_add(kind, channel, title, body="", now=None, test=False, path=None):
+    entry = {"t": round(now or time.time(), 1), "kind": str(kind or "other")[:40], "channel": channel,
+             "title": str(title or "")[:120], "body": str(body or "")[:200]}
+    if test:
+        entry["test"] = True
+    with _notify_log_lock:
+        _notify_log.append(entry)
+        del _notify_log[:-_NOTIFY_LOG_MAX]
+        snap = list(_notify_log)
+    try:
+        path = path or NOTIFY_LOG_FILE
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    return entry
+
+
+try:
+    _notify_log_load()
+except Exception:
+    pass
+
+
+def _notify_webhook(kind, payload, project="", url=None) -> bool:
+    """Gate + deliver one webhook event (payload as before). True if sent."""
+    ok, _why = _notify_gate(kind, "webhook", project)
+    if not ok:
+        return False
+    _fire_webhook(url or _webhook_settings.get("url", ""), payload)
+    _notify_log_add(kind, "webhook", payload.get("event", kind), "")
+    return True
+
+
+def _notify_center_view(notify_cfg, webhook_cfg, push_devices=0, now_hm=None) -> dict:
+    """Pure: what Settings -> Notify shows -- every type with its channels'
+    state and whether quiet hours apply right now."""
+    qs, qe = notify_cfg.get("quiet_start", ""), notify_cfg.get("quiet_end", "")
+    rows = []
+    for t in _NOTIFY_TYPES:
+        rows.append({"key": t["key"], "group": t["group"], "label": t["label"], "quiet": t.get("quiet", True),
+                     "channels": {c: _notify_type_on(t["key"], c, notify_cfg, webhook_cfg) if c in t["channels"] else None
+                                  for c in _NOTIFY_CHANNELS}})
+    quiet_now = False
+    if qs and qe and now_hm is not None:
+        quiet_now = (qs <= now_hm < qe) if qs <= qe else (now_hm >= qs or now_hm < qe)
+    return {"types": rows, "quiet_start": qs, "quiet_end": qe, "quiet_now": quiet_now,
+            "muted_projects": list(notify_cfg.get("muted_projects") or []),
+            "webhook_url": bool((webhook_cfg or {}).get("url")), "push_devices": push_devices}
+
+
+def _notify_set(kind, channel, on, notify_cfg, webhook_cfg):
+    """Pure: (new notify cfg, new webhook cfg) with one toggle changed, or
+    raise ValueError."""
+    t = _NOTIFY_BY_KEY.get(kind)
+    if not t or channel not in t["channels"]:
+        raise ValueError("unknown notification")
+    ncfg, wcfg = dict(notify_cfg), dict(webhook_cfg)
+    if channel == "webhook":
+        ev = dict(_sanitize_webhook_events(wcfg.get("events") or {}))
+        ev[t["webhook"]] = bool(on)
+        wcfg["events"] = ev
+    else:
+        ch = {k: dict(v) for k, v in (ncfg.get("channels") or {}).items()}
+        ch.setdefault(kind, {})[channel] = bool(on)
+        ncfg["channels"] = _sanitize_notify_channels(ch)
+    return ncfg, wcfg
+
+
+_notify_test_last = [0.0]
+
+
+def _notify_log_clear(path=None):
+    with _notify_log_lock:
+        del _notify_log[:]
+    try:
+        os.remove(path or NOTIFY_LOG_FILE)
+    except OSError:
+        pass
+
+
+def _notify_center_payload(now=None) -> dict:
+    """GET /notify_center: the toggle table plus the recent log, newest first."""
+    try:
+        devices = len(_push_subs())
+    except Exception:
+        devices = 0
+    view = _notify_center_view(_notify_settings, _webhook_settings, devices,
+                               datetime.fromtimestamp(now or time.time()).strftime("%H:%M"))
+    with _notify_log_lock:
+        view["log"] = list(reversed(_notify_log))
+    view["pro"] = bool(_is_pro())
+    return view
+
+
+def _notify_test(kind, now=None, channel=None) -> dict:
+    """Send the type's sample through every channel that is on for it, or
+    just `channel` (on or off) -- quiet hours and the phone's away mode are
+    ignored, you asked for it."""
+    now = now or time.time()
+    t = _NOTIFY_BY_KEY.get(kind)
+    if not t:
+        return {"ok": False, "error": "unknown notification"}
+    if channel is not None and channel not in t["channels"]:
+        return {"ok": False, "error": "not available for this notification"}
+    if now - _notify_test_last[0] < 3:
+        return {"ok": False, "error": "wait a few seconds between tests"}
+    _notify_test_last[0] = now
+    title, body = t["sample"]
+    title = "[test] " + title
+    sent, skipped = [], {}
+    for ch in ((channel,) if channel else t["channels"]):
+        if not channel and not _notify_type_on(kind, ch, _notify_settings, _webhook_settings):
+            skipped[ch] = "off"
+            continue
+        if ch == "toast":
+            _win_toast(title, body)
+            _notify_log_add(kind, "toast", title, body, now=now, test=True)
+            sent.append("toast")
+        elif ch == "push":
+            n = _push_notify(title, body, tag="test-" + kind, force=True)
+            if n:
+                _notify_log_add(kind, "push", title, body, now=now, test=True)
+                sent.append("push")
+            else:
+                skipped["push"] = "no phone set up"
+        elif ch == "webhook":
+            url = _webhook_settings.get("url", "")
+            if not url:
+                skipped["webhook"] = "no webhook url"
+                continue
+            _fire_webhook(url, {"event": t["webhook"], "test": True, "title": title, "body": body})
+            _notify_log_add(kind, "webhook", title, body, now=now, test=True)
+            sent.append("webhook")
+    return {"ok": True, "sent": sent, "skipped": skipped}
 
 _SNITCH_INTERVAL_S = 600  # 10 min -- comfortably inside the grace period any
                           # ping-or-alert service (healthchecks.io, Cronitor,
@@ -2337,6 +2612,7 @@ def _webhook_notify_worker():
     _budget_notified = set()  # projects already alerted this calendar month
     _budget_notified_month = [datetime.now().strftime("%Y-%m")]
     _rate_limit_notified = _load_rate_limit_notified(time.time())
+    _cache_alert_notified = set()  # (session id, cache expiry) already alerted
     while True:
         try:
             time.sleep(3)
@@ -2353,7 +2629,7 @@ def _webhook_notify_worker():
                 if old.get("status") == "running":
                     new_status = a.get("status")
                     event = new_status if new_status in ("done", "error") else None
-                    if event and events.get(event) and not suppressed:
+                    if event and not suppressed:
                         # project/model were missing here even though both are
                         # sitting right on `a` -- an external webhook consumer
                         # (Slack, Discord, a custom bot) had no way to tell
@@ -2370,7 +2646,7 @@ def _webhook_notify_worker():
                         }
                         if new_status == "error" and a.get("error_message"):
                             agent_payload["error_message"] = a["error_message"][:500]
-                        _fire_webhook(url, {"event": event, "agent": agent_payload})
+                        _notify_webhook(event, {"event": event, "agent": agent_payload}, agent_payload["project"], url)
                 prev_done = len([t for t in (old.get("tasks") or []) if t.get("done")])
                 cur_done = len([t for t in (a.get("tasks") or []) if t.get("done")])
                 if a.get("status") == "running":
@@ -2379,18 +2655,18 @@ def _webhook_notify_worker():
                     if aid not in _stuck_notified and time.time() - _last_progress_at[aid] > 300:
                         _stuck_notified.add(aid)
                         if not suppressed:
-                            if events.get("stuck"):
-                                _fire_webhook(url, {
-                                    "event": "stuck",
-                                    "agent": {
-                                        "id": a.get("id"), "name": a.get("name"), "status": "running",
-                                        "cost": round(a.get("estimated_cost") or 0, 4),
-                                        "project": a.get("session_project") or "",
-                                        "model": a.get("model") or "",
-                                    },
-                                })
+                            _notify_webhook("stuck", {
+                                "event": "stuck",
+                                "agent": {
+                                    "id": a.get("id"), "name": a.get("name"), "status": "running",
+                                    "cost": round(a.get("estimated_cost") or 0, 4),
+                                    "project": a.get("session_project") or "",
+                                    "model": a.get("model") or "",
+                                },
+                            }, a.get("session_project") or "", url)
                             try:
-                                _show_native_toast(f"⏸ {a.get('name','Agent')[:40]}", "No task progress for 5+ min")
+                                _show_native_toast(f"⏸ {a.get('name','Agent')[:40]}", "No task progress for 5+ min",
+                                                   kind="stuck", project=a.get("session_project") or "")
                             except Exception:
                                 pass
                 else:
@@ -2445,17 +2721,17 @@ def _webhook_notify_worker():
                 if spend >= budget and project not in _budget_notified:
                     _budget_notified.add(project)
                     if not _notification_suppressed(project):
-                        if events.get("budget_alert"):
-                            _fire_webhook(url, {
-                                "event": "budget_alert",
-                                "project": project,
-                                "spend": round(spend, 2),
-                                "budget": round(budget, 2),
-                            })
+                        _notify_webhook("budget_alert", {
+                            "event": "budget_alert",
+                            "project": project,
+                            "spend": round(spend, 2),
+                            "budget": round(budget, 2),
+                        }, project, url)
                         try:
                             _show_native_toast(
                                 f"💸 {project}",
-                                f"Monthly budget exceeded: ${spend:.2f} of ${budget:.2f}"
+                                f"Monthly budget exceeded: ${spend:.2f} of ${budget:.2f}",
+                                kind="budget_alert", project=project,
                             )
                         except Exception:
                             pass
@@ -2467,10 +2743,24 @@ def _webhook_notify_worker():
                 _rate_limit_notified.add(key)
                 _save_rate_limit_notified({k for k in _rate_limit_notified if k[1] > time.time()})
                 if not _notification_suppressed(""):
-                    if events.get("rate_limit"):
-                        _fire_webhook(url, payload)
+                    _notify_webhook("rate_limit", payload, "", url)
                     try:
-                        _show_native_toast(title, body)
+                        _show_native_toast(title, body, kind="rate_limit")
+                    except Exception:
+                        pass
+
+            # Prompt cache about to expire on a session waiting on you: reply
+            # now for cache-read prices, or pay to write the context again.
+            now = time.time()
+            for key in [k for k in _cache_alert_notified if k[1] <= now]:
+                _cache_alert_notified.discard(key)
+            sess_by_id = {s.get("id"): s for s in (d.get("sessions_list") or [])}
+            for key, title, body in _cache_expiry_alerts(d.get("sessions_list"), _cache_alert_notified, now):
+                _cache_alert_notified.add(key)
+                proj = (sess_by_id.get(key[0]) or {}).get("project", "")
+                if not _notification_suppressed(proj):
+                    try:
+                        _show_native_toast(title, body, kind="cache_expiry", project=proj)
                     except Exception:
                         pass
 
@@ -2503,21 +2793,21 @@ def _webhook_notify_worker():
                     if sid not in _waiting_notified:
                         _waiting_notified.add(sid)
                         if not suppressed:
-                            if events.get("waiting_nudge"):
-                                _fire_webhook(url, {
-                                    "event": "waiting_nudge",
-                                    "session": {
-                                        "id": sid, "project": sess.get("project"),
-                                        "display_name": sess.get("display_name"),
-                                        "waiting_secs": sess.get("waiting_secs"),
-                                    },
-                                })
+                            _notify_webhook("waiting_nudge", {
+                                "event": "waiting_nudge",
+                                "session": {
+                                    "id": sid, "project": sess.get("project"),
+                                    "display_name": sess.get("display_name"),
+                                    "waiting_secs": sess.get("waiting_secs"),
+                                },
+                            }, sess.get("project") or "", url)
                             try:
                                 ws = sess.get("waiting_secs") or 0
                                 wh, wm = int(ws // 3600), int((ws % 3600) // 60)
                                 _show_native_toast(
                                     f"⏳ {sess.get('display_name') or sess.get('project') or 'Session'}",
-                                    f"Waiting on you for {wh}h {wm}m"
+                                    f"Waiting on you for {wh}h {wm}m",
+                                    kind="waiting_nudge", project=sess.get("project") or "",
                                 )
                             except Exception:
                                 pass
@@ -2532,15 +2822,15 @@ def _webhook_notify_worker():
                     _loop_notified[sid] = loop.get("kind")
                     if not suppressed:
                         name = sess.get("display_name") or sess.get("project") or "Session"
-                        if events.get("stuck"):
-                            _fire_webhook(url, {
-                                "event": "session_loop",
-                                "session": {"id": sid, "project": sess.get("project"), "display_name": name,
-                                            "kind": loop.get("kind"), "detail": loop.get("text"),
-                                            "cost": round(sess.get("estimated_cost") or 0, 4)},
-                            })
+                        _notify_webhook("session_loop", {
+                            "event": "session_loop",
+                            "session": {"id": sid, "project": sess.get("project"), "display_name": name,
+                                        "kind": loop.get("kind"), "detail": loop.get("text"),
+                                        "cost": round(sess.get("estimated_cost") or 0, 4)},
+                        }, sess.get("project") or "", url)
                         try:
-                            _show_native_toast(f"⟳ {name[:40]} looks stuck", (loop.get("text") or "")[:120])
+                            _show_native_toast(f"⟳ {name[:40]} looks stuck", (loop.get("text") or "")[:120],
+                                               kind="session_loop", project=sess.get("project") or "")
                         except Exception:
                             pass
                 elif not loop:
@@ -2558,20 +2848,20 @@ def _webhook_notify_worker():
                     if sid not in _cost_spike_notified:
                         _cost_spike_notified.add(sid)
                         if not suppressed:
-                            if events.get("cost_spike"):
-                                _fire_webhook(url, {
-                                    "event": "cost_spike",
-                                    "session": {
-                                        "id": sid, "project": sess.get("project"),
-                                        "display_name": sess.get("display_name"),
-                                        "cost": round(session_cost, 4),
-                                        "project_avg_cost": round(project_avg, 4),
-                                    },
-                                })
+                            _notify_webhook("cost_spike", {
+                                "event": "cost_spike",
+                                "session": {
+                                    "id": sid, "project": sess.get("project"),
+                                    "display_name": sess.get("display_name"),
+                                    "cost": round(session_cost, 4),
+                                    "project_avg_cost": round(project_avg, 4),
+                                },
+                            }, sess.get("project") or "", url)
                             try:
                                 _show_native_toast(
                                     f"💰 {sess.get('display_name') or sess.get('project') or 'Session'}",
-                                    f"Cost spike: ${session_cost:.2f} (project avg ${project_avg:.2f})"
+                                    f"Cost spike: ${session_cost:.2f} (project avg ${project_avg:.2f})",
+                                    kind="cost_spike", project=sess.get("project") or "",
                                 )
                             except Exception:
                                 pass
@@ -2592,20 +2882,20 @@ def _webhook_notify_worker():
                     if sid not in _burn_notified:
                         _burn_notified.add(sid)
                         if not suppressed:
-                            if events.get("burn_spike"):
-                                _fire_webhook(url, {
-                                    "event": "burn_spike",
-                                    "session": {
-                                        "id": sid, "project": sess.get("project"),
-                                        "display_name": sess.get("display_name"),
-                                        "recent_rate": round(recent_rate, 1),
-                                        "avg_rate": round(avg_rate, 1),
-                                    },
-                                })
+                            _notify_webhook("burn_spike", {
+                                "event": "burn_spike",
+                                "session": {
+                                    "id": sid, "project": sess.get("project"),
+                                    "display_name": sess.get("display_name"),
+                                    "recent_rate": round(recent_rate, 1),
+                                    "avg_rate": round(avg_rate, 1),
+                                },
+                            }, sess.get("project") or "", url)
                             try:
                                 _show_native_toast(
                                     f"⚡ {sess.get('display_name') or sess.get('project') or 'Session'}",
-                                    f"Burn spike: {recent_rate:.0f} tok/min (avg {avg_rate:.0f})"
+                                    f"Burn spike: {recent_rate:.0f} tok/min (avg {avg_rate:.0f})",
+                                    kind="burn_spike", project=sess.get("project") or "",
                                 )
                             except Exception:
                                 pass
@@ -3293,8 +3583,10 @@ def _perm_open(data, cfg, now) -> dict:
             "created": now, "last_poll": now, "state": "pending", "message": "",
         }
     try:
-        _push_notify(f"🔐 {_push_session_name(data.get('session_id'))} needs your OK", summary,
-                     tag="perm-" + rid, urgent=True)
+        if _notify_gate("permission", "push")[0]:
+            title = f"🔐 {_push_session_name(data.get('session_id'))} needs your OK"
+            if _push_notify(title, summary, tag="perm-" + rid, urgent=True):
+                _notify_log_add("permission", "push", title, summary)
     except Exception as e:
         _log_bg_error("push", e)
     return {"hold": True, "id": rid, "summary": summary}
@@ -3338,7 +3630,8 @@ def _perm_pending_by_session(now) -> dict:
             if q["state"] == "pending":
                 out.setdefault(q["session_id"], []).append(
                     {"id": q["id"], "tool_name": q["tool_name"], "summary": q["summary"],
-                     "detail": q["detail"], "age_s": int(now - q["created"])})
+                     "detail": q["detail"], "age_s": int(now - q["created"]),
+                     "danger": q.get("danger") or ""})
     return out
 
 
@@ -3390,9 +3683,11 @@ def _reply_open(data, cfg, now) -> dict:
         }
     try:
         msg = str(data.get("last_assistant_message") or "").strip()
-        _push_notify(f"💬 {_push_session_name(sid)} " + ("asks" if msg.endswith("?") else "finished its turn"),
-                     ("…" + msg[-240:]) if len(msg) > 240 else (msg or "Reply from AOC to carry on."),
-                     tag="reply-" + rid, urgent=True)
+        if _notify_gate("reply", "push")[0]:
+            title = f"💬 {_push_session_name(sid)} " + ("asks" if msg.endswith("?") else "finished its turn")
+            body = ("…" + msg[-240:]) if len(msg) > 240 else (msg or "Reply from AOC to carry on.")
+            if _push_notify(title, body, tag="reply-" + rid, urgent=True):
+                _notify_log_add("reply", "push", title, body)
     except Exception as e:
         _log_bg_error("push", e)
     return {"hold": True, "id": rid}
@@ -4274,7 +4569,7 @@ def _release_update_worker(installed: str):
             if status["stale"] and not _self_update_notified[0]:
                 _self_update_notified[0] = True
                 try:
-                    _show_native_toast("AOC", f"AOC {status['latest']} is available (you have {installed}).")
+                    _show_native_toast("AOC", f"AOC {status['latest']} is available (you have {installed}).", kind="update")
                 except Exception:
                     pass
         except Exception as e:
@@ -4325,7 +4620,7 @@ def _selfupdate_worker():
             if stale and not _self_update_notified[0]:
                 _self_update_notified[0] = True
                 try:
-                    _show_native_toast("AOC", f"Update available: {behind_by} commit(s) behind origin/master.")
+                    _show_native_toast("AOC", f"Update available: {behind_by} commit(s) behind origin/master.", kind="update")
                 except Exception:
                     pass
             elif not stale:
@@ -4512,14 +4807,12 @@ def _digest_worker():
                 try:
                     _show_native_toast(
                         "AOC Digest",
-                        f"{summary['sessions']} sessions, ${summary['cost']:.2f} ({trend}), {summary['errors']} errors this week"
+                        f"{summary['sessions']} sessions, ${summary['cost']:.2f} ({trend}), {summary['errors']} errors this week",
+                        kind="weekly_digest",
                     )
                 except Exception:
                     pass
-                cfg = _webhook_settings
-                url = cfg.get("url", "")
-                if url and cfg.get("events", {}).get("weekly_digest"):
-                    _fire_webhook(url, {"event": "weekly_digest", "summary": summary})
+                _notify_webhook("weekly_digest", {"event": "weekly_digest", "summary": summary})
                 _write_last_digest_week(_digest_marker_for(now, cadence))
         except Exception as e:
             _log_bg_error("_digest_worker", e)
@@ -4773,6 +5066,50 @@ def _calc_cost(inp: int, out: int, cache_write: int, cache_read: int, model: str
             + cw_1h * pi * _CACHE_WRITE_1H_MULT + cache_read * pr) / 1_000_000
 
 
+def _recache_cost(tokens, ttl, model):
+    """(cold $, warm $) for the next message of a session whose context is
+    `tokens` long: cold = writing it all to cache again (1.25x input for a
+    5-minute entry, 2x for a 1-hour one), warm = reading it from cache."""
+    pi, _po, pw, pr = _model_pricing(model or "")
+    tokens = max(int(tokens or 0), 0)
+    write = pi * _CACHE_WRITE_1H_MULT if ttl == "1h" else pw
+    return tokens * write / 1_000_000, tokens * pr / 1_000_000
+
+
+# How long before expiry the alert fires, per cache TTL, and the smallest
+# extra cost worth interrupting you for.
+_CACHE_ALERT_LEAD_S = {"1h": 600, "5m": 120}
+_CACHE_ALERT_MIN_USD = 0.25
+
+
+def _cache_expiry_alerts(sessions, notified, now):
+    """Pure: [(key, title, body)] for open sessions waiting on you whose
+    prompt cache expires within _CACHE_ALERT_LEAD_S and would cost at least
+    _CACHE_ALERT_MIN_USD more to re-cache than to read. key = (sid, expiry),
+    so a session alerts once per wait; a new reply moves the expiry and
+    re-arms it. Keys already in `notified` are skipped."""
+    out = []
+    for s in sessions or ():
+        c = s.get("context") or {}
+        sid, exp, ttl = s.get("id"), c.get("cache_expires_at"), c.get("cache_ttl")
+        if not sid or not s.get("session_active") or not s.get("waiting_on_you") or not exp or ttl not in _CACHE_ALERT_LEAD_S:
+            continue
+        left = exp - now
+        if left <= 0 or left > _CACHE_ALERT_LEAD_S[ttl] or (sid, exp) in notified:
+            continue
+        tokens = c.get("recache_tokens") or c.get("tokens") or 0
+        cold, warm = _recache_cost(tokens, ttl, s.get("model"))
+        if cold - warm < _CACHE_ALERT_MIN_USD:
+            continue
+        mins = max(1, int(left // 60))
+        name = s.get("display_name") or s.get("project") or "Session"
+        tok = f"{tokens / 1000:.0f}k" if tokens >= 1000 else str(tokens)
+        out.append(((sid, exp), f"🧊 {name[:40]}: cache expires in {mins} min",
+                    f"Reply within {mins} min to keep it warm (~${warm:.2f}). "
+                    f"After that the next message re-caches {tok} tokens: ~${cold:.2f}."))
+    return out
+
+
 # child_id -> parent_id, for a parent's child_ids arriving before the
 # child agent itself has been created yet (see _apply_agent_update below).
 # In practice the child's own PreToolUse/PostToolUse almost always fire
@@ -4817,6 +5154,16 @@ def _apply_agent_update(status: dict, au: dict, session_id: str, session_project
                 existing_ids[cid]["parent_id"] = aid
             else:
                 _pending_parent_links[cid] = aid
+    if aid in existing_ids and au.get("detected_via") == "transcript":
+        # The scanner reads a start line up to 30 s late; by then the hook has
+        # usually registered the agent (and for a finished one, marked it
+        # done). Re-applying that start used to flip it back to "running"
+        # and flag a hook miss that never happened -- only fill the gaps.
+        a = existing_ids[aid]
+        for k, v in au.items():
+            if k not in ("status", "detected_via") and not a.get(k):
+                a[k] = v
+        return
     if aid in existing_ids:
         a = existing_ids[aid]
         old_status = a.get("status", "")
@@ -5083,12 +5430,23 @@ def _human_text(obj):
 
 
 _SESSION_EDITED_MAX = 300  # files remembered per session for its Changes view
+_ACTIVITY_MINUTES_MAX = 1440  # active minutes remembered per session (a day's worth)
 
 
 def _activity_track(stats, obj, now):
     """Feed one transcript line into stats["activity"]: counters since your
     last message to this session."""
     act = stats.setdefault("activity", {"since": 0, "tools": 0, "errors": 0, "commits": 0, "files": [], "pending": {}})
+    # transcript lines per minute (last 24 h) -- the Heat / Timeline session views
+    if isinstance(obj, dict) and obj.get("type") in ("user", "assistant") and not obj.get("isSidechain"):
+        ts = _iso_to_epoch(obj.get("timestamp"))
+        if ts:
+            mins = act.setdefault("minutes", {})
+            m = int(ts // 60) * 60
+            mins[m] = mins.get(m, 0) + 1
+            if len(mins) > _ACTIVITY_MINUTES_MAX:
+                for k in sorted(mins)[:len(mins) - _ACTIVITY_MINUTES_MAX]:
+                    del mins[k]
     if _human_text(obj) is not None:
         act.update({"since": _iso_to_epoch(obj.get("timestamp")) or now, "tools": 0, "errors": 0,
                     "commits": 0, "files": [], "pending": {}})
@@ -5312,6 +5670,380 @@ def _recap_get(sid, force=False, run=None, now=None):
             _recap_busy.discard(sid)
 
 
+# ── Ask AOC: questions in plain words over your own history ───────────────
+# The model never touches the database. The question picks a period ("v
+# utorok", "this month", "last 7 days") and topics (spend, failures,
+# commits, cache, clients, models) by keywords; the matching facts are
+# pulled from the transcript index and the existing reports into a short
+# plain-text sheet (capped), and Haiku answers from that sheet only.
+# Sessions in the sheet carry 8-char ids ([#1a2b3c4d]) that the UI turns
+# into Replay links. Answers are cached per question and day.
+ASK_CACHE_FILE = os.path.join(AOC_DATA_DIR, "ask_cache.json")
+_ASK_MAX_FACTS = 12000
+_ASK_MAX_Q = 500
+_ASK_KEEP = 60
+_ask_lock = threading.Lock()
+_ask_busy = [False]
+_ASK_INSTRUCTION = (
+    "You answer a question about the user's own Claude Code usage. Use ONLY the FACTS given with "
+    "the question; use their exact numbers (money in $ with 2 decimals) and add them up yourself only "
+    "when no total is given. If the facts don't hold the answer, say so in one sentence and name what "
+    "is missing. When you mention a session, write its id exactly as in the facts, like [#1a2b3c4d]. "
+    "Be short: 1-5 sentences or a short list with '- '. Plain text: no markdown headings, no bold, "
+    "no backticks. Answer in the same language as the question.")
+_ASK_STOP = set("""
+a aj ako ale alebo ani asi az bol bola bolo by bude co ci do este for from had has have how i in is it je
+ja jej ich k kde ked kedy kolko kto ma mam me mi my na nad nie o od on ona pod pre pri s sa si sme so som
+ste su sú t ta tak tam te ten the this to tom tu tych u uz v vo vy z za ze what which who why with you
+your was were did do does my me on at of and or an are be by kolkokrat ktora ktore ktory ktorej najviac
+najmenej most least celkovo spolu total kolko minul minula minuli stal stala stalo stoji cost spend spent
+dnes vcera predvcerom today yesterday tyzden tyzdni tyzdna week mesiac mesiaci mesiaca month rok year
+posledne poslednych poslednom last past den dni dna day days robil robila robili urobil pracoval work worked
+session sessions sessionu sessiony relacia relacie claude code aoc som si sa mi ma
+tento tomto tohto tuto tato toto this that these those minuly minulom minulu minuleho previous ever time all
+predchadzajuci predchadzajucom much many cost costs costed ktory which kolko viac more less menej
+""".split())
+_ASK_TOPICS = (
+    ("spend", r"minul|stal|stoj|cost|spend|spent|cen[ay]|\$|eur|dolar|peniaz|money|kolko|how much|drah|expens|lacn|cheap|rozpoc|budget|utrat"),
+    ("failures", r"fail|chyb|error|zlyh|padl|padal|crash|broke|nefung|denied|zamiet|problem"),
+    ("commits", r"commit|push|merge"),
+    ("cache", r"cache|kes"),
+    ("clients", r"klient|client|faktur|invoice|bill"),
+    ("models", r"model|opus|sonnet|haiku|fable"),
+)
+_ASK_WEEKDAYS = (r"pondel|monday|\bmon\b", r"utor|tuesday|\btue\b", r"\bstred|wednesday", r"stvrt|thursday",
+                 r"\bpiat|friday", r"sobot|saturday", r"nedel|sunday")
+_ASK_MONTHS = (r"januar|january|\bjan\b", r"februar|february", r"\bmar(ec|ci|ca)\b|march", r"april",
+               r"\bmaj(a|i)?\b|\bmay\b", r"\bjun(a|i|e)?\b|june", r"\bjul(a|i)?\b|july", r"august",
+               r"septemb", r"oktob|october", r"novemb", r"decemb")
+
+
+def _ask_norm(s):
+    """Pure: lowercase, no diacritics, single spaces."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+
+def _ask_period(question, today):
+    """Pure: the days a question is about -> {from, to, label} (YYYY-MM-DD,
+    both inclusive). today = datetime.date. Default: the last 30 days."""
+    from datetime import date as _date, timedelta as _td
+    t = _ask_norm(question)
+    iso = lambda d: d.isoformat()
+
+    def one(d, label):
+        return {"from": iso(d), "to": iso(d), "label": label}
+
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", t)
+    if m:
+        try:
+            return one(_date(int(m.group(1)), int(m.group(2)), int(m.group(3))), m.group(0))
+        except ValueError:
+            pass
+    m = re.search(r"\b(\d{1,2})\.\s?(\d{1,2})\.(?:\s?(\d{4}))?", t)
+    if m:
+        try:
+            d = _date(int(m.group(3) or today.year), int(m.group(2)), int(m.group(1)))
+            if d > today and not m.group(3):
+                d = d.replace(year=d.year - 1)
+            return one(d, iso(d))
+        except ValueError:
+            pass
+    m = re.search(r"\b(?:posledn\w*|last|past)\s+(\d{1,3})\s*(dn|dni|day|tyzd|week|mesia|month)", t)
+    if m:
+        n = int(m.group(1)) * (7 if m.group(2) in ("tyzd", "week") else 30 if m.group(2) in ("mesia", "month") else 1)
+        n = max(1, min(n, 3650))
+        return {"from": iso(today - _td(days=n - 1)), "to": iso(today), "label": f"last {n} days"}
+    if re.search(r"predvcer|day before yesterday", t):
+        return one(today - _td(days=2), "day before yesterday")
+    if re.search(r"\bvcer|yesterday", t):
+        return one(today - _td(days=1), "yesterday")
+    if re.search(r"\bdnes|today", t):
+        return one(today, "today")
+    monday = today - _td(days=today.weekday())
+    if re.search(r"(minul\w*|predchadzajuc\w*|last|previous)\s+(tyzd|week)", t):
+        return {"from": iso(monday - _td(days=7)), "to": iso(monday - _td(days=1)), "label": "last week"}
+    if re.search(r"(tento|tomto|tohto|this)\s+(tyzd|week)", t):
+        return {"from": iso(monday), "to": iso(today), "label": "this week"}
+    first = today.replace(day=1)
+    if re.search(r"(minul\w*|predchadzajuc\w*|last|previous)\s+(mesia|month)", t):
+        prev_end = first - _td(days=1)
+        return {"from": iso(prev_end.replace(day=1)), "to": iso(prev_end), "label": "last month"}
+    if re.search(r"(tento|tomto|tohto|this)\s+(mesia|month)", t):
+        return {"from": iso(first), "to": iso(today), "label": "this month"}
+    if re.search(r"(tento|tomto|tohto|this)\s+(rok|year)|\bcelkovo\b|all time|\bever\b|odjakziva|\bvsetk\w* cas", t):
+        return {"from": "2000-01-01", "to": iso(today), "label": "all time"}
+    for i, pat in enumerate(_ASK_WEEKDAYS):
+        if re.search(pat, t):
+            d = today - _td(days=(today.weekday() - i) % 7)
+            return one(d, d.strftime("%A"))
+    for i, pat in enumerate(_ASK_MONTHS):
+        if re.search(pat, t):
+            y = today.year if i + 1 <= today.month else today.year - 1
+            start = _date(y, i + 1, 1)
+            end = (_date(y + (i == 11), (i + 1) % 12 + 1, 1) - _td(days=1))
+            return {"from": iso(start), "to": iso(min(end, today)), "label": start.strftime("%B %Y")}
+    return {"from": iso(today - _td(days=29)), "to": iso(today), "label": "last 30 days"}
+
+
+def _ask_topics(question):
+    """Pure: the report topics a question touches (set)."""
+    t = _ask_norm(question)
+    return {name for name, pat in _ASK_TOPICS if re.search(pat, t)}
+
+
+def _ask_keywords(question, limit=5):
+    """Pure: the words worth searching for (names, things), no stop words,
+    no dates or topic words."""
+    out = []
+    for w in re.findall(r"[a-z0-9][a-z0-9_.\-]{2,}", _ask_norm(question)):
+        w = w.strip(".-_")
+        if len(w) < 3 or w in _ASK_STOP or re.fullmatch(r"[\d.\-_]+", w) or w in out:
+            continue
+        if any(re.fullmatch(pat, w) or re.match(pat, w) for _n, pat in _ASK_TOPICS):
+            continue
+        if any(re.search(p, w) for p in _ASK_WEEKDAYS + _ASK_MONTHS):
+            continue
+        out.append(w)
+    return out[:limit]
+
+
+def _ask_cap(blocks, max_chars=_ASK_MAX_FACTS):
+    """Pure: join fact blocks in order until max_chars; the block that
+    doesn't fit is cut at a line end and marked, later ones dropped."""
+    out, used = [], 0
+    for b in blocks:
+        b = (b or "").strip()
+        if not b:
+            continue
+        if used + len(b) + 2 <= max_chars:
+            out.append(b)
+            used += len(b) + 2
+            continue
+        room = max_chars - used - 30
+        if room > 200:
+            cut = b[:room].rsplit("\n", 1)[0]
+            out.append(cut + "\n(... more not shown)")
+        break
+    return "\n\n".join(out)
+
+
+def _ask_sessions(conn, d0, d1):
+    """Sessions with spend in [d0, d1]: [{id, cost, tokens, first_day,
+    last_day, title, project, cwd, first}] most expensive first."""
+    rows = conn.execute("""SELECT session_id, SUM(cost), SUM(inp + out + cw + cr), MIN(day), MAX(day)
+                           FROM usage WHERE day >= ? AND day <= ? GROUP BY session_id""", (d0, d1)).fetchall()
+    sids = [r[0] for r in rows]
+    meta, first = {}, {}
+    for i in range(0, len(sids), 500):
+        part = sids[i:i + 500]
+        qs = ",".join("?" * len(part))
+        for sid, project, cwd, title in conn.execute(
+                f"SELECT session_id, project, cwd, title FROM sessions_meta WHERE session_id IN ({qs})", part):
+            meta[sid] = (project or "", cwd or "", title or "")
+        for sid, ts, text in conn.execute(
+                f"SELECT session_id, ts, substr(text, 1, 160) FROM msgs WHERE role = 'user' AND session_id IN ({qs})", part):
+            if sid not in first or (ts or "") < first[sid][0]:
+                first[sid] = (ts or "", text or "")
+    out = []
+    for sid, cost, tokens, a, b in rows:
+        project, cwd, title = meta.get(sid, ("", "", ""))
+        out.append({"id": sid, "cost": round(cost or 0, 4), "tokens": int(tokens or 0), "first_day": a, "last_day": b,
+                    "title": title, "project": project, "cwd": cwd,
+                    "first": re.sub(r"\s+", " ", first.get(sid, ("", ""))[1]).strip()})
+    out.sort(key=lambda s: -s["cost"])
+    return out
+
+
+def _ask_facts(conn, question, today, fail_fn=None, client_cfg=None):
+    """-> (facts text, {id8: {id, title}}, period). conn = transcript index;
+    fail_fn(days) = the failure map (only called when the question is about
+    failures -- it scans transcripts)."""
+    from datetime import date as _date
+    period = _ask_period(question, today)
+    topics = _ask_topics(question)
+    words = _ask_keywords(question)
+    d0, d1 = period["from"], period["to"]
+    sess = _ask_sessions(conn, d0, d1)
+    ids = {}
+
+    def ref(s):
+        k = s["id"][:8]
+        ids[k] = {"id": s["id"], "title": s["title"] or s["project"] or k}
+        return f"[#{k}]"
+
+    money = lambda v: f"${(v or 0):.2f}"
+    total = sum(s["cost"] for s in sess)
+    n_commits = conn.execute("SELECT COUNT(*) FROM commits WHERE sha NOT LIKE 'tu:%' AND day >= ? AND day <= ?",
+                             (d0, d1)).fetchone()[0]
+    blocks = [f"PERIOD: {period['label']} ({d0} to {d1}); today is {today.isoformat()} ({today.strftime('%A')})\n"
+              f"Total Claude Code spend: {money(total)} in {len(sess)} sessions; {n_commits} commits."]
+    if words:
+        lines = []
+        for w in words:
+            hit = [s for s in sess if w in _ask_norm(" ".join((s["title"], s["first"], s["cwd"], s["project"])))]
+            if hit:
+                lines.append(f"- '{w}': {money(sum(s['cost'] for s in hit))} in {len(hit)} sessions "
+                             f"({', '.join(ref(s) for s in hit[:12])})")
+        if lines:
+            blocks.append("SESSIONS MENTIONING THE QUESTION'S WORDS (title, first message or folder), this period:\n"
+                          + "\n".join(lines))
+    try:
+        days_n = (_date.fromisoformat(d1) - _date.fromisoformat(d0)).days + 1
+    except ValueError:
+        days_n = 31
+    if 1 < days_n <= 62:
+        by_day = conn.execute("SELECT day, SUM(cost) FROM usage WHERE day >= ? AND day <= ? GROUP BY day ORDER BY day",
+                              (d0, d1)).fetchall()
+        if by_day:
+            blocks.append("SPEND PER DAY:\n" + "\n".join(f"{d} {_date.fromisoformat(d).strftime('%a')} {money(c)}"
+                                                         for d, c in by_day))
+    if sess:
+        lines = []
+        for s in sess[:40]:
+            days = s["first_day"] if s["first_day"] == s["last_day"] else f"{s['first_day']}..{s['last_day']}"
+            lines.append(f"{ref(s)} {days} {money(s['cost'])} \"{s['title'] or s['project']}\""
+                         + (f" first msg: \"{s['first'][:110]}\"" if s["first"] else ""))
+        more = f"\n(+{len(sess) - 40} cheaper sessions, {money(sum(s['cost'] for s in sess[40:]))})" if len(sess) > 40 else ""
+        blocks.append("SESSIONS (most expensive first):\n" + "\n".join(lines) + more)
+    if "models" in topics or "spend" in topics:
+        rows = conn.execute("SELECT model, SUM(cost), SUM(n) FROM usage WHERE day >= ? AND day <= ? GROUP BY model "
+                            "ORDER BY 2 DESC", (d0, d1)).fetchall()
+        if rows:
+            blocks.append("SPEND BY MODEL:\n" + "\n".join(f"{m or '?'}: {money(c)}, {n} API calls" for m, c, n in rows))
+    if "commits" in topics or not topics:
+        cs = [c for c in _commit_stats(conn, d0)["commits"]
+              if not c.get("epoch") or datetime.fromtimestamp(c["epoch"]).strftime("%Y-%m-%d") <= d1]
+        if cs:
+            lines = []
+            for c in cs[:30]:
+                day = datetime.fromtimestamp(c["epoch"]).strftime("%Y-%m-%d %H:%M") if c.get("epoch") else ""
+                k = c["session_id"][:8]
+                ids.setdefault(k, {"id": c["session_id"], "title": c.get("title") or k})
+                lines.append(f"{day} {c['repo']} {str(c['sha'])[:7]} \"{c['subject'][:90]}\" {money(c['cost'])} [#{k}]")
+            blocks.append("COMMITS (newest first, cost = session spend since its previous commit):\n" + "\n".join(lines))
+    if "cache" in topics:
+        st = _cache_stats(conn, d0, top=5)["total"]
+        blocks.append(f"PROMPT CACHE since {d0}: hit rate {round((st['hit_rate'] or 0) * 100)}%, saved {money(st['saved'])}, "
+                      f"re-caches {st['cold_n']} costing {money(st['cold_extra'])} extra, cache reads {money(st['cost_read'])}, "
+                      f"cache writes {money(st['cost_write'])}, output {money(st['cost_out'])}")
+    if "clients" in topics and client_cfg is not None:
+        rep = _client_report(conn, d0[:7], client_cfg)
+        lines = [f"- {g['name'] or '(no client)'}: {money(g['cost'])} (billed {money(g['billed'])}), "
+                 f"{len(g['sessions'])} sessions, {g['commits']} commits" for g in rep["clients"] if g["sessions"]]
+        if lines:
+            blocks.append(f"CLIENTS in {rep['month']}:\n" + "\n".join(lines))
+    if "failures" in topics and fail_fn is not None:
+        try:
+            fdays = max(1, min(90, (today - _date.fromisoformat(d0)).days + 1))
+            fm = fail_fn(fdays)
+            lines = [f"Last {fdays} days: {fm['failed']} failed tool calls of {fm['calls']} ({fm['rate']}%), "
+                     f"~{round(fm['secs'] / 60)} min and {money(fm['cost'])} lost, {fm['denied']} denied by you"]
+            for g in (fm.get("top") or [])[:15]:
+                lines.append(f"- {g['tool']} {g['target'][:60]} ({g['reason']}): {g['count']}x in {g['sessions']} sessions, "
+                             f"{money(g['cost'])}; last [#{str(g['last_sid'])[:8]}]")
+                ids.setdefault(str(g["last_sid"])[:8], {"id": g["last_sid"], "title": g.get("last_label") or ""})
+            worst = {}
+            for g in fm.get("top") or []:
+                w = worst.setdefault(g["last_sid"], [0, g.get("last_label") or ""])
+                w[0] += g["count"]
+            if worst:
+                lines.append("Sessions with the most failures (by their latest failing pattern): " + ", ".join(
+                    f"[#{str(sid)[:8]}] {n}x" for sid, (n, _l) in sorted(worst.items(), key=lambda kv: -kv[1][0])[:6]))
+            blocks.append("FAILURES:\n" + "\n".join(lines))
+        except Exception as e:
+            _log_bg_error("ask failures", e)
+    if words:
+        hits = _search_transcripts(conn, " ".join(words), limit_sessions=8, hits_per_session=2)
+        if not hits and len(words) > 1:  # every word at once found nothing: each one alone
+            seen = set()
+            for w in words[:3]:
+                for h in _search_transcripts(conn, w, limit_sessions=4, hits_per_session=2):
+                    if h["session_id"] not in seen:
+                        seen.add(h["session_id"])
+                        hits.append(h)
+        lines = []
+        for h in hits:
+            k = h["session_id"][:8]
+            ids.setdefault(k, {"id": h["session_id"], "title": h.get("title") or h.get("project") or k})
+            snips = " | ".join(re.sub(r"[\x02\x03]", "", x["snippet"] or "")[:140] for x in h["hits"])
+            lines.append(f"[#{k}] {str(h.get('last_ts') or '')[:10]} \"{h.get('title') or h.get('project') or ''}\" "
+                         f"({h['n_hits']} matches): {snips}")
+        if lines:
+            blocks.append("TEXT SEARCH IN CONVERSATIONS (any date) for " + ", ".join(words) + ":\n" + "\n".join(lines))
+    facts = _ask_cap(blocks)
+    used = {k: v for k, v in ids.items() if f"[#{k}]" in facts}
+    return facts, used, period
+
+
+def _ask_cache_key(question, today):
+    import hashlib
+    return hashlib.sha1((_ask_norm(question) + "|" + today.isoformat()).encode("utf-8")).hexdigest()[:20]
+
+
+def _ask_load():
+    d = _load_json_file(ASK_CACHE_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def _ask_store(key, entry):
+    d = _ask_load()
+    d[key] = entry
+    d = dict(sorted(d.items(), key=lambda kv: kv[1].get("at", 0))[-_ASK_KEEP:])
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = ASK_CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, ASK_CACHE_FILE)
+
+
+def _ask_history(limit=12):
+    """GET /ask/history: the newest answered questions."""
+    items = sorted(_ask_load().values(), key=lambda e: -e.get("at", 0))[:limit]
+    return {"items": items}
+
+
+def _ask(question, force=False, run=None, now=None, conn_fn=None, fail_fn=None):
+    """POST /ask: {"ok", "q", "answer", "cost", "at", "period", "sessions",
+    "cached"}. Blocking (a few seconds) unless cached for today."""
+    from datetime import date as _date
+    q = re.sub(r"\s+", " ", str(question or "")).strip()[:_ASK_MAX_Q]
+    if len(q) < 3:
+        return {"ok": False, "error": "Type a question first."}
+    now = now or time.time()
+    today = _date.fromtimestamp(now)
+    key = _ask_cache_key(q, today)
+    hit = _ask_load().get(key)
+    if hit and not force:
+        return {"ok": True, **hit, "cached": True}
+    if conn_fn is None and not os.path.exists(TRANSCRIPT_INDEX_DB):
+        return {"ok": False, "error": "The history index isn't built yet -- try again in a minute."}
+    with _ask_lock:
+        if _ask_busy[0]:
+            return {"ok": False, "busy": True, "error": "Still answering the previous question."}
+        _ask_busy[0] = True
+    try:
+        conn = (conn_fn or _transcript_index_connect)()
+        try:
+            facts, sessions, period = _ask_facts(conn, q, today, fail_fn=fail_fn if fail_fn is not None else _failure_map,
+                                                 client_cfg=_load_clients())
+        finally:
+            conn.close()
+        text, cost = (run or _run_haiku)(_ASK_INSTRUCTION, f"QUESTION: {q}\n\nFACTS:\n{facts}\n")
+        text = text.strip()[:4000]
+        entry = {"key": key, "q": q, "answer": text, "cost": round(cost, 4), "at": now,
+                 "period": period, "sessions": {k: v for k, v in sessions.items() if f"#{k}" in text}}
+        _ask_store(key, entry)
+        return {"ok": True, **entry, "cached": False}
+    except Exception as e:
+        _log_bg_error("ask", e)
+        return {"ok": False, "error": str(e)[:200] or "failed"}
+    finally:
+        with _ask_lock:
+            _ask_busy[0] = False
+
+
 # ── Session changes: uncommitted edits of the files a session touched ─────
 # Only files the session itself edited (from its transcript, see
 # _activity_track's "edited") are ever looked at, so the endpoint can't be
@@ -5386,6 +6118,20 @@ def _session_edited(sid):
         return list(((cur.get("stats") or {}).get("activity") or {}).get("edited") or [])
 
 
+def _sessions_activity(since):
+    """{session_id: {"minutes": [[epoch_min, lines], ...] since `since`, oldest
+    first, "edited": [paths]}} for every transcript the scanner follows --
+    what the Timeline / Heat / Graph views draw when no agent ran."""
+    out = {}
+    with _transcript_cursors_lock:
+        for sid, cur in _transcript_cursors.items():
+            act = (cur.get("stats") or {}).get("activity") or {}
+            mins = sorted([m, n] for m, n in (act.get("minutes") or {}).items() if m >= since)
+            if mins:
+                out[sid] = {"minutes": mins, "edited": list(act.get("edited") or [])}
+    return out
+
+
 def _session_changes(files):
     """Uncommitted changes in `files` (absolute paths) -> {"repos": [{root,
     name, branch, files: [{path, rel, kind, ins, dels}]}], "clean", "outside"}."""
@@ -5447,6 +6193,209 @@ def _session_file_diff(path):
     return out[:1_000_000]
 
 
+# ── Change review: mark files seen, discard one (with undo), stage the seen
+# ones. Only files the session itself edited (the caller resolves the path
+# against _session_edited first), only from this PC. A discard first copies
+# the file into %LOCALAPPDATA%\AOC\change_backups\<id>\ (plus meta.json),
+# so it can always be put back: tracked files are restored from HEAD with
+# `git restore`, new files are moved into the backup -- never deleted.
+_CHANGE_BACKUP_DIR = os.path.join(AOC_DATA_DIR, "change_backups")
+_CHANGE_BACKUPS_KEEP = 50
+_CHANGE_REVIEW_FILE = os.path.join(AOC_DATA_DIR, "change_review.json")
+_CHANGE_LOCK = threading.Lock()
+
+
+def _change_own(edited, path):
+    """Pure: `path` as the session recorded it, if it is one of its edited
+    files (case/slash-insensitive); None otherwise -- so ../ tricks or any
+    other path on disk are refused."""
+    want = os.path.normcase(os.path.normpath(str(path or "")))
+    if not path or not want:
+        return None
+    return next((f for f in edited if os.path.normcase(os.path.normpath(f)) == want), None)
+
+
+def _file_sig(path):
+    """'size:mtime_ns' of a file, '' when missing -- what a 'seen' mark is tied to."""
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        return ""
+
+
+def _file_hash(path):
+    import hashlib
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _change_review_load(path=None):
+    d = _load_json_file(path or _CHANGE_REVIEW_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def _change_seen_set(sid, file, seen, path=None, now=None):
+    """Mark (or unmark) a file seen for a session. The mark holds only while
+    the file is unchanged since (its size+mtime)."""
+    path = path or _CHANGE_REVIEW_FILE
+    d = _change_review_load(path)
+    s = d.setdefault(sid, {"files": {}, "at": 0})
+    if seen:
+        s["files"][os.path.normcase(os.path.normpath(file))] = _file_sig(file)
+    else:
+        s["files"].pop(os.path.normcase(os.path.normpath(file)), None)
+    s["at"] = now or time.time()
+    if len(d) > 200:   # forget the oldest sessions
+        for k in sorted(d, key=lambda k: d[k].get("at") or 0)[:len(d) - 200]:
+            d.pop(k, None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, path)
+    return {"ok": True, "seen": bool(seen)}
+
+
+def _change_seen_marks(sid, files, path=None):
+    """{path: True} for each of `files` marked seen and unchanged since."""
+    marks = (_change_review_load(path).get(sid) or {}).get("files") or {}
+    out = {}
+    for f in files:
+        sig = marks.get(os.path.normcase(os.path.normpath(f)))
+        if sig is not None and sig == _file_sig(f):
+            out[f] = True
+    return out
+
+
+def _change_status(path):
+    """(root, rel, porcelain code) of a file -- code '' when unchanged."""
+    root = _git_root_for(path, {})
+    if not root:
+        return None, None, ""
+    rel = os.path.relpath(os.path.realpath(path), root).replace("\\", "/")
+    st = _parse_porcelain_z(_git_out(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", rel], root) or "")
+    code = next((v for k, v in st.items() if os.path.normcase(k) == os.path.normcase(rel)), "")
+    return root, rel, code
+
+
+def _change_backups(sid=None, bdir=None):
+    """Discards (newest first), optionally of one session, not yet undone."""
+    bdir = bdir or _CHANGE_BACKUP_DIR
+    out = []
+    try:
+        names = os.listdir(bdir)
+    except OSError:
+        return out
+    for n in names:
+        meta = _load_json_file(os.path.join(bdir, n, "meta.json"), None)
+        if isinstance(meta, dict) and not meta.get("undone") and (sid is None or meta.get("sid") == sid):
+            out.append(meta)
+    out.sort(key=lambda m: -(m.get("at") or 0))
+    return out
+
+
+def _change_prune(bdir, keep=None):
+    import shutil
+    keep = keep or _CHANGE_BACKUPS_KEEP
+    try:
+        names = os.listdir(bdir)
+    except OSError:
+        return
+    metas = []
+    for n in names:
+        meta = _load_json_file(os.path.join(bdir, n, "meta.json"), None)
+        metas.append(((meta or {}).get("at") or 0, n))
+    for _, n in sorted(metas, reverse=True)[keep:]:
+        shutil.rmtree(os.path.join(bdir, n), ignore_errors=True)
+
+
+def _change_discard(path, sid, bdir=None, now=None, expect_sig=None):
+    """Throw away the uncommitted change of one file (a backup first).
+    `expect_sig` = the file's _file_sig when the panel was shown: if it
+    changed since, refuse (conflict) -- you'd discard work you never saw."""
+    import shutil, uuid
+    bdir = bdir or _CHANGE_BACKUP_DIR
+    if expect_sig is not None and _file_sig(path) != expect_sig:
+        return {"ok": False, "error": "the file changed since you opened the panel -- look at it again", "conflict": True}
+    root, rel, code = _change_status(path)
+    if not root:
+        return {"ok": False, "error": "not in a git repo"}
+    if not code:
+        return {"ok": False, "error": "no uncommitted change in this file"}
+    kind = _change_kind(code)
+    if kind == "renamed":
+        return {"ok": False, "error": "renamed files: undo the rename in git yourself"}
+    existed = os.path.isfile(path)
+    if os.path.exists(path) and not existed:
+        return {"ok": False, "error": "not a file"}
+    bid = time.strftime("%Y%m%d-%H%M%S", time.localtime(now or time.time())) + "-" + uuid.uuid4().hex[:6]
+    d = os.path.join(bdir, bid)
+    os.makedirs(d, exist_ok=True)
+    if existed:
+        shutil.copy2(path, os.path.join(d, "file"))
+    meta = {"id": bid, "sid": sid, "path": path, "root": root, "rel": rel, "kind": kind, "code": code,
+            "existed": existed, "staged": code[0] not in " ?", "at": now or time.time(), "undone": False}
+    if kind in ("untracked", "added"):
+        if kind == "added" and _git_out(["rm", "--cached", "-q", "--", rel], root) is None:
+            shutil.rmtree(d, ignore_errors=True)
+            return {"ok": False, "error": "git rm --cached failed"}
+        os.remove(path)   # the copy is in the backup
+    elif _git_out(["restore", "--source=HEAD", "--staged", "--worktree", "--", rel], root) is None:
+        shutil.rmtree(d, ignore_errors=True)
+        return {"ok": False, "error": "git restore failed"}
+    meta["after"] = _file_hash(path)   # what undo expects to find
+    with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False)
+    _change_prune(bdir)
+    return {"ok": True, "backup": meta}
+
+
+def _change_undo(bid, bdir=None, force=False):
+    """Put a discarded file back as it was. Refuses when the file changed
+    again since the discard (unless force) -- that would lose newer work."""
+    import shutil
+    bdir = bdir or _CHANGE_BACKUP_DIR
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", str(bid or "")):
+        return {"ok": False, "error": "bad id"}
+    d = os.path.join(bdir, bid)
+    meta = _load_json_file(os.path.join(d, "meta.json"), None)
+    if not isinstance(meta, dict):
+        return {"ok": False, "error": "backup not found"}
+    if meta.get("undone"):
+        return {"ok": False, "error": "already undone"}
+    path = meta["path"]
+    if not force and _file_hash(path) != meta.get("after", ""):
+        return {"ok": False, "error": "the file changed since it was discarded", "conflict": True}
+    if meta.get("existed"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copy2(os.path.join(d, "file"), path)
+    elif os.path.isfile(path):
+        os.remove(path)   # it was deleted in the working tree; the discard brought it back
+    if meta.get("kind") == "added":
+        _git_out(["add", "--", meta["rel"]], meta["root"])
+    meta["undone"] = True
+    with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False)
+    return {"ok": True, "path": path}
+
+
+def _change_stage(paths):
+    """git add each file (all already checked to be the session's own)."""
+    staged, failed = [], []
+    for p in paths:
+        root = _git_root_for(p, {})
+        rel = os.path.relpath(os.path.realpath(p), root).replace("\\", "/") if root else None
+        if root and _git_out(["add", "-A", "--", rel], root) is not None:
+            staged.append(p)
+        else:
+            failed.append(p)
+    return {"ok": not failed, "staged": staged, "failed": failed}
+
+
 # ── Launch: start a new Claude Code session from the dashboard ────────────
 # claude.exe is started directly in a new console window (no shell, so a
 # prompt with quotes, & or ; reaches Claude exactly as typed), in a folder
@@ -5472,12 +6421,20 @@ def _launch_validate(data, isdir=os.path.isdir):
     model = str(data.get("model") or "").strip().lower()
     if model not in _LAUNCH_MODELS:
         return None, "unknown model"
-    return {"cwd": folder, "prompt": prompt, "model": model}, None
+    resume = str(data.get("resume") or "").strip()
+    if resume and not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", resume):
+        return None, "bad session id"
+    out = {"cwd": folder, "prompt": prompt, "model": model}
+    if resume:
+        out["resume"] = resume
+    return out, None
 
 
 def _launch_argv(exe, args):
     """Pure: the claude command line (a list -- never through a shell)."""
     argv = [exe]
+    if args.get("resume"):
+        argv += ["--resume", args["resume"]]
     if args.get("model"):
         argv += ["--model", args["model"]]
     if args.get("prompt"):
@@ -5550,9 +6507,901 @@ def _launch_session(data, now=None, popen=None):
     if not exe:
         return {"ok": False, "error": "Claude Code (claude) not found on this PC"}
     _launch_last[0] = now
+    if args.get("resume") and args.get("prompt"):
+        args = {**args, "prompt": ""}   # --resume reopens the conversation; nothing to type
     p = (popen or subprocess.Popen)(_launch_argv(exe, args), cwd=args["cwd"],
                                     creationflags=0x00000010 if os.name == "nt" else 0)  # CREATE_NEW_CONSOLE
     return {"ok": True, "pid": p.pid, "cwd": args["cwd"], "trusted": _folder_trusted(args["cwd"])}
+
+
+# ── Parallel sessions in git worktrees ────────────────────────────────────
+# "+ New session" can start 1-4 sessions side by side, each in its own git
+# worktree on its own branch (aoc/<when>-<n>) off the repo's current HEAD,
+# so they never edit the same files. %LOCALAPPDATA%\AOC\worktrees.json lists
+# the worktrees AOC made; only those can be merged (into the branch they
+# started from, after a dry-run conflict check) or discarded (worktree and
+# branch removed). They live in <repo>\.claude\worktrees\aoc-* like Claude
+# Code's own, so a repo folder you already trusted stays trusted.
+WORKTREES_FILE = os.path.join(AOC_DATA_DIR, "worktrees.json")
+_WT_MAX_PARALLEL = 4
+_WT_MAX = 40
+_WT_STATUS_CACHE_S = 10
+_wt_lock = threading.Lock()
+_wt_status_cache = {}
+
+
+def _wt_git(args, cwd, timeout=30):
+    """(returncode, stdout, stderr) of a git call, decoded as UTF-8;
+    (-1, "", error) when git can't run at all."""
+    try:
+        r = subprocess.run(["git", "-c", "core.quotepath=off"] + list(args), cwd=cwd, capture_output=True,
+                           timeout=timeout, creationflags=_NO_WINDOW)
+    except Exception as e:
+        return -1, "", str(e)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def _wt_err(text, fallback):
+    """Pure: the last meaningful line of git's stderr, for an error message."""
+    lines = [l.strip() for l in str(text or "").splitlines() if l.strip() and not l.strip().startswith("hint:")]
+    return (lines[-1] if lines else fallback)[:240]
+
+
+def _wt_load(path=None):
+    data = _load_json_file(path or WORKTREES_FILE, [])
+    return [w for w in data if isinstance(w, dict) and w.get("id") and w.get("path")] if isinstance(data, list) else []
+
+
+def _wt_save(items, path=None):
+    path = path or WORKTREES_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _wt_validate(data, isdir=os.path.isdir):
+    """Pure-ish: POST /worktrees/launch body -> (args + count, None) or (None, error)."""
+    args, err = _launch_validate(data, isdir=isdir)
+    if err:
+        return None, err
+    if args.get("resume"):
+        return None, "a worktree session starts fresh (no resume)"
+    try:
+        n = int(data.get("count", 1))
+    except (TypeError, ValueError):
+        return None, "bad count"
+    if not 1 <= n <= _WT_MAX_PARALLEL:
+        return None, f"1 to {_WT_MAX_PARALLEL} sessions at once"
+    return dict(args, count=n), None
+
+
+def _wt_names(repo, slug, n):
+    """Pure: [(id, branch, worktree path)] for n parallel sessions."""
+    return [(f"{slug}-{i}", f"aoc/{slug}-{i}", os.path.join(repo, ".claude", "worktrees", f"aoc-{slug}-{i}"))
+            for i in range(1, n + 1)]
+
+
+def _wt_repo(cwd, git=None):
+    """(repo facts, None) or (None, error): top folder, current branch, HEAD sha."""
+    git = git or _wt_git
+    rc, top, er = git(["rev-parse", "--show-toplevel"], cwd)
+    if rc != 0:
+        return None, "that folder is not inside a git repo"
+    repo = os.path.normpath(os.path.realpath(top.strip()))
+    rc, branch, _ = git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
+    if rc != 0 or not branch.strip():
+        return None, "the repo has no branch checked out (detached HEAD) -- check one out first"
+    rc, sha, _ = git(["rev-parse", "--verify", "-q", "HEAD"], repo)
+    if rc != 0 or not sha.strip():
+        return None, "the repo has no commits yet"
+    return {"repo": repo, "base": branch.strip(), "base_sha": sha.strip()}, None
+
+
+def _wt_remove(repo, path, branch, git=None, force_branch=True):
+    """Remove a worktree and its branch. Returns an error text or ''."""
+    git = git or _wt_git
+    err = ""
+    if os.path.isdir(path):
+        rc, _, er = git(["worktree", "remove", "--force", path], repo, timeout=60)
+        if rc != 0:
+            err = _wt_err(er, "could not remove the worktree folder (is a program still open in it?)")
+    git(["worktree", "prune"], repo)
+    if not err and branch:
+        rc, _, er = git(["branch", "-D" if force_branch else "-d", branch], repo)
+        if rc != 0 and "not found" not in er:
+            err = _wt_err(er, "could not delete the branch")
+    return err
+
+
+def _wt_create(facts, slug, n, git=None):
+    """Create n worktrees off facts['base_sha']; all or nothing.
+    -> ([{id, branch, path}], None) or (None, error)."""
+    git = git or _wt_git
+    made = []
+    for wid, branch, path in _wt_names(facts["repo"], slug, n):
+        rc, _, er = git(["worktree", "add", "-b", branch, path, facts["base_sha"]], facts["repo"], timeout=120)
+        if rc != 0:
+            for m in made:
+                _wt_remove(facts["repo"], m["path"], m["branch"], git)
+            return None, "git worktree add failed: " + _wt_err(er, "unknown error")
+        made.append({"id": wid, "branch": branch, "path": path})
+    return made, None
+
+
+def _wt_launch(data, now=None, popen=None, git=None, path=None):
+    """POST /worktrees/launch {cwd, prompt, model, count} -> {"ok", "items"}."""
+    now = now or time.time()
+    args, err = _wt_validate(data)
+    if err:
+        return {"ok": False, "error": err}
+    if now - _launch_last[0] < _LAUNCH_MIN_GAP_S:
+        return {"ok": False, "error": "one launch every few seconds, please"}
+    exe = _find_claude_exe()
+    if not exe:
+        return {"ok": False, "error": "Claude Code (claude) not found on this PC"}
+    facts, err = _wt_repo(args["cwd"], git)
+    if err:
+        return {"ok": False, "error": err}
+    # started in a subfolder of the repo -> each session starts in the same subfolder of its worktree
+    rel = os.path.relpath(os.path.realpath(args["cwd"]), facts["repo"])
+    rel = "" if rel == "." or rel.startswith("..") else rel
+    with _wt_lock:
+        items = _wt_load(path)
+        if len(items) + args["count"] > _WT_MAX:
+            return {"ok": False, "error": f"AOC already keeps {len(items)} worktrees -- merge or discard some first"}
+        slug = time.strftime("%m%d-%H%M%S", time.localtime(now))
+        made, err = _wt_create(facts, slug, args["count"], git)
+        if err:
+            return {"ok": False, "error": err}
+        _launch_last[0] = now
+        for i, w in enumerate(made):
+            cwd = os.path.join(w["path"], rel) if rel and os.path.isdir(os.path.join(w["path"], rel)) else w["path"]
+            w.update(group=slug, n=i + 1, of=len(made), repo=facts["repo"], base=facts["base"],
+                     base_sha=facts["base_sha"], cwd=cwd, prompt=args["prompt"][:500], model=args["model"],
+                     created=now, state="open")
+            try:
+                p = (popen or subprocess.Popen)(_launch_argv(exe, {"prompt": args["prompt"], "model": args["model"]}),
+                                                cwd=cwd, creationflags=0x00000010 if os.name == "nt" else 0)
+                w["pid"] = p.pid
+            except OSError as e:
+                w["pid"] = None
+                w["error"] = f"could not start claude: {e}"[:200]
+        _wt_save(items + made, path)
+    return {"ok": True, "items": made, "trusted": _folder_trusted(facts["repo"])}
+
+
+def _wt_shortstat(text):
+    """Pure: `git diff --shortstat` -> {files, add, del}."""
+    out = {"files": 0, "add": 0, "del": 0}
+    for num, word in re.findall(r"(\d+) (file|insertion|deletion)", str(text or "")):
+        out[{"file": "files", "insertion": "add", "deletion": "del"}[word]] = int(num)
+    return out
+
+
+def _wt_status(w, git=None, now=None, fresh=False):
+    """Git facts for one worktree (cached 10 s): exists, dirty (uncommitted
+    files), ahead/behind its base branch, committed diff stat, last subject."""
+    git = git or _wt_git
+    now = now or time.time()
+    hit = _wt_status_cache.get(w["id"])
+    if hit and not fresh and now - hit[0] < _WT_STATUS_CACHE_S:
+        return hit[1]
+    out = {"exists": os.path.isdir(w["path"])}
+    if out["exists"]:
+        rc, st, _ = git(["status", "--porcelain=v1", "-z"], w["path"])
+        out["dirty"] = len(_parse_porcelain_z(st)) if rc == 0 else None
+        rng = f"refs/heads/{w['base']}...refs/heads/{w['branch']}"
+        rc, lr, _ = git(["rev-list", "--left-right", "--count", rng], w["repo"])
+        parts = lr.split() if rc == 0 else []
+        out["behind"], out["ahead"] = (int(parts[0]), int(parts[1])) if len(parts) == 2 else (None, None)
+        rc, ss, _ = git(["diff", "--shortstat", rng], w["repo"])
+        out.update(_wt_shortstat(ss if rc == 0 else ""))
+        if out["ahead"]:
+            rc, subj, _ = git(["log", "-1", "--format=%s", f"refs/heads/{w['branch']}"], w["repo"])
+            out["last_subject"] = subj.strip()[:200] if rc == 0 else ""
+    _wt_status_cache[w["id"]] = (now, out)
+    return out
+
+
+def _wt_sessions_in(w, sessions):
+    """Pure: the dashboard sessions whose folder is this worktree (or inside it)."""
+    root = os.path.normcase(os.path.normpath(w.get("path") or ""))
+    out = []
+    for s in sessions or []:
+        cwd = os.path.normcase(os.path.normpath(s.get("cwd") or "")) if s.get("cwd") else ""
+        if root and cwd and (cwd == root or cwd.startswith(root + os.sep)):
+            out.append({"id": s.get("id"), "name": s.get("display_name") or s.get("project") or "",
+                        "active": s.get("session_active") is not False,
+                        "waiting": bool(s.get("waiting_on_you")), "cost": s.get("estimated_cost") or 0})
+    return out
+
+
+def _wt_list(sessions=(), git=None, path=None, now=None):
+    """GET /worktrees -> {"items": [...]} (newest group first)."""
+    keys = ("id", "group", "n", "of", "repo", "base", "branch", "path", "cwd", "prompt", "model",
+            "created", "pid", "state", "error")
+    out = []
+    for w in _wt_load(path):
+        v = {k: w.get(k) for k in keys}
+        v["repo_name"] = os.path.basename((w.get("repo") or "").rstrip("\\/"))
+        v.update(_wt_status(w, git, now))
+        v["sessions"] = _wt_sessions_in(w, sessions)
+        out.append(v)
+    out.sort(key=lambda v: (-(v.get("created") or 0), v.get("n") or 0))
+    return {"items": out, "max_parallel": _WT_MAX_PARALLEL}
+
+
+def _wt_find(items, wid):
+    return next((w for w in items if w.get("id") == wid), None)
+
+
+def _wt_conflicts(out):
+    """Pure: `git merge-tree --write-tree --name-only --no-messages` stdout
+    on a conflict -> the conflicting paths (first line is the tree id)."""
+    lines = str(out or "").split("\n")[1:]
+    files = []
+    for l in lines:
+        if not l.strip():
+            break
+        if l.strip() not in files:
+            files.append(l.strip())
+    return files
+
+
+def _wt_merge(wid, sessions=(), git=None, path=None, now=None):
+    """POST /worktrees/merge {id}: merge the worktree's branch into the branch
+    it started from (no-ff), after checking it would merge cleanly; then
+    remove the worktree and its (now merged) branch."""
+    git = git or _wt_git
+    now = now or time.time()
+    with _wt_lock:
+        items = _wt_load(path)
+        w = _wt_find(items, wid)
+        if not w:
+            return {"ok": False, "error": "unknown worktree"}
+        if any(s["active"] for s in _wt_sessions_in(w, sessions)):
+            return {"ok": False, "error": "a session is still open in this worktree -- close it first"}
+        st = _wt_status(w, git, now, fresh=True)
+        if not st["exists"]:
+            return {"ok": False, "error": "the worktree folder is gone -- discard it instead"}
+        if st.get("dirty"):
+            return {"ok": False, "error": f"{st['dirty']} uncommitted file(s) in the worktree -- commit or discard them first"}
+        if not st.get("ahead"):
+            return {"ok": False, "error": "nothing to merge -- the branch has no new commits"}
+        repo = w["repo"]
+        rc, cur, _ = git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
+        if rc != 0 or cur.strip() != w["base"]:
+            return {"ok": False, "error": f"the repo is on '{cur.strip() or 'detached HEAD'}', not '{w['base']}' -- check out {w['base']} first"}
+        rc, dirty, _ = git(["status", "--porcelain=v1", "-z", "--untracked-files=no"], repo)
+        if rc != 0 or _parse_porcelain_z(dirty):
+            return {"ok": False, "error": "the repo has uncommitted changes -- commit or stash them first"}
+        rc, out, er = git(["merge-tree", "--write-tree", "--name-only", "--no-messages", w["base"], w["branch"]], repo, timeout=60)
+        if rc == 1:
+            files = _wt_conflicts(out)
+            return {"ok": False, "conflicts": files,
+                    "error": "would conflict in " + (", ".join(files[:5]) + (f" and {len(files) - 5} more" if len(files) > 5 else "") if files else "some files")}
+        if rc != 0:
+            return {"ok": False, "error": "conflict check failed: " + _wt_err(er, "git merge-tree needs git 2.38 or newer")}
+        rc, _, er = git(["merge", "--no-ff", "--no-edit", "-m",
+                         f"Merge {w['branch']} (AOC parallel session {w.get('n', 1)}/{w.get('of', 1)})", w["branch"]],
+                        repo, timeout=120)
+        if rc != 0:
+            git(["merge", "--abort"], repo)
+            return {"ok": False, "error": "merge failed: " + _wt_err(er, "unknown error")}
+        rc, sha, _ = git(["rev-parse", "HEAD"], repo)
+        cleanup = _wt_remove(repo, w["path"], w["branch"], git, force_branch=False)
+        _wt_status_cache.pop(wid, None)
+        if cleanup:
+            w.update(state="merged", merged_at=now)
+        else:
+            items = [x for x in items if x is not w]
+        _wt_save(items, path)
+    return {"ok": True, "sha": sha.strip()[:40], "cleanup_error": cleanup}
+
+
+def _wt_discard(wid, sessions=(), force=False, git=None, path=None):
+    """POST /worktrees/discard {id, force?}: delete the worktree and its
+    branch, with whatever was done in it."""
+    with _wt_lock:
+        items = _wt_load(path)
+        w = _wt_find(items, wid)
+        if not w:
+            return {"ok": False, "error": "unknown worktree"}
+        if not force and any(s["active"] for s in _wt_sessions_in(w, sessions)):
+            return {"ok": False, "error": "a session is still open in this worktree -- close it first"}
+        err = _wt_remove(w["repo"], w["path"], w["branch"], git)
+        if err:
+            return {"ok": False, "error": err}
+        _wt_status_cache.pop(wid, None)
+        _wt_save([x for x in items if x is not w], path)
+    return {"ok": True}
+
+
+def _wt_diff(wid, git=None, path=None):
+    """GET /worktrees/diff?id= -> committed changes vs the base branch, plus
+    anything not committed yet in the worktree."""
+    git = git or _wt_git
+    w = _wt_find(_wt_load(path), wid)
+    if not w:
+        return {"ok": False, "error": "unknown worktree"}
+    rc, committed, _ = git(["diff", f"refs/heads/{w['base']}...refs/heads/{w['branch']}"], w["repo"], timeout=60)
+    text = committed if rc == 0 else ""
+    if os.path.isdir(w["path"]):
+        rc, wip, _ = git(["diff", "HEAD"], w["path"], timeout=60)
+        if rc == 0 and wip.strip():
+            text += ("\n" if text else "") + "# --- not committed yet ---\n" + wip
+    return {"ok": True, "diff": text[:1_000_000], "branch": w["branch"], "base": w["base"]}
+
+
+# ── A/B model compare: the same first message, run headless (`claude -p`)
+# once per model, each in its own throwaway git worktree off the repo's
+# HEAD, so neither run touches your working copy. Runs may read and edit
+# files in their copy only: shell tools are off, MCP servers are off and
+# hooks are off, so a run can't push, delete, install or message anyone;
+# each is capped by --max-budget-usd. Afterwards you keep one (its changes
+# are committed on a branch and merged into your repo -- only when your
+# working copy has no uncommitted changes) or discard both.
+# %LOCALAPPDATA%\AOC\ab_runs.json holds the comparisons, ab_worktrees\ the
+# copies. The _ab_git/_ab_wt_* helpers are deliberately private to this
+# feature.
+AB_RUNS_FILE = os.path.join(AOC_DATA_DIR, "ab_runs.json")
+AB_WT_DIR = os.path.join(AOC_DATA_DIR, "ab_worktrees")
+_AB_MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+_AB_LABELS = ("A", "B")
+_AB_PROMPT_MAX = 8000
+_AB_BUDGET_DEFAULT = 2.0
+_AB_BUDGET_MAX = 20.0
+_AB_TIMEOUT_S = 20 * 60
+_AB_KEEP = 20
+_AB_DIFF_MAX = 200_000
+_AB_FINAL_MAX = 6000
+_AB_STARTUP_TOKENS = 30_000   # system prompt + built-in tools of a bare -p run
+_AB_NO_TOOLS = ("Bash", "PowerShell", "KillShell", "BashOutput")
+_ab_lock = threading.Lock()
+_ab_procs = {}                # (comparison id, label) -> Popen while it runs
+_AB_LOADED_AT = time.time()
+
+
+def _ab_validate(data, isdir=os.path.isdir):
+    """Pure-ish: body -> ({cwd, prompt, models, budget}, None) or (None, error)."""
+    if not isinstance(data, dict):
+        return None, "bad request"
+    base, err = _launch_validate({"cwd": data.get("cwd"), "prompt": data.get("prompt")}, isdir=isdir)
+    if err:
+        return None, err
+    if not base["prompt"]:
+        return None, "write the task both models get"
+    if len(base["prompt"]) > _AB_PROMPT_MAX:
+        return None, f"prompt too long for a comparison ({_AB_PROMPT_MAX:,} characters max)"
+    models = data.get("models") or ["opus", "sonnet"]
+    if (not isinstance(models, list) or len(models) != 2 or len(set(models)) != 2
+            or any(m not in _AB_MODELS for m in models)):
+        return None, "pick two different models"
+    try:
+        budget = float(data.get("budget") if data.get("budget") not in (None, "") else _AB_BUDGET_DEFAULT)
+    except (TypeError, ValueError):
+        return None, "budget must be a number"
+    if not 0.1 <= budget <= _AB_BUDGET_MAX:
+        return None, f"budget per run must be between $0.10 and ${_AB_BUDGET_MAX:.0f}"
+    return {"cwd": base["cwd"], "prompt": base["prompt"], "models": list(models), "budget": round(budget, 2)}, None
+
+
+def _ab_estimate(prompt, model_key):
+    """Pure: rough (low, high) $ for one headless run -- a short task (3 API
+    calls) and a long one (25). Context = startup + prompt, growing per call."""
+    pi, po, pw, pr = _model_pricing(_AB_MODELS.get(model_key, ""))
+    ctx = _AB_STARTUP_TOKENS + len(prompt or "") // 4
+
+    def est(calls, out_per, grow):
+        total = ctx * pw + calls * out_per * po
+        for i in range(1, calls):
+            total += (ctx + i * grow) * pr + grow * pw
+        return total / 1_000_000
+    return round(est(3, 400, 1500), 2), round(est(25, 600, 2500), 2)
+
+
+def _ab_quote(data):
+    """POST /ab/estimate: per run (low, high) $, the high end capped by the budget."""
+    data = data if isinstance(data, dict) else {}
+    models = data.get("models") if isinstance(data.get("models"), list) else ["opus", "sonnet"]
+    try:
+        budget = min(max(float(data.get("budget") or _AB_BUDGET_DEFAULT), 0.1), _AB_BUDGET_MAX)
+    except (TypeError, ValueError):
+        budget = _AB_BUDGET_DEFAULT
+    runs = []
+    for label, m in zip(_AB_LABELS, models[:2]):
+        if m not in _AB_MODELS:
+            continue
+        lo, hi = _ab_estimate(str(data.get("prompt") or ""), m)
+        runs.append({"label": label, "model": m, "low": min(lo, budget), "high": min(hi, budget),
+                     "capped": hi > budget})
+    return {"runs": runs, "budget": round(budget, 2), "max_total": round(budget * len(runs), 2)}
+
+
+def _ab_argv(exe, model_key, budget):
+    """Pure: the headless claude command line (prompt goes in on stdin)."""
+    return [exe, "-p", "--model", model_key, "--output-format", "stream-json", "--verbose",
+            "--no-session-persistence", "--permission-mode", "acceptEdits",
+            "--disallowedTools", ",".join(_AB_NO_TOOLS), "--strict-mcp-config",
+            "--max-budget-usd", f"{budget:.2f}", "--settings", '{"disableAllHooks": true}']
+
+
+def _ab_parse_stream(lines):
+    """Pure: stream-json lines of `claude -p --verbose` -> run facts. Cost =
+    the result line's total_cost_usd, else summed from usage (each API call
+    once: a message repeats per content block)."""
+    r = {"cost": None, "turns": 0, "tool_calls": 0, "errors": 0, "denials": 0, "final": "",
+         "is_error": False, "stop": "", "model": "", "api_ms": None}
+    seen_msg, seen_tool, usage_cost = set(), set(), 0.0
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        t = d.get("type")
+        if t == "system" and d.get("subtype") == "init":
+            r["model"] = d.get("model") or r["model"]
+        elif t == "assistant":
+            m = d.get("message") or {}
+            for c in m.get("content") or ():
+                if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id") not in seen_tool:
+                    seen_tool.add(c.get("id"))
+                    r["tool_calls"] += 1
+            mid = m.get("id")
+            u = m.get("usage") or {}
+            if mid and mid not in seen_msg and u:
+                seen_msg.add(mid)
+                cc = u.get("cache_creation") or {}
+                usage_cost += _calc_cost(u.get("input_tokens") or 0, u.get("output_tokens") or 0,
+                                         u.get("cache_creation_input_tokens") or 0, u.get("cache_read_input_tokens") or 0,
+                                         m.get("model") or r["model"], cc.get("ephemeral_1h_input_tokens") or 0)
+        elif t == "user":
+            for c in (d.get("message") or {}).get("content") or ():
+                if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
+                    text = c.get("content")
+                    text = " ".join(x.get("text", "") for x in text if isinstance(x, dict)) if isinstance(text, list) else str(text or "")
+                    if re.search(r"permission|not allowed|denied|disallowed", text, re.I):
+                        r["denials"] += 1
+                    else:
+                        r["errors"] += 1
+        elif t == "result":
+            if d.get("total_cost_usd") is not None:
+                r["cost"] = float(d["total_cost_usd"])
+            r["turns"] = int(d.get("num_turns") or 0)
+            r["final"] = str(d.get("result") or "")[:_AB_FINAL_MAX]
+            r["is_error"] = bool(d.get("is_error"))
+            r["stop"] = str(d.get("subtype") or "")
+            r["api_ms"] = d.get("duration_api_ms")
+    if r["cost"] is None:
+        r["cost"] = usage_cost
+    r["cost"] = round(r["cost"], 4)
+    return r
+
+
+# Git-worktree plumbing for A/B: git calls and worktree removal go through the
+# shared _wt_* API (parallel sessions); A/B keeps its own folders/branch names
+# and, unlike parallel sessions, also works on a detached HEAD.
+def _ab_git(args, cwd, timeout=60):
+    """-> (returncode, stdout, stderr), UTF-8 -- the shared _wt_git with A/B's longer timeout."""
+    return _wt_git(list(args), cwd, timeout=timeout)
+
+
+def _ab_repo(cwd):
+    """(repo root, HEAD sha) of the folder, or (None, error)."""
+    rc, root, _ = _ab_git(["rev-parse", "--show-toplevel"], cwd)
+    if rc != 0 or not root.strip():
+        return None, "that folder is not inside a git repository"
+    rc, head, _ = _ab_git(["rev-parse", "--verify", "HEAD"], cwd)
+    if rc != 0:
+        return None, "the repository has no commit yet"
+    return (os.path.realpath(root.strip()), head.strip()), None
+
+
+def _ab_wt_add(repo, path, branch, head):
+    rc, _o, err = _ab_git(["worktree", "add", "-b", branch, path, head], repo)
+    return None if rc == 0 else (err.strip() or "git worktree add failed")[:300]
+
+
+def _ab_wt_remove(repo, path, branch=None):
+    """Removes the worktree (and its branch when given) via the shared
+    _wt_remove; a folder git refuses to remove is deleted anyway. Never raises."""
+    import shutil
+    if _wt_remove(repo, path or "", branch, git=_ab_git) and path and os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+        _ab_git(["worktree", "prune"], repo)
+        if branch:
+            _ab_git(["branch", "-D", branch], repo)
+
+
+def _ab_wt_snapshot(wt):
+    """Stage everything in the worktree -> (diffstat, diff text, truncated)."""
+    _ab_git(["add", "-A"], wt)
+    _rc, num, _e = _ab_git(["diff", "--cached", "--numstat", "HEAD"], wt)
+    files = [{"path": p, "ins": i, "dels": d} for p, (i, d) in _parse_numstat(num).items()]
+    _rc, diff, _e = _ab_git(["diff", "--cached", "HEAD"], wt)
+    stat = {"files": len(files), "ins": sum(f["ins"] or 0 for f in files),
+            "dels": sum(f["dels"] or 0 for f in files), "list": files[:200]}
+    return stat, diff[:_AB_DIFF_MAX], len(diff) > _AB_DIFF_MAX
+
+
+def _ab_load():
+    d = _load_json_file(AB_RUNS_FILE, [])
+    return d if isinstance(d, list) else []
+
+
+def _ab_save(items):
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    items = sorted(items, key=lambda x: x.get("created") or 0)[-_AB_KEEP:]
+    tmp = AB_RUNS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False)
+    os.replace(tmp, AB_RUNS_FILE)
+
+
+def _ab_update(cid, label=None, **fields):
+    """Merge fields into a comparison (or one of its runs); returns it."""
+    with _ab_lock:
+        items = _ab_load()
+        for c in items:
+            if c.get("id") != cid:
+                continue
+            target = c if label is None else next((r for r in c.get("runs") or () if r.get("label") == label), None)
+            if target is not None:
+                target.update(fields)
+            if label is None and fields.get("state") in ("kept", "discarded"):
+                for r in c.get("runs") or ():      # the copies are gone: so are their diffs
+                    r.pop("diff", None)
+            if label is not None and all(r.get("state") not in ("queued", "running") for r in c.get("runs") or ()) \
+                    and c.get("state") == "running":
+                c["state"] = "done"
+            _ab_save(items)
+            return c
+    return None
+
+
+def _ab_overall(c, loaded_at=None, live=None):
+    """Pure: a comparison as shown -- runs still 'running' that this AOC
+    process never started (it restarted mid-run) are reported as stopped."""
+    loaded_at = _AB_LOADED_AT if loaded_at is None else loaded_at
+    live = _ab_procs if live is None else live
+    c = json.loads(json.dumps(c))
+    if c.get("state") == "running" and (c.get("created") or 0) < loaded_at:
+        for r in c.get("runs") or ():
+            if r.get("state") in ("queued", "running") and (c.get("id"), r.get("label")) not in live:
+                r["state"], r["error"] = "error", "AOC restarted during the run"
+        if all(r.get("state") not in ("queued", "running") for r in c.get("runs") or ()):
+            c["state"] = "done"
+    return c
+
+
+def _ab_run_one(cid, label, argv, wt, prompt, popen=None, timeout=_AB_TIMEOUT_S, clock=time.time):
+    """Runs one model in its worktree (blocking; called on a thread)."""
+    start = clock()
+    _ab_update(cid, label, state="running", started=start)
+    lines, other = [], []
+    try:
+        # stderr into stdout: a full stderr pipe nobody reads would stall the run
+        p = (popen or subprocess.Popen)(argv, cwd=wt, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, creationflags=_NO_WINDOW)
+    except Exception as e:
+        _ab_update(cid, label, state="error", error=f"could not start Claude Code: {e}"[:300], ended=clock())
+        return
+    _ab_procs[(cid, label)] = p
+    _own_claude_pids.add(p.pid)
+    killer = threading.Timer(timeout, lambda: p.kill())
+    killer.daemon = True
+    killer.start()
+    try:
+        try:
+            p.stdin.write(prompt.encode("utf-8"))
+            p.stdin.close()
+        except OSError:
+            pass
+        last_push = clock()
+        for raw in p.stdout:
+            s = raw.decode("utf-8", "replace")
+            if s.lstrip().startswith("{"):
+                lines.append(s)
+            elif s.strip():
+                other = (other + [s.strip()])[-20:]
+            if clock() - last_push >= 2:
+                last_push = clock()
+                part = _ab_parse_stream(lines)
+                _ab_update(cid, label, live={k: part[k] for k in ("tool_calls", "errors", "denials", "cost")})
+        p.wait()
+    finally:
+        killer.cancel()
+        _ab_procs.pop((cid, label), None)
+        _own_claude_pids.discard(p.pid)
+    end = clock()
+    res = _ab_parse_stream(lines)
+    timed_out = end - start >= timeout - 1
+    stat, diff, trunc = _ab_wt_snapshot(wt) if os.path.isdir(wt) else ({"files": 0, "ins": 0, "dels": 0, "list": []}, "", False)
+    stopped = (cid, label) in _ab_stopped
+    state = "stopped" if stopped else "error" if (not lines or (res["is_error"] and res["stop"] != "error_max_budget_usd")) else "done"
+    error = ("stopped" if stopped else "timed out" if timed_out else
+             "" if state == "done" else (res["final"] or "\n".join(other) or "no output")[-300:])
+    _ab_update(cid, label, state=state, ended=end, wall_s=round(end - start, 1), live=None, error=error,
+               diffstat=stat, diff=diff, diff_truncated=trunc,
+               **{k: res[k] for k in ("cost", "turns", "tool_calls", "errors", "denials", "final", "stop", "model")})
+
+
+_ab_stopped = set()
+
+
+def _ab_start(data, now=None, exe=None, popen=None, spawn=None):
+    """POST /ab/start -> {"ok", "id"} or {"ok": False, "error"}."""
+    if not isinstance(data, dict) or data.get("confirm") is not True:
+        return {"ok": False, "error": "confirm the cost first"}
+    args, err = _ab_validate(data)
+    if err:
+        return {"ok": False, "error": err}
+    repo, err = _ab_repo(args["cwd"])
+    if err:
+        return {"ok": False, "error": err}
+    root, head = repo
+    exe = exe or _find_claude_exe()
+    if not exe:
+        return {"ok": False, "error": "Claude Code (claude) not found on this PC"}
+    now = now or time.time()
+    with _ab_lock:
+        if any(_ab_overall(c).get("state") == "running" for c in _ab_load()):
+            return {"ok": False, "error": "an A/B comparison is already running"}
+        cid = time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + os.urandom(2).hex()
+        runs = []
+        for label, m in zip(_AB_LABELS, args["models"]):
+            runs.append({"label": label, "model": m, "branch": f"aoc-ab/{cid}-{label.lower()}-{m}",
+                         "wt": os.path.join(AB_WT_DIR, f"{cid}-{label.lower()}"), "state": "queued"})
+        os.makedirs(AB_WT_DIR, exist_ok=True)
+        for r in runs:
+            e = _ab_wt_add(root, r["wt"], r["branch"], head)
+            if e:
+                for x in runs:
+                    _ab_wt_remove(root, x["wt"], x["branch"])
+                return {"ok": False, "error": "could not make a copy of the repo: " + e}
+        rel = os.path.relpath(os.path.realpath(args["cwd"]), root)
+        rec = {"id": cid, "created": now, "cwd": args["cwd"], "repo": root, "head": head, "prompt": args["prompt"],
+               "budget": args["budget"], "state": "running", "kept": None, "runs": runs}
+        items = _ab_load()
+        items.append(rec)
+        _ab_save(items)
+    spawn = spawn or (lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True, name="ab-run").start())
+    for r in runs:
+        wt_cwd = os.path.normpath(os.path.join(r["wt"], rel)) if rel != "." else r["wt"]
+        spawn(_ab_run_one, cid, r["label"], _ab_argv(exe, r["model"], args["budget"]), wt_cwd, args["prompt"], popen)
+    return {"ok": True, "id": cid}
+
+
+def _ab_get(cid):
+    c = next((c for c in _ab_load() if c.get("id") == cid), None)
+    return _ab_overall(c) if c else None
+
+
+def _ab_list():
+    """GET /ab: comparisons newest first, without diffs/answers."""
+    out = []
+    for c in sorted(_ab_load(), key=lambda c: -(c.get("created") or 0)):
+        c = _ab_overall(c)
+        c["runs"] = [{k: v for k, v in r.items() if k not in ("diff", "final")} for r in c.get("runs") or ()]
+        out.append(c)
+    return {"items": out}
+
+
+def _ab_stop(c):
+    for r in c.get("runs") or ():
+        p = _ab_procs.get((c["id"], r["label"]))
+        if p:
+            _ab_stopped.add((c["id"], r["label"]))
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def _ab_discard(cid):
+    """POST /ab/discard: stop what still runs, remove both copies + branches."""
+    c = _ab_get(cid)
+    if not c:
+        return {"ok": False, "error": "not found"}
+    if c.get("state") in ("kept", "discarded"):
+        return {"ok": True}
+    _ab_stop(c)
+    for _ in range(50):
+        if not any((cid, r["label"]) in _ab_procs for r in c["runs"]):
+            break
+        time.sleep(0.1)
+    for r in c["runs"]:
+        _ab_wt_remove(c["repo"], r.get("wt"), r.get("branch"))
+    _ab_update(cid, state="discarded", diff_dropped=True)
+    return {"ok": True}
+
+
+def _ab_keep(cid, label):
+    """POST /ab/keep: commit that run's changes on its branch and merge it
+    into the repo's current branch; the other copy is discarded. Refused
+    while your working copy has uncommitted changes. A conflicting merge is
+    aborted and the branch is left for you to merge by hand."""
+    c = _ab_get(cid)
+    if not c:
+        return {"ok": False, "error": "not found"}
+    if c.get("state") != "done":
+        return {"ok": False, "error": "still running" if c.get("state") == "running" else "already " + str(c.get("state"))}
+    run = next((r for r in c["runs"] if r.get("label") == label), None)
+    if not run or run.get("state") not in ("done", "stopped"):
+        return {"ok": False, "error": "that run has nothing to keep"}
+    if not (run.get("diffstat") or {}).get("files"):
+        return {"ok": False, "error": "that run changed no files -- discard instead"}
+    repo, wt = c["repo"], run["wt"]
+    rc, dirty, _e = _ab_git(["status", "--porcelain", "--untracked-files=no"], repo)
+    if rc != 0 or dirty.strip():
+        return {"ok": False, "error": "your working copy has uncommitted changes -- commit or stash them first"}
+    first = re.sub(r"\s+", " ", c.get("prompt") or "").strip()[:60]
+    _ab_git(["add", "-A"], wt)
+    rc, _o, err = _ab_git(["commit", "-q", "-m", f"A/B {run['model']}: {first}"], wt)
+    if rc != 0:
+        return {"ok": False, "error": "could not commit in the copy: " + (err.strip() or "git commit failed")[:200]}
+    rc, _o, err = _ab_git(["merge", "--no-ff", "--no-edit", "-m", f"Merge A/B run {label} ({run['model']})", run["branch"]], repo)
+    if rc != 0:
+        _ab_git(["merge", "--abort"], repo)
+        for r in c["runs"]:
+            _ab_wt_remove(repo, r.get("wt"), None if r is run else r.get("branch"))
+        _ab_update(cid, state="kept", kept=label, merge_error=True)
+        return {"ok": False, "error": f"merge conflict -- the changes stay on branch {run['branch']}; merge it yourself",
+                "branch": run["branch"]}
+    _rc, sha, _e = _ab_git(["rev-parse", "HEAD"], repo)
+    for r in c["runs"]:
+        _ab_wt_remove(repo, r.get("wt"), None if r is run else r.get("branch"))
+    _ab_git(["branch", "-d", run["branch"]], repo)
+    _ab_update(cid, state="kept", kept=label, merged=sha.strip())
+    return {"ok": True, "merged": sha.strip()}
+
+
+# ── Continue a project (Today -> "Pick up where you left off") ───────────
+# Most sessions start with the same kind of message: "continue with X"
+# ("pokračuj v AOC", typos included). Projects come from the auto-memory
+# indexes ([Name](project_x.md) entries); past sessions are matched to them
+# by their first message, and each card offers that same opening again in
+# the folder it last ran in -- or reopens the last conversation itself.
+# Sessions that match no project fall back to cards per folder.
+_RESUME_DAYS = 30
+_RESUME_CACHE_S = 60
+_RESUME_MAX_CARDS = 8
+_RESUME_VERB = re.compile(r"^(?:p\w{0,3}kra\w*|continue\w*|resume\w*|let'?s continue)\s+(?:(?:v|vo|s|so|na|with|on|in)\s+)?(.+)$")
+_resume_cache = {}
+
+
+def _resume_norm(s):
+    """Pure: lowercase, no diacritics, single spaces."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+
+def _resume_match(text, names):
+    """Pure: (project name, is_continue_prompt) for a session's first
+    message, or (None, False). A "continue with X" message is matched
+    typo-tolerantly against the start of X; any other message only when it
+    names a project as a whole word."""
+    import difflib
+    t = _resume_norm(text)[:300]
+    m = _RESUME_VERB.match(t)
+    if m:
+        rest = m.group(1).strip(" .!?:")
+        best, score = None, 0.0
+        for n in names:
+            nn = _resume_norm(n)
+            r = difflib.SequenceMatcher(None, rest[:len(nn)], nn).ratio() if nn else 0
+            if r > score:
+                best, score = n, r
+        if best and score >= 0.8:
+            return best, True
+    for n in sorted(names, key=lambda n: -len(n)):
+        nn = _resume_norm(n)
+        if len(nn) >= 3 and re.search(r"(?<![a-z0-9])" + re.escape(nn) + r"(?![a-z0-9])", t):
+            return n, False
+    return None, False
+
+
+def _resume_projects_from_index(text):
+    """Pure: [(name, file, hook)] from a MEMORY.md index -- project entries only."""
+    out = []
+    for m in re.finditer(r"^- \[([^\]]+)\]\(((?:[^)]*[\\/])?project_[^)\s]*\.md)\)\s*(?:—|-|:)?\s*(.*)$", text or "", re.M):
+        out.append((m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
+    return out
+
+
+def _resume_cards(projects, sessions, home, now, open_ids=()):
+    """Pure: project cards. projects = [(name, file, hook)], sessions =
+    [{id, cwd, title, cost, last, first}] newest first. Each card: name,
+    hook, cwd, prompt ("continue with <name>" in your usual verb, spelled
+    right; a folder card repeats that folder's last opening), last session,
+    30-day count/cost, resume_id, open."""
+    names = [p[0] for p in projects]
+    hooks = {p[0]: p[2] for p in projects}
+    by, verbs, rest = {}, [], []
+    for s in sessions:
+        name, cont = _resume_match(s.get("first") or "", names)
+        if cont:
+            verbs.append(s["first"].strip().split()[0])
+        if name:
+            by.setdefault(name, {"sessions": [], "prompt": None})["sessions"].append(s)
+        else:
+            rest.append(s)
+    word = max(set(verbs), key=verbs.count) if verbs else "Continue"   # your usual verb
+    prep = "v" if word.lower().startswith(("pokr", "pkr")) else "with"
+    homen = os.path.normcase(os.path.normpath(home))
+    open_ids = set(open_ids)
+
+    def card(name, hook, group, folder_card=False):
+        ss = group["sessions"]
+        last = ss[0]
+        cwd = last.get("cwd") or home
+        return {"name": name, "hook": hook, "cwd": cwd, "folder": folder_card,
+                "prompt": group.get("prompt") or f"{word} {prep} {name}",
+                "last": {"id": last["id"], "title": last.get("title") or "", "at": last.get("last") or 0},
+                "sessions": len(ss), "cost": round(sum(s.get("cost") or 0 for s in ss), 2),
+                "resume_id": last["id"],
+                "open": [s["id"] for s in ss if s["id"] in open_ids]}
+
+    cards = [card(n, hooks.get(n, ""), g) for n, g in by.items()]
+    folders = {}
+    for s in rest if len(cards) < 3 else ():   # no memory projects to speak of: cards per folder
+        cwd = s.get("cwd") or ""
+        k = os.path.normcase(os.path.normpath(cwd)) if cwd else ""
+        if not cwd or k == homen or re.search(r"[\\/](temp|tmp|scratchpad)([\\/]|$)", k):
+            continue
+        folders.setdefault(os.path.normcase(os.path.normpath(cwd)), {"sessions": [], "prompt": None})["sessions"].append(s)
+    for g in folders.values():
+        first = g["sessions"][0]
+        g["prompt"] = re.sub(r"\s+", " ", first.get("first") or "").strip()[:200] or None
+        cards.append(card(os.path.basename(first["cwd"].rstrip("\\/")) or first["cwd"], "", g, folder_card=True))
+    cards.sort(key=lambda c: -(c["last"]["at"] or 0))
+    return cards[:_RESUME_MAX_CARDS]
+
+
+def _resume_sessions(days, now):
+    """[{id, cwd, title, cost, last, first}] of the last `days`, newest first."""
+    if not os.path.exists(TRANSCRIPT_INDEX_DB):
+        return []
+    conn = _transcript_index_connect()
+    try:
+        meta = conn.execute("SELECT session_id, cwd, title, run_cost, last_call_epoch FROM sessions_meta "
+                            "WHERE last_call_epoch >= ? ORDER BY last_call_epoch DESC", (now - days * 86400,)).fetchall()
+        want = {r[0] for r in meta}
+        first = {}
+        for sid, ts, text in conn.execute("SELECT session_id, ts, substr(text, 1, 300) FROM msgs WHERE role = 'user'"):
+            if sid in want and (sid not in first or (ts or "") < first[sid][0]):
+                first[sid] = (ts or "", text or "")
+    finally:
+        conn.close()
+    return [{"id": r[0], "cwd": r[1] or "", "title": r[2] or "", "cost": r[3] or 0, "last": r[4] or 0,
+             "first": first.get(r[0], ("", ""))[1]} for r in meta if r[0] in first]
+
+
+def _resume_report(open_ids=(), now=None):
+    """GET /resume_projects (cached a minute; `open` is filled per call)."""
+    now = now or time.time()
+    hit = _resume_cache.get("v")
+    if not hit or now - hit[0] >= _RESUME_CACHE_S:
+        home = os.path.expanduser("~")
+        projects, seen = [], set()
+        for f in _mem_discover(home, []):
+            if f["kind"] != "index":
+                continue
+            try:
+                for p in _resume_projects_from_index(_mem_read(f["path"])):
+                    if p[0].lower() not in seen:
+                        seen.add(p[0].lower())
+                        projects.append(p)
+            except (OSError, ValueError):
+                continue
+        hit = (now, projects, _resume_sessions(_RESUME_DAYS, now), home)
+        _resume_cache["v"] = hit
+    return {"days": _RESUME_DAYS, "cards": _resume_cards(hit[1], hit[2], hit[3], now, open_ids)}
 
 
 # ── Task queue: start a session later -- at a set time and/or once the
@@ -5698,9 +7547,9 @@ def _queue_tick(now=None, launch=None, view=None):
     try:
         name = os.path.basename(task["cwd"]) or task["cwd"]
         if task["state"] == "launched":
-            _show_native_toast(f"▶ Queued task started · {name}", task["prompt"][:120])
+            _show_native_toast(f"▶ Queued task started · {name}", task["prompt"][:120], kind="queue")
         else:
-            _show_native_toast(f"⚠ Queued task failed · {name}", task["error"][:120])
+            _show_native_toast(f"⚠ Queued task failed · {name}", task["error"][:120], kind="queue")
     except Exception:
         pass
     return task
@@ -5950,12 +7799,10 @@ def _budget_tick(now=None):
         title = f"⛔ Budget cap · {names.get(sid, 'Session')[:40]}" if sid else "⛔ Daily budget cap reached"
         body = f"${x['spent']:.2f} of ${x['cap']:.2f} -- tool calls are blocked until you let it continue"
         try:
-            _show_native_toast(title, body)
+            _show_native_toast(title, body, kind="budget_cap")
         except Exception:
             pass
-        cfg = _webhook_settings
-        if cfg.get("url") and (cfg.get("events") or {}).get("budget_alert"):
-            _fire_webhook(cfg["url"], {"event": "budget_cap", "kind": x["kind"], "session_id": sid or None,
+        _notify_webhook("budget_cap", {"event": "budget_cap", "kind": x["kind"], "session_id": sid or None,
                                        "display_name": names.get(sid) if sid else None,
                                        "spent": x["spent"], "cap": x["cap"]})
 
@@ -5971,6 +7818,396 @@ def _budget_worker():
 
 
 threading.Thread(target=_budget_worker, daemon=True, name="budget-worker").start()
+
+
+# ── Dangerous-command guard: your OK before Claude runs a destructive command ─
+# A second HTTP PreToolUse hook (shell tools only, see setup.py) asks POST
+# /hook/danger before every Bash / PowerShell call. A harmless command is
+# answered at once ({} = carry on as usual). A dangerous one -- force push,
+# git reset --hard, rm -rf / Remove-Item -Recurse on a broad path, DROP /
+# TRUNCATE / DELETE without WHERE, wiping a disk or a dev database -- is held
+# as a "Needs your OK" prompt on the dashboard and your phone, whatever
+# permission mode the session runs in (auto / bypass included). Allow runs
+# it, Deny tells Claude why, "Answer in terminal" hands it to Claude Code's
+# own dialog; no answer within hold_min minutes = denied. If AOC is not
+# running the hook fails open, like the budget hook.
+DANGER_GUARD_FILE = os.path.join(AOC_DATA_DIR, "danger_guard.json")
+_DANGER_MODES = ("hold", "off")
+_DANGER_HOLD_MAX_MIN = 60          # setup.py's hook timeout (3700 s) must stay above this
+_DANGER_MAX_PATTERNS = 50
+_DANGER_RULES = (
+    ("force_push", "Force push", "git push --force / -f / +branch: rewrites history others may have"),
+    ("git_discard", "Discard uncommitted work", "git reset --hard, git clean -f, git checkout -- . / git restore ., git stash clear"),
+    ("remote_branch_delete", "Delete a remote branch", "git push --delete / git push origin :branch"),
+    ("rm_broad", "Recursive delete of a broad path", "rm -r, Remove-Item -Recurse, rd /s on /, ~, a drive, a folder near the root or home, ., .., * or $VARIABLE/"),
+    ("sql_destroy", "Destroy database data", "DROP TABLE/DATABASE/SCHEMA, TRUNCATE, DELETE FROM without WHERE (also inside python -c, psql, sqlite3 ...)"),
+    ("db_reset", "Reset a dev database", "prisma migrate reset, prisma db push --force-reset, dropdb, supabase db reset, docker compose down -v, docker volume rm/prune"),
+    ("disk_wipe", "Format or overwrite a disk", "format X:, diskpart, mkfs, dd of=/dev/..., Clear-Disk, Format-Volume"),
+)
+_DANGER_RULE_IDS = tuple(r[0] for r in _DANGER_RULES)
+# heads whose arguments are only text -- a commit message about "DROP TABLE" is fine
+_DANGER_TEXT_HEADS = {"git", "echo", "printf", "write-host", "write-output", "grep", "rg", "findstr",
+                      "select-string", "gh", "cat", "type", "less", "head", "tail", "sls"}
+_DANGER_RM_HEADS = {"rm", "remove-item", "ri", "del", "erase", "rd", "rmdir"}
+_DANGER_SQL = (
+    re.compile(r"\bdrop\s+(table|database|schema)\b", re.I),
+    re.compile(r"\btruncate\s+(table\s+)?[\w.\"`\[]", re.I),
+    re.compile(r"\bdelete\s+from\s+[\w.\"`\[\]]+(?![^;'\"]*\bwhere\b)", re.I),
+)
+_danger_cfg_cache = {"mtime": None, "cfg": None}
+
+
+def _sanitize_danger_guard(data) -> dict:
+    data = data if isinstance(data, dict) else {}
+    mode = data.get("mode") if data.get("mode") in _DANGER_MODES else "hold"
+    try:
+        hold_min = int(data.get("hold_min", 10))
+    except (TypeError, ValueError):
+        hold_min = 10
+    off = data.get("off_rules") if isinstance(data.get("off_rules"), list) else []
+    pats = []
+    for p in data.get("patterns") if isinstance(data.get("patterns"), list) else []:
+        p = str(p or "").strip()[:200]
+        if not p or p in pats:
+            continue
+        try:
+            re.compile(p)
+        except re.error:
+            continue
+        pats.append(p)
+    return {"mode": mode, "hold_min": max(1, min(hold_min, _DANGER_HOLD_MAX_MIN)),
+            "off_rules": [r for r in _DANGER_RULE_IDS if r in off],
+            "patterns": pats[:_DANGER_MAX_PATTERNS]}
+
+
+def _load_danger_guard() -> dict:
+    """Read on every shell tool call, so cached by the file's mtime."""
+    try:
+        mtime = os.path.getmtime(DANGER_GUARD_FILE)
+    except OSError:
+        mtime = None
+    if _danger_cfg_cache["cfg"] is None or _danger_cfg_cache["mtime"] != mtime:
+        _danger_cfg_cache.update(mtime=mtime, cfg=_sanitize_danger_guard(_load_json_file(DANGER_GUARD_FILE, {})))
+    return _danger_cfg_cache["cfg"]
+
+
+def _save_danger_guard(data) -> dict:
+    """Saves the fields present in `data`; the rest keep their stored value.
+    Patterns that don't compile are reported back in "rejected"."""
+    merged = dict(_load_danger_guard())
+    rejected = []
+    if isinstance(data, dict):
+        merged.update({k: v for k, v in data.items() if k in ("mode", "hold_min", "off_rules", "patterns")})
+        for p in data.get("patterns") or [] if isinstance(data.get("patterns"), list) else []:
+            try:
+                re.compile(str(p))
+            except re.error:
+                rejected.append(str(p)[:200])
+    cfg = _sanitize_danger_guard(merged)
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = DANGER_GUARD_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    os.replace(tmp, DANGER_GUARD_FILE)
+    _danger_cfg_cache.update(mtime=None, cfg=None)
+    return {**cfg, "rejected": rejected}
+
+
+def _danger_unquote(w) -> str:
+    w = str(w)
+    if len(w) >= 2 and w[0] == w[-1] and w[0] in "'\"":
+        w = w[1:-1]
+    return w
+
+
+def _danger_broad_path(p) -> bool:
+    """Pure: is deleting this path recursively a disaster? Root, a drive,
+    home, anything at most two levels under a drive/root or one under home,
+    the current/parent folder, a bare wildcard, or $VARIABLE/ (an empty
+    variable = deletes from /)."""
+    p = _danger_unquote(p).strip().replace("\\", "/")
+    if not p:
+        return False
+    if re.match(r"^\$(\{\w+\}|\w+|env:\w+)/\*?$", p, re.I):
+        return True
+    p = re.sub(r"/\*$", "", p.rstrip("/")) or "/"
+    if p.lower() in ("/", "*", ".", "..", "~", "$home", "${home}", "$env:userprofile"):
+        return True
+    if all(c in (".", "..", "*", "") for c in p.split("/")):
+        return True
+    m = re.match(r"^(~|\$home|\$\{home\}|\$env:userprofile)(/.*)?$", p, re.I)
+    if m:
+        return len([c for c in (m.group(2) or "").split("/") if c]) <= 1
+    m = re.match(r"^([a-z]:|/[a-z](?=/|$)|/mnt/[a-z](?=/|$))(/.*)?$", p, re.I)
+    if m:
+        rest = [c for c in (m.group(2) or "").split("/") if c]
+        return len(rest) <= (3 if rest[:1] and rest[0].lower() == "users" else 2)
+    if p.startswith("/"):
+        comps = [c for c in p.split("/") if c]
+        return len(comps) <= (3 if comps[:1] == ["home"] else 1)
+    return False
+
+
+def _danger_rm_hit(words) -> bool:
+    """Pure: a simple command that recursively deletes a broad path."""
+    head = _perm_head(words[0])
+    if head == "sudo" and len(words) > 1:
+        return _danger_rm_hit(words[1:])
+    if head not in _DANGER_RM_HEADS:
+        return False
+    cmdish = head in ("rd", "rmdir", "del", "erase")
+    recursive, targets, skip = False, [], False
+    for w in words[1:]:
+        u = _danger_unquote(w)
+        lw = u.lower()
+        if skip:
+            skip = False
+            continue
+        if cmdish and re.match(r"^/[a-z]$", lw):
+            recursive = recursive or lw == "/s"
+            continue
+        if lw.startswith("--"):
+            recursive = recursive or lw == "--recursive"
+            continue
+        if lw.startswith("-") and len(lw) > 1:
+            if head == "rm" and re.match(r"^-[a-z]{1,4}$", lw) and "r" in lw:
+                recursive = True
+            elif "-recurse".startswith(lw) and len(lw) >= 2:
+                recursive = True
+            elif lw in ("-filter", "-include", "-exclude"):
+                skip = True
+            continue
+        targets.append(u)
+    return recursive and any(_danger_broad_path(t) for t in targets)
+
+
+def _danger_git_hits(words) -> list:
+    """Pure: built-in rule ids a git simple command trips."""
+    if _perm_head(words[0]) != "git":
+        return []
+    args = [_danger_unquote(w) for w in words[1:]]
+    while args[:1] and args[0] in ("-C", "-c", "--git-dir", "--work-tree") and len(args) > 1:
+        args = args[2:]
+    if not args:
+        return []
+    sub, rest = args[0].lower(), args[1:]
+    hits = []
+    if sub == "push":
+        if any(a in ("-f", "--force", "--force-with-lease", "--force-if-includes", "--mirror") or a.startswith("--force-with-lease=")
+               or (re.match(r"^-[a-z]+$", a) and "f" in a[1:]) for a in rest) \
+                or any(a.startswith("+") for a in rest if not a.startswith("-")):
+            hits.append("force_push")
+        pos = [a for a in rest if not a.startswith("-")]
+        if any(a in ("-d", "--delete") for a in rest) or any(a.startswith(":") and len(a) > 1 for a in pos[1:]):
+            hits.append("remote_branch_delete")
+    elif sub == "reset" and "--hard" in rest:
+        hits.append("git_discard")
+    elif sub == "clean" and any(re.match(r"^-[a-z]*f", a, re.I) or a == "--force" for a in rest):
+        hits.append("git_discard")
+    elif sub in ("checkout", "restore") and "--staged" not in rest and any(a in (".", ":/", "*") for a in rest) \
+            and (sub == "restore" or "--" in rest):
+        hits.append("git_discard")
+    elif sub == "stash" and rest[:1] == ["clear"]:
+        hits.append("git_discard")
+    return hits
+
+
+def _danger_db_hit(words) -> bool:
+    w = [_danger_unquote(x).lower() for x in words]
+    head = _perm_head(w[0])
+    if head in ("npx", "pnpm", "yarn", "bunx", "pnpx") and len(w) > 1:
+        w, head = w[1:], _perm_head(w[1])
+    j = " ".join(w[1:])
+    if head == "prisma":
+        return bool(re.search(r"\bmigrate\s+reset\b", j) or "--force-reset" in w)
+    if head == "dropdb":
+        return True
+    if head == "supabase":
+        return bool(re.search(r"\bdb\s+reset\b", j))
+    if head in ("docker", "docker-compose", "podman"):
+        return bool(re.search(r"\bdown\b.*(\s|^)(-v|--volumes)\b", j) or re.search(r"\bvolume\s+(rm|prune)\b", j)
+                    or re.search(r"\bsystem\s+prune\b.*--volumes", j))
+    return False
+
+
+def _danger_disk_hit(words) -> bool:
+    w = [_danger_unquote(x).lower() for x in words]
+    head = _perm_head(w[0])
+    if head == "format" and any(re.match(r"^[a-z]:$", a) for a in w[1:]):
+        return True
+    if head in ("diskpart", "clear-disk", "format-volume", "initialize-disk") or head.startswith("mkfs"):
+        return True
+    return head == "dd" and any(a.startswith("of=/dev/") for a in w[1:])
+
+
+def _danger_check(command, shell, cfg) -> list:
+    """Pure: a shell command -> [{"id", "label", "why", "part"}] of the rules
+    it trips (empty = harmless). Quote-aware: each simple command of a chain
+    is judged on its own, and text arguments (commit messages, echo, grep)
+    never count as SQL."""
+    command = str(command or "")
+    if cfg.get("mode") == "off" or not command.strip():
+        return []
+    off = set(cfg.get("off_rules") or [])
+    simple, _script = _perm_simple_commands(command, shell)
+    found = {}
+
+    def add(rid, part):
+        if rid not in off and rid not in found:
+            r = next(x for x in _DANGER_RULES if x[0] == rid)
+            found[rid] = {"id": rid, "label": r[1], "why": r[2], "part": part[:300]}
+
+    texts = []
+    for words in simple:
+        if not words:
+            continue
+        part = " ".join(words)
+        for rid in _danger_git_hits(words):
+            add(rid, part)
+        if _danger_rm_hit(words):
+            add("rm_broad", part)
+        if _danger_db_hit(words):
+            add("db_reset", part)
+        if _danger_disk_hit(words):
+            add("disk_wipe", part)
+        if _perm_head(words[0]) not in _DANGER_TEXT_HEADS:
+            texts.append(part)
+    # heredoc bodies were dropped by the splitter -- SQL piped into psql /
+    # sqlite3 / python lives there
+    for m in re.finditer(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\s*\2\s*(?=\n|$)", command, re.S):
+        feeder = _perm_simple_commands(command[command.rfind("\n", 0, m.start()) + 1:m.start()], shell)[0]
+        if not feeder or _perm_head(feeder[-1][0]) not in _DANGER_TEXT_HEADS:   # cat <<EOF > notes.md is text
+            texts.append(m.group(3))
+    for t in texts:
+        if any(rx.search(t) for rx in _DANGER_SQL):
+            add("sql_destroy", t)
+            break
+    out = list(found.values())
+    for p in cfg.get("patterns") or []:
+        try:
+            if re.search(p, command, re.I):
+                out.append({"id": "pattern", "label": "Your pattern", "why": p, "part": command[:300]})
+                break
+        except re.error:
+            continue
+    return out
+
+
+def _danger_reply(decision, reason) -> dict:
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": reason}}
+
+
+def _danger_open(hook, hits, now) -> str:
+    """Add a held dangerous command to the remote-approve prompts (shown as
+    "Needs your OK" on the session) and tell the phone. Returns its id."""
+    tool = str(hook.get("tool_name") or "Bash")
+    ti = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
+    cmd = str(ti.get("command") or "")
+    sid = str(hook.get("session_id") or "")
+    why = "; ".join(h["label"] for h in hits)
+    detail = (str(ti.get("description") or "") + "\n\n" if ti.get("description") else "") + \
+        "AOC holds this because: " + "; ".join(f"{h['label']} ({h['why']})" for h in hits)
+    rid = _secrets.token_hex(8)
+    with _perm_lock:
+        _perm_expire(now)
+        _perm_requests[rid] = {
+            "id": rid, "session_id": sid, "tool_name": tool, "summary": f"{tool}: {cmd}".strip()[:300],
+            "detail": detail[:2000], "created": now, "last_poll": now, "state": "pending", "message": "",
+            "danger": why[:200], "cwd": str(hook.get("cwd") or "")[:300],
+        }
+    with _status_cond:
+        _status_version[0] += 1
+        _status_cond.notify_all()
+    name = _push_session_name(sid)
+    try:
+        _push_notify(f"⚠ {name}: dangerous command", f"{why} -- {cmd[:160]}", tag="perm-" + rid, urgent=True)
+    except Exception as e:
+        _log_bg_error("push", e)
+    try:
+        _show_native_toast(f"⚠ {name[:40]} wants to run a dangerous command", f"{why}: {cmd[:120]} -- Allow or Deny in AOC")
+    except Exception:
+        pass
+    return rid
+
+
+def _danger_wait(rid, hold_s, now_fn=time.time, sleep_fn=time.sleep, gone_fn=lambda: False):
+    """Hold until the dashboard answers: -> (state, message). state is
+    allow | deny | release, "timeout", or "gone" (Claude Code hung up --
+    Esc, session closed)."""
+    deadline = now_fn() + hold_s
+    while True:
+        now = now_fn()
+        with _perm_lock:
+            req = _perm_requests.get(rid)
+            if req is None:
+                return "gone", ""
+            if req["state"] != "pending":
+                del _perm_requests[rid]
+                return req["state"], req["message"]
+            if now >= deadline or gone_fn():
+                del _perm_requests[rid]
+                return ("timeout" if now >= deadline else "gone"), ""
+            req["last_poll"] = now
+        sleep_fn(0.5)
+
+
+def _danger_decision(state, message, hits, hold_min) -> dict:
+    """Pure: the hold's outcome -> the PreToolUse reply for Claude Code."""
+    what = "; ".join(h["label"] for h in hits) or "dangerous command"
+    if state == "allow":
+        return _danger_reply("allow", f"AOC: the user approved this command ({what}).")
+    if state == "release":
+        return _danger_reply("ask", f"AOC flagged this as dangerous ({what}); the user wants to decide here.")
+    if state == "deny":
+        msg = f" They said: {message}" if message else ""
+        return _danger_reply("deny", f"AOC: the user denied this dangerous command ({what}).{msg} "
+                                     "Do not run it in another form; ask the user how to go on.")
+    if state == "timeout":
+        return _danger_reply("deny", f"AOC held this dangerous command ({what}) for the user's OK for {hold_min} min "
+                                     "and got no answer, so it was not run. Do not retry it in another form; stop, "
+                                     "tell the user what you wanted to run and why, and wait for them.")
+    return {}
+
+
+def _danger_hook(hook, cfg=None, wait=_danger_wait, now=None, gone_fn=lambda: False) -> dict:
+    """POST /hook/danger body (Claude Code's PreToolUse input) -> {} for a
+    harmless command, else holds and returns allow / deny / ask."""
+    if not isinstance(hook, dict) or hook.get("hook_event_name", "PreToolUse") != "PreToolUse":
+        return {}
+    tool = str(hook.get("tool_name") or "")
+    if tool not in ("Bash", "PowerShell"):
+        return {}
+    cfg = cfg or _load_danger_guard()
+    ti = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
+    hits = _danger_check(ti.get("command"), tool, cfg)
+    if not hits:
+        return {}
+    rid = _danger_open(hook, hits, now or time.time())
+    state, message = wait(rid, cfg["hold_min"] * 60, gone_fn=gone_fn)
+    return _danger_decision(state, message, hits, cfg["hold_min"])
+
+
+def _danger_hook_installed(settings) -> bool:
+    """Pure: is AOC's /hook/danger PreToolUse entry in ~/.claude/settings.json?"""
+    return "/hook/danger" in json.dumps(((settings or {}).get("hooks") or {}).get("PreToolUse") or [])
+
+
+def _danger_view(cfg, settings) -> dict:
+    """GET /danger_guard: settings + the built-in rules + hook state."""
+    return {**cfg, "rules": [{"id": r[0], "label": r[1], "why": r[2]} for r in _DANGER_RULES],
+            "hook_installed": _danger_hook_installed(settings)}
+
+
+def _socket_hung_up(sock) -> bool:
+    """The request body is read, so a readable socket means the client
+    closed (or reset) the connection."""
+    import select as _select
+    try:
+        r, _, _ = _select.select([sock], [], [], 0)
+        return bool(r) and sock.recv(1, _socket.MSG_PEEK) == b""
+    except Exception:
+        return True
 
 
 def _queue_worker():
@@ -6188,6 +8425,9 @@ def _transcript_scanner_worker():
     # below) before module-level "import hashlib as _hashlib" (line ~1321) runs,
     # so relying on that global would be a startup-order race.
     projects_base = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    # _status_lock / _load_status are defined further down; the first scan
+    # used to race them at startup (NameError in background_errors.log)
+    _module_loaded.wait(60)
 
     while True:
         try:
@@ -7332,6 +9572,270 @@ def _client_report_csv(report, client=None):
     return buf.getvalue()
 
 
+# ── Work log / standup (History -> WORK LOG) ──────────────────────────────
+# What got done in a period, per project (the repo a session committed to,
+# else its folder) or per client (_client_for): sessions, commits, time
+# active, cost -- all from transcript_index.db. "Summarize" hands a compact
+# digest (your asks, Claude's last word, commit subjects) to Haiku for a
+# standup or a client-facing report; answers are cached by digest, so the
+# same period costs nothing the second time.
+WORKLOG_CACHE_FILE = os.path.join(AOC_DATA_DIR, "worklogs.json")
+_WORKLOG_MAX_DAYS = 92
+_WORKLOG_GAP_S = 10 * 60        # a longer silence is a break, not work
+_WORKLOG_DIGEST_MAX = 14000
+_WORKLOG_MODES = ("standup", "client")
+_WORKLOG_HOME_GROUP = "Other (home folder)"
+_worklog_lock = threading.Lock()
+_worklog_busy = set()           # digest keys being summarized right now
+
+
+def _worklog_range(d0, d1, today):
+    """Pure: validated (from, to) YYYY-MM-DD; bad input -> today, swapped
+    if reversed, at most _WORKLOG_MAX_DAYS long (the start moves)."""
+    def ok(d):
+        try:
+            datetime.strptime(str(d), "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+    d0 = d0 if ok(d0) else today
+    d1 = d1 if ok(d1) else (d0 if ok(d0) and d0 != today else today)
+    if d1 < d0:
+        d0, d1 = d1, d0
+    a, b = datetime.strptime(d0, "%Y-%m-%d"), datetime.strptime(d1, "%Y-%m-%d")
+    if (b - a).days >= _WORKLOG_MAX_DAYS:
+        d0 = (b - timedelta(days=_WORKLOG_MAX_DAYS - 1)).strftime("%Y-%m-%d")
+    return d0, d1
+
+
+def _worklog_active_s(epochs, gap=_WORKLOG_GAP_S):
+    """Pure: seconds of work in these activity timestamps -- each gap counts
+    up to `gap`, longer ones are breaks."""
+    e = sorted(x for x in epochs if x)
+    return int(sum(min(b - a, gap) for a, b in zip(e, e[1:])))
+
+
+def _worklog_project(cwd, repos, home):
+    """Pure: the project a session belongs to -- the repo it committed to
+    most, else its folder's name; sessions in the home folder that never
+    committed share one group."""
+    if repos:
+        return max(repos, key=repos.count)
+    c = (cwd or "").replace("\\", "/").rstrip("/")
+    h = (home or "").replace("\\", "/").rstrip("/")
+    if not c or (h and c.lower() == h.lower()):
+        return _WORKLOG_HOME_GROUP
+    return c.split("/")[-1] or _WORKLOG_HOME_GROUP
+
+
+def _worklog_report(conn, d0, d1, group, cfg, home=""):
+    """{from, to, group, total: {cost, tokens, sessions, commits, active_s},
+    groups: [{name, cost, tokens, active_s, sessions: [{id, title, cost,
+    tokens, active_s, commits, first_day, last_day, asks, last_reply}],
+    commits: [{sha, subject, repo, day, epoch, session_id, ins, dels}]}]}
+    most spend first; group = "project" | "client"."""
+    rows = conn.execute("""SELECT session_id, SUM(cost), SUM(inp + out + cw + cr), MIN(day), MAX(day)
+                           FROM usage WHERE day >= ? AND day <= ? GROUP BY session_id""", (d0, d1)).fetchall()
+    sids = [r[0] for r in rows]
+    meta, commits, msgs = {}, {}, {}
+    for i in range(0, len(sids), 500):
+        part = sids[i:i + 500]
+        qs = ",".join("?" * len(part))
+        for sid, project, cwd, title in conn.execute(
+                f"SELECT session_id, project, cwd, title FROM sessions_meta WHERE session_id IN ({qs})", part):
+            meta[sid] = (project or "", cwd or "", title or "")
+        for sid, sha, subject, cwd, epoch, day, ins, dels in conn.execute(
+                f"""SELECT session_id, sha, subject, cwd, epoch, day, ins, dels FROM commits
+                    WHERE sha NOT LIKE 'tu:%' AND day >= ? AND day <= ? AND session_id IN ({qs})
+                    ORDER BY COALESCE(epoch, 0)""", [d0, d1] + part):
+            repo = (cwd or "").replace("\\", "/").rstrip("/").split("/")[-1]
+            commits.setdefault(sid, []).append({"sha": sha, "subject": subject or "", "repo": repo, "day": day or "",
+                                                "epoch": epoch, "session_id": sid, "ins": ins, "dels": dels})
+        for sid, ts, role, text in conn.execute(
+                f"SELECT session_id, ts, role, substr(text, 1, 600) FROM msgs WHERE session_id IN ({qs})", part):
+            ep = _iso_to_epoch(ts)
+            if ep and d0 <= time.strftime("%Y-%m-%d", time.localtime(ep)) <= d1:
+                msgs.setdefault(sid, []).append((ep, role, text or ""))
+    groups = {}
+    for sid, cost, tokens, f_day, l_day in rows:
+        project, cwd, title = meta.get(sid, ("", "", ""))
+        cms = commits.get(sid, [])
+        repos = [c["repo"] for c in cms if c["repo"]]
+        if group == "client":
+            name = _client_for(sid, [title, project, cwd] + repos, cfg)[0]
+        else:
+            name = _worklog_project(cwd, repos, home)
+        ms = sorted(msgs.get(sid, []), key=lambda m: m[0])
+        asks = [" ".join(t.split())[:300] for _, r, t in ms if r == "user" and t.strip()]
+        reply = next((" ".join(t.split())[:500] for _, r, t in reversed(ms) if r == "assistant" and t.strip()), "")
+        active = _worklog_active_s([m[0] for m in ms] + [c["epoch"] for c in cms])
+        g = groups.setdefault(name, {"name": name, "cost": 0.0, "tokens": 0, "active_s": 0, "sessions": [], "commits": []})
+        g["sessions"].append({"id": sid, "title": title or (asks[0][:80] if asks else sid[:8]), "cost": round(cost or 0, 4),
+                              "tokens": int(tokens or 0), "active_s": active, "commits": len(cms),
+                              "first_day": f_day, "last_day": l_day, "asks": asks[:6], "last_reply": reply})
+        g["commits"] += cms
+        g["cost"] += cost or 0
+        g["tokens"] += int(tokens or 0)
+        g["active_s"] += active
+    out = sorted(groups.values(), key=lambda g: (g["name"] in ("", _WORKLOG_HOME_GROUP), -g["cost"]))
+    for g in out:
+        g["cost"] = round(g["cost"], 4)
+        g["sessions"].sort(key=lambda s: s["cost"], reverse=True)
+        g["commits"].sort(key=lambda c: c["epoch"] or 0)
+    return {"from": d0, "to": d1, "group": group, "groups": out,
+            "total": {"cost": round(sum(g["cost"] for g in out), 4), "tokens": sum(g["tokens"] for g in out),
+                      "sessions": len(rows), "commits": sum(len(g["commits"]) for g in out),
+                      "active_s": sum(g["active_s"] for g in out)}}
+
+
+def _worklog_digest(report, max_chars=_WORKLOG_DIGEST_MAX):
+    """Pure: the period as compact text for the summarizer: per group its
+    commits, then each session's asks (YOU) and Claude's last word. No
+    costs -- a client report must not leak them by accident."""
+    out = [f"PERIOD: {report['from']}" + ("" if report["to"] == report["from"] else f" to {report['to']}")]
+    for g in report["groups"]:
+        out.append(f"\n== {g['name'] or 'Unassigned'} ==")
+        for c in g["commits"]:
+            out.append(f"COMMIT {c['repo']}: {c['subject']}")
+        for s in g["sessions"]:
+            out.append(f"SESSION: {s['title']}")
+            out += ["  YOU: " + a for a in s["asks"]]
+            if s["last_reply"]:
+                out.append("  CLAUDE (last): " + s["last_reply"])
+    text = "\n".join(out)
+    if len(text) > max_chars:
+        head = max_chars // 2
+        text = text[:head] + "\n[... cut ...]\n" + text[-(max_chars - head):]
+    return text
+
+
+_WORKLOG_INSTRUCTIONS = {
+    "standup": (
+        "Below is a log of one developer's Claude Code work in a period, grouped by project: commits, "
+        "what they asked (YOU) and Claude's last word per session. Write their standup in three short "
+        "sections titled Done, Next and Blockers (translate the three titles into the language of the YOU "
+        "lines). Done: 2-6 bullets of concrete results, most important first, with the project name. "
+        "Next: 1-4 bullets of what is unfinished or was said to come next. Blockers: bullets, or a single "
+        "'none' in that language. Bullets start with '- '. Plain text only: no markdown, no bold, no "
+        "backticks, no preamble. Write in the same language as the YOU lines."),
+    "client": (
+        "Below is a log of a developer's work in a period, grouped by project: commits, what they asked "
+        "(YOU) and the AI assistant's last word per session. Write a short work report they can send to "
+        "their client: for each project a heading line with its name, then 2-5 bullets ('- ') of the "
+        "results in plain business language -- what was built, fixed or improved and why it matters. "
+        "No internal jargon, no file names, no mention of AI, Claude, prompts, costs or tokens. Plain "
+        "text only: no markdown, no bold, no preamble. Write in the same language as the YOU lines."),
+}
+
+
+def _worklog_key(mode, digest):
+    import hashlib
+    return hashlib.sha1((mode + "\n" + digest).encode("utf-8")).hexdigest()
+
+
+def _worklog_cached(key):
+    d = _load_json_file(WORKLOG_CACHE_FILE, {})
+    return (d if isinstance(d, dict) else {}).get(key)
+
+
+def _worklog_store(key, entry):
+    with _worklog_lock:
+        d = _load_json_file(WORKLOG_CACHE_FILE, {})
+        d = d if isinstance(d, dict) else {}
+        d[key] = entry
+        d = dict(sorted(d.items(), key=lambda kv: kv[1].get("generated_at", 0))[-100:])
+        os.makedirs(AOC_DATA_DIR, exist_ok=True)
+        tmp = WORKLOG_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, WORKLOG_CACHE_FILE)
+
+
+def _worklog_cached_summaries(report):
+    """{mode: cached entry or None} for this exact report."""
+    digest = _worklog_digest(report)
+    return {m: _worklog_cached(_worklog_key(m, digest)) for m in _WORKLOG_MODES}
+
+
+def _worklog_summary(report, mode, force=False, run=None, now=None):
+    """POST /worklog/summary: {"ok", "text", "cost", "generated_at", "mode",
+    "fresh"} -- from the cache unless forced; one summary at a time."""
+    if mode not in _WORKLOG_MODES:
+        return {"ok": False, "error": "unknown mode"}
+    if not report["groups"]:
+        return {"ok": False, "error": "no work in this period"}
+    now = now or time.time()
+    digest = _worklog_digest(report)
+    key = _worklog_key(mode, digest)
+    cached = _worklog_cached(key)
+    if cached and not force:
+        return {"ok": True, **cached, "fresh": False}
+    with _worklog_lock:
+        if key in _worklog_busy:
+            return {"ok": False, "busy": True, "error": "already summarizing"}
+        _worklog_busy.add(key)
+    try:
+        text, cost = (run or _run_haiku)(_WORKLOG_INSTRUCTIONS[mode], digest)
+        entry = {"text": text[:6000], "cost": round(cost, 4), "generated_at": now, "mode": mode,
+                 "from": report["from"], "to": report["to"], "group": report["group"]}
+        _worklog_store(key, entry)
+        return {"ok": True, **entry, "fresh": True}
+    except Exception as e:
+        _log_bg_error("worklog", e)
+        return {"ok": False, "error": str(e)[:200]}
+    finally:
+        with _worklog_lock:
+            _worklog_busy.discard(key)
+
+
+def _worklog_print_html(report, summary=None):
+    """A plain, printable work log (browser -> Save as PDF): the summary if
+    there is one, then per group its commits and sessions. No costs, so it
+    can go to a client as is."""
+    import html as _html
+    esc = lambda v: _html.escape(str(v), quote=True)
+    period = report["from"] + ("" if report["to"] == report["from"] else " – " + report["to"])
+    hrs = lambda s: f"{s / 3600:.1f} h" if s >= 3600 else f"{max(1, round(s / 60))} min"
+    parts = []
+    if summary and summary.get("text"):
+        parts.append(f"<div class=sum>{esc(summary['text'])}</div>")
+    for g in report["groups"]:
+        cm = "".join(f"<li><code>{esc((c['sha'] or '')[:7])}</code> {esc(c['subject'] or '(no message)')}"
+                     f"<span class=d> · {esc(c['repo'])} · {esc(c['day'])}</span></li>" for c in g["commits"])
+        ss = "".join(f"<li>{esc(s['title'])}<span class=d> · {esc(s['first_day'])} · {hrs(s['active_s'])}</span></li>"
+                     for s in g["sessions"])
+        parts.append(f"<h2>{esc(g['name'] or 'Unassigned')} <span class=d>{hrs(g['active_s'])} active</span></h2>"
+                     + (f"<h3>Commits</h3><ul>{cm}</ul>" if cm else "") + f"<h3>Sessions</h3><ul>{ss}</ul>")
+    body = "".join(parts) or "<p>No work recorded in this period.</p>"
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Work log {esc(period)}</title>
+<style>body{{font:14px/1.5 system-ui,Segoe UI,sans-serif;color:#111;max-width:860px;margin:32px auto;padding:0 20px}}
+h1{{font-size:22px;margin:0 0 4px}}h2{{font-size:17px;margin:26px 0 4px;border-bottom:1px solid #ddd;padding-bottom:3px}}
+h3{{font-size:12px;color:#555;text-transform:uppercase;letter-spacing:.04em;margin:10px 0 2px}}ul{{margin:0;padding-left:20px}}
+.d{{color:#777;font-size:12px;font-weight:400}}.sub{{color:#555;margin:0 0 18px}}.sum{{white-space:pre-wrap;background:#f6f6f2;border-left:3px solid #888;padding:10px 14px;margin:0 0 10px}}
+.foot{{margin-top:26px;color:#777;font-size:12px}}button{{float:right;padding:6px 14px;cursor:pointer}}@media print{{button{{display:none}}body{{margin:0}}}}</style></head>
+<body><button onclick="print()">Print / Save as PDF</button>
+<h1>Work log</h1><p class="sub">{esc(period)} · {report['total']['sessions']} sessions · {report['total']['commits']} commits · {hrs(report['total']['active_s'])} active</p>
+{body}<p class="foot">From Claude Code's session records on this computer. Generated by AOC on {esc(datetime.now().strftime('%Y-%m-%d'))}.</p>
+</body></html>"""
+
+
+def _worklog_csv(report):
+    """CSV of the period: one line per session, then a total per group."""
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["from", "to", report["group"], "session", "session_id", "first_day", "last_day",
+                "active_min", "commits", "tokens", "cost_usd"])
+    for g in report["groups"]:
+        name = g["name"] or "(unassigned)"
+        for s in g["sessions"]:
+            w.writerow([report["from"], report["to"], name, s["title"], s["id"], s["first_day"], s["last_day"],
+                        round(s["active_s"] / 60), s["commits"], s["tokens"], f'{s["cost"]:.2f}'])
+        w.writerow([report["from"], report["to"], name, "TOTAL", "", "", "", round(g["active_s"] / 60),
+                    len(g["commits"]), g["tokens"], f'{g["cost"]:.2f}'])
+    return buf.getvalue()
+
+
 # ── Model advice (History -> MODELS) ──────────────────────────────────────
 # Every API call in the transcripts is sorted by the work it did (the tools
 # it called: only reading/searching, editing, running commands, delegating
@@ -8122,6 +10626,301 @@ def _context_report(days, now=None):
     return report
 
 
+# ── Memory & CLAUDE.md editor (History -> MEMORY) ─────────────────────────
+# The instruction files Claude Code loads at session start (~/.claude/
+# CLAUDE.md, a project's CLAUDE.md / .claude/CLAUDE.md / CLAUDE.local.md,
+# each auto-memory MEMORY.md index) and the memory topic files the indexes
+# point to. _mem_lint flags what costs tokens or misleads Claude: oversized
+# files, index lines that should be one-line hooks, links and paths that
+# lead nowhere, topic files no index mentions, repeated lines. Saving is
+# local-only, refused when the file changed since it was opened, and keeps
+# backups in AOC's data folder (not next to the memory files).
+_MEM_MAX_FILES = 200
+_MEM_MAX_BYTES = 512 * 1024
+_MEM_BACKUP_DIR = os.path.join(AOC_DATA_DIR, "memory_backups")
+_MEM_BACKUPS_KEEP = 10
+_MEM_LOADED = ("user", "project", "local", "index")   # read into every session start (where they apply)
+_MEM_BIG_TOKENS = 1500
+_MEM_BIG_TOPIC_TOKENS = 10000
+_MEM_INDEX_MAX_LINES = 200   # Claude Code loads only the start of a long MEMORY.md
+_MEM_INDEX_LINE_CHARS = 300
+_MEM_DUPE_MIN_CHARS = 40
+_MEM_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+_MEM_WIKI = re.compile(r"\[\[([^\]|#]+)")
+_MEM_ABS = re.compile(r"(?<![\w/\\])(?:[A-Za-z]:[\\/]|~[\\/])[^\s`'\"<>|*?()\[\],;]*")
+_MEM_SEV = {"error": 0, "warn": 1, "info": 2}
+
+
+def _mem_discover(home, dirs, isfile=os.path.isfile, glob_fn=glob.glob):
+    """[{path, kind}] -- kind: user / project / local / index / memory.
+    `dirs` = folders Claude Code worked in (_launch_known_dirs)."""
+    out, seen = [], set()
+
+    def add(p, kind):
+        p = os.path.normpath(p)
+        k = os.path.normcase(p)
+        if k not in seen and isfile(p):
+            seen.add(k)
+            out.append({"path": p, "kind": kind})
+
+    j = os.path.join
+    add(j(home, ".claude", "CLAUDE.md"), "user")
+    for d in dirs:
+        add(j(d, "CLAUDE.md"), "project")
+        add(j(d, ".claude", "CLAUDE.md"), "project")
+        add(j(d, "CLAUDE.local.md"), "local")
+    mds = glob_fn(j(glob.escape(home), ".claude", "projects", "*", "memory", "*.md"))
+    for p in sorted(mds, key=lambda p: (os.path.dirname(p).lower(), os.path.basename(p) != "MEMORY.md", os.path.basename(p).lower())):
+        add(p, "index" if os.path.basename(p) == "MEMORY.md" else "memory")
+    return out[:_MEM_MAX_FILES]
+
+
+def _mem_frontmatter(text):
+    """{key: value} of a leading '---' block, or None when there is none."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    meta = {}
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            return meta
+        m = re.match(r"^([\w-]+):\s*(.*)$", ln)
+        if m:
+            meta[m.group(1)] = m.group(2).strip().strip("'\"")
+    return None
+
+
+def _mem_find_path(line, m, exists):
+    """The path an absolute-path match starts, or None when it exists. A
+    path with spaces ('...\\AOC-Agent Monitoring\\x') is cut at the first
+    space by the regex, so up to 4 following words are tried too."""
+    cand = m.group(0).rstrip(".:!")
+    if any(x in cand for x in ("<", "...", "…", "%", "{", "$")) or len(cand) <= 3:
+        return None
+    rest = line[m.end():]
+    tries = [cand]
+    if rest.startswith(" ") and m.group(0) == cand:   # the path itself may go on after a space
+        for w in rest[1:].split(" ")[:4]:
+            w = re.split(r"[`'\"<>|*?()\[\],;]", w)[0]
+            if not w:
+                break
+            tries.append(tries[-1] + " " + w.rstrip(".:!"))
+            if w != w.rstrip(".:!"):
+                break
+    if m.start() > 0 and line[m.start() - 1] == "`" and "`" in rest:   # `C:\a b\c` -- the whole quoted path
+        tries.append(line[m.start():m.end() + rest.index("`")].rstrip(".:!"))
+    for t in tries:
+        if exists(os.path.expanduser(t)):
+            return None
+    # only when its folder (or the one above) is there: a moved / renamed /
+    # deleted file, not an example path like C:\Users\x\.ssh\id_rsa
+    full = tries[-1]
+    parent = os.path.dirname(os.path.expanduser(full).rstrip("\\/"))
+    grand = os.path.dirname(parent)
+    if exists(parent) or (grand and len(re.split(r"[\\/]+", grand.strip("\\/"))) >= 3 and exists(grand)):
+        return full
+    return None
+
+
+def _mem_lint(files, exists=os.path.exists):
+    """Pure (file system only through `exists`): files = [{path, kind, text}]
+    -> [{path, kind, tokens, lines, issues: [{sev, line, rule, msg}]}],
+    worst first. Line numbers are 1-based; 0 = the whole file."""
+    by_dir = {}
+    for f in files:
+        if f["kind"] in ("index", "memory"):
+            by_dir.setdefault(os.path.normcase(os.path.dirname(f["path"])), []).append(f)
+    names, linked = {}, {}
+    for d, group in by_dir.items():
+        ns = set()
+        for f in group:
+            ns.add(os.path.splitext(os.path.basename(f["path"]))[0].lower())
+            meta = _mem_frontmatter(f["text"]) or {}
+            if meta.get("name"):
+                ns.add(meta["name"].lower())
+        names[d] = ns
+        linked[d] = {os.path.normcase(os.path.basename(t)) for f in group if f["kind"] == "index"
+                     for t in _MEM_LINK.findall(f["text"])}
+
+    seen_lines, out = {}, []
+    for f in files:
+        path, kind, text = f["path"], f["kind"], f["text"]
+        d = os.path.normcase(os.path.dirname(path))
+        lines = text.splitlines()
+        issues = []
+        add = lambda sev, ln, rule, msg: issues.append({"sev": sev, "line": ln, "rule": rule, "msg": msg})
+        tokens = _ctx_tokens(len(text))
+        if kind in _MEM_LOADED and tokens >= _MEM_BIG_TOKENS:
+            add("warn", 0, "size", f"~{tokens:,} tokens read at every session start. Keep short pointers here "
+                                   "and move detail into files Claude opens when needed.")
+        if kind == "memory" and tokens >= _MEM_BIG_TOPIC_TOKENS:
+            add("info", 0, "size", f"~{tokens:,} tokens: each time Claude opens this memory it reads all of it. "
+                                   "Trim old history or split it.")
+        if kind == "index" and len(lines) > _MEM_INDEX_MAX_LINES:
+            add("warn", _MEM_INDEX_MAX_LINES + 1, "index_length",
+                f"{len(lines)} lines: Claude Code loads only the first {_MEM_INDEX_MAX_LINES}, the rest is never seen.")
+        if kind == "memory" and d in linked and os.path.normcase(os.path.basename(path)) not in linked[d]:
+            add("warn", 0, "orphan", "No link to this file in its MEMORY.md, so Claude never finds it.")
+        if kind == "memory":
+            meta = _mem_frontmatter(text)
+            missing = [k for k in ("name", "description") if not (meta or {}).get(k)]
+            if missing:
+                add("info", 1, "frontmatter", "Frontmatter is missing " + " and ".join(missing)
+                    + " (used to decide when the memory is relevant).")
+        in_front = bool(lines) and lines[0].strip() == "---"
+        reported_paths = set()
+        for i, ln in enumerate(lines, 1):
+            if in_front:
+                if i > 1 and ln.strip() == "---":
+                    in_front = False
+                continue
+            if kind == "index" and len(ln) > _MEM_INDEX_LINE_CHARS:
+                add("warn", i, "long_line", f"{len(ln):,}-character index line. An index entry should be a "
+                                            "one-line hook; put the detail in the topic file it links to.")
+            for target in _MEM_LINK.findall(ln):
+                if re.match(r"^[a-z][\w+.-]*:", target, re.I) or target.startswith("#"):
+                    continue   # URLs, mailto:, anchors
+                t = target.split("#")[0]
+                full = os.path.expanduser(t) if os.path.isabs(os.path.expanduser(t)) else os.path.join(os.path.dirname(path), t)
+                if t and not exists(full):
+                    add("error", i, "dead_link", f"Link to {t}, which doesn't exist.")
+            if kind in ("index", "memory") and d in names:
+                for w in _MEM_WIKI.findall(ln):
+                    if w.strip().lower() not in names[d]:
+                        add("info", i, "wikilink", f"[[{w.strip()}]]: no memory with that name yet.")
+            for m in _MEM_ABS.finditer(ln):
+                bad = _mem_find_path(ln, m, exists)
+                if bad and bad not in reported_paths:
+                    reported_paths.add(bad)
+                    add("warn", i, "dead_path", f"{bad} doesn't exist (moved or renamed?).")
+            # repeated lines: within one file, or across the files every session
+            # loads together -- topic files are opened one at a time, so the
+            # same line in two of them isn't read twice
+            norm = re.sub(r"\s+", " ", re.sub(r"^[\s>#*\-+\d.]+", "", ln)).strip().lower()
+            if len(norm) >= _MEM_DUPE_MIN_CHARS:
+                scope = seen_lines if kind in _MEM_LOADED else seen_lines.setdefault(("file", path), {})
+                first = scope.get(norm)
+                if first:
+                    where = f"line {first[1]}" if first[0] == path else f"{os.path.basename(first[0])}:{first[1]}"
+                    add("warn", i, "duplicate", f"Same as {where} -- Claude reads it twice.")
+                else:
+                    scope[norm] = (path, i)
+        issues.sort(key=lambda x: (_MEM_SEV[x["sev"]], x["line"]))
+        out.append({"path": path, "kind": kind, "tokens": tokens, "lines": len(lines), "issues": issues})
+    return out
+
+
+def _mem_read(path):
+    with open(path, "rb") as fh:
+        raw = fh.read(_MEM_MAX_BYTES + 1)
+    if len(raw) > _MEM_MAX_BYTES:
+        raise ValueError("file too large")
+    return raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+
+def _mem_files():
+    """Discovered files, each with its text and mtime (unreadable ones skipped)."""
+    out = []
+    for f in _mem_discover(os.path.expanduser("~"), [d["path"] for d in _launch_known_dirs()]):
+        try:
+            out.append({**f, "text": _mem_read(f["path"]), "mtime": os.stat(f["path"]).st_mtime})
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _memory_lint():
+    """GET /memory_lint."""
+    files = _mem_files()
+    rows = _mem_lint(files)
+    mt = {f["path"]: f["mtime"] for f in files}
+    counts = {s: sum(1 for r in rows for x in r["issues"] if x["sev"] == s) for s in _MEM_SEV}
+    for r in rows:
+        r["mtime"] = mt[r["path"]]
+        r["backups"] = len(_mem_backups(r["path"]))
+    return {"files": rows, "counts": counts,
+            "start_tokens": sum(r["tokens"] for r in rows if r["kind"] in ("user", "index"))}
+
+
+def _mem_known(path):
+    """The discovered entry for `path` (case-insensitive), or None -- only
+    these files can be read or written through the editor."""
+    k = os.path.normcase(os.path.normpath(str(path or "")))
+    for f in _mem_files():
+        if os.path.normcase(f["path"]) == k:
+            return f
+    return None
+
+
+def _mem_backup_prefix(path):
+    import hashlib
+    return hashlib.sha1(os.path.normcase(os.path.normpath(path)).encode("utf-8")).hexdigest()[:12] + "-"
+
+
+def _mem_backups(path):
+    """This file's backups, oldest first."""
+    try:
+        pre = _mem_backup_prefix(path)
+        return sorted(os.path.join(_MEM_BACKUP_DIR, n) for n in os.listdir(_MEM_BACKUP_DIR) if n.startswith(pre))
+    except OSError:
+        return []
+
+
+def _mem_write_text(path, text):
+    """Replace `path` with `text`, keeping the file's own line endings."""
+    eol = "\n"
+    try:
+        with open(path, "rb") as fh:
+            if b"\r\n" in fh.read():
+                eol = "\r\n"
+    except OSError:
+        pass
+    tmp = path + ".aoc-tmp"
+    with open(tmp, "w", encoding="utf-8", newline=eol) as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _memory_save(path, text, mtime):
+    """POST /memory_file: back up then write. Refused when the file changed
+    on disk after the editor loaded it (Claude may have just written it)."""
+    if not isinstance(text, str) or len(text.encode("utf-8")) > _MEM_MAX_BYTES:
+        return {"ok": False, "error": "Text missing or too large."}
+    f = _mem_known(path)
+    if not f:
+        return {"ok": False, "error": "Not a CLAUDE.md or memory file AOC knows about."}
+    if not isinstance(mtime, (int, float)) or abs(f["mtime"] - mtime) > 0.001:
+        return {"ok": False, "error": "changed", "mtime": f["mtime"],
+                "detail": "The file changed on disk since you opened it (Claude may have just written it). Copy your edit, press REVERT to load the new version, then apply it again."}
+    text = text.replace("\r\n", "\n")
+    if text == f["text"]:
+        return {"ok": True, "unchanged": True, "mtime": f["mtime"]}
+    import shutil
+    os.makedirs(_MEM_BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    shutil.copy2(f["path"], os.path.join(_MEM_BACKUP_DIR, _mem_backup_prefix(f["path"]) + stamp + "-" + os.path.basename(f["path"])))
+    for old in _mem_backups(f["path"])[:-_MEM_BACKUPS_KEEP]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    _mem_write_text(f["path"], text)
+    return {"ok": True, "mtime": os.stat(f["path"]).st_mtime}
+
+
+def _memory_undo(path):
+    """POST /memory_file/undo: put back the newest backup (and drop it)."""
+    f = _mem_known(path)
+    if not f:
+        return {"ok": False, "error": "Not a CLAUDE.md or memory file AOC knows about."}
+    baks = _mem_backups(f["path"])
+    if not baks:
+        return {"ok": False, "error": "No earlier version saved by AOC."}
+    _mem_write_text(f["path"], _mem_read(baks[-1]))
+    os.remove(baks[-1])
+    return {"ok": True, "mtime": os.stat(f["path"]).st_mtime}
+
+
 # ── Failure map (History -> FAILURES) ─────────────────────────────────────
 # Every tool call that came back as an error, across the transcripts of the
 # last N days (main sessions and their subagents), grouped by tool, what it
@@ -8454,6 +11253,97 @@ def _fail_scans(days, now):
 
 _fail_cache = {}
 _fail_scan_cache = {}
+
+
+# ── System monitor (COMMAND view) ─────────────────────────────────────────
+# CPU / RAM / system-drive use for the Command Center's rings, from the OS
+# directly (no psutil needed): CPU is the busy share of the time between
+# two samples, so the first call takes a short second sample.
+_sysinfo_prev = {"cpu": None}
+_sysinfo_lock = threading.Lock()
+
+
+def _cpu_times():
+    """(idle, total) CPU time since boot in OS ticks, None if unknown."""
+    import sys
+    if sys.platform == "win32":
+        import ctypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("lo", ctypes.c_uint32), ("hi", ctypes.c_uint32)]
+        idle, kern, user = FILETIME(), FILETIME(), FILETIME()
+        if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+            return None
+        val = lambda t: (t.hi << 32) | t.lo
+        return val(idle), val(kern) + val(user)   # kernel time includes idle time
+    try:
+        with open("/proc/stat", encoding="ascii") as fh:
+            parts = [int(x) for x in fh.readline().split()[1:]]
+        return parts[3] + (parts[4] if len(parts) > 4 else 0), sum(parts)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _cpu_pct(prev, cur):
+    """Pure: two (idle, total) samples -> busy % in between, None if unusable."""
+    if not prev or not cur or cur[1] <= prev[1]:
+        return None
+    return round(max(0.0, min(100.0, 100.0 * (1 - (cur[0] - prev[0]) / (cur[1] - prev[1])))), 1)
+
+
+def _mem_pct():
+    """(used %, total bytes) of physical memory, (None, None) if unknown."""
+    import sys
+    if sys.platform == "win32":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(m)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) or not m.ullTotalPhys:
+            return None, None
+        return round(100.0 * (1 - m.ullAvailPhys / m.ullTotalPhys), 1), m.ullTotalPhys
+    try:
+        info = {}
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for ln in fh:
+                k, _, v = ln.partition(":")
+                info[k] = int(v.split()[0]) * 1024
+        return round(100.0 * (1 - info["MemAvailable"] / info["MemTotal"]), 1), info["MemTotal"]
+    except (OSError, ValueError, KeyError, ZeroDivisionError):
+        return None, None
+
+
+def _sysinfo():
+    """GET /sysinfo -> {"cpu", "ram", "ram_total", "disk", "disk_total", "disk_path"} (% values, None if unknown)."""
+    import shutil
+    with _sysinfo_lock:
+        cur = _cpu_times()
+        prev = _sysinfo_prev["cpu"]
+        if cur and (not prev or time.monotonic() - prev[2] > 30):   # no usable earlier sample: take one now
+            time.sleep(0.25)
+            prev, cur = (cur[0], cur[1], 0), _cpu_times()
+        cpu = _cpu_pct(prev[:2] if prev else None, cur)
+        if cur:
+            _sysinfo_prev["cpu"] = (cur[0], cur[1], time.monotonic())
+    ram, ram_total = _mem_pct()
+    drive = (os.environ.get("SystemDrive", "C:") + "\\") if os.name == "nt" else "/"
+    try:
+        du = shutil.disk_usage(drive)
+        disk, disk_total = round(100.0 * du.used / du.total, 1), du.total
+    except OSError:
+        disk = disk_total = None
+    try:
+        host = _socket.gethostname()
+    except OSError:
+        host = ""
+    return {"cpu": cpu, "ram": ram, "ram_total": ram_total, "disk": disk, "disk_total": disk_total, "disk_path": drive,
+            "host": host}
 
 
 # ── Permission advisor (History -> PERMISSIONS) ───────────────────────────
@@ -9863,7 +12753,7 @@ HTML = r"""<!DOCTYPE html>
 <link rel="apple-touch-icon" href="/icon.svg">
 <title>AOC — Agent Operations Center</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&family=Red+Hat+Mono:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&family=Red+Hat+Mono:wght@400;500;700&family=Orbitron:wght@500;600;700;800&family=Rajdhani:wght@500;600;700&display=swap');
 
 /* Strip-board identity (shared with the cloud dashboard,
    saas-backend/app/static/dashboard.html): a controller's console in dark
@@ -10539,6 +13429,12 @@ button.le-tag { cursor:pointer; }
 .sbay > .perm-ask { margin:0 12px 8px; }
 .perm-head { display:flex;align-items:center;gap:8px; }
 .perm-head .woy-lbl { color:var(--r); }
+.perm-ask.danger { border-color:rgba(224,161,58,.6);border-left-color:var(--o);background:rgba(224,161,58,.09); }
+.perm-ask.danger .perm-head .woy-lbl { color:var(--o); }
+.dg-rules { display:flex;flex-direction:column;gap:4px;margin:2px 0 8px; }
+.dg-rule { display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--t2);line-height:1.4; }
+.dg-rule input { margin-top:2px; }
+.dg-rule small { color:var(--t3);font-size:10px; }
 .perm-more { font:400 9px var(--font2);color:var(--t3); }
 .perm-sum { margin-top:3px;font:400 11px var(--font2);color:var(--t);word-break:break-all;
   display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden; }
@@ -10561,7 +13457,8 @@ button.le-tag { cursor:pointer; }
   color:var(--t);background:rgba(0,0,0,.16);padding:8px 10px;border-radius:6px; }
 body.light .reply-full { background:rgba(0,0,0,.05); }
 .td-head { position:relative; }
-.td-launch { position:absolute;right:0;top:4px;font-size:10px;padding:4px 12px; }
+.td-launch { position:absolute;right:0;top:4px;display:flex;gap:6px; }
+.td-launch .adp-btn { font-size:10px;padding:4px 12px; }
 .ln-box { max-width:620px; }
 .ln-form { display:flex;flex-direction:column;gap:6px; }
 .ln-lbl { font:700 9px var(--font2);letter-spacing:.07em;text-transform:uppercase;color:var(--t3);margin-top:4px; }
@@ -10641,6 +13538,37 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .ln-go { border-color:var(--c);color:var(--c);padding:6px 16px; }
 .ln-go:disabled { opacity:.5; }
 .ln-note { font-size:10px;color:var(--t3);line-height:1.5;margin-top:4px; }
+.ab-link { margin-left:6px; }
+.ab-box { max-width:760px; }
+.ab-budget { width:80px !important; }
+.ab-est { font-size:11px;color:var(--t2);min-height:15px; }
+.ab-est b { color:var(--t); }
+.ab-warn { color:var(--o); }
+.ab-prompt { font-size:12px;color:var(--t);white-space:pre-wrap;max-height:90px;overflow:auto;padding:8px 10px;border-left:2px solid var(--c);background:rgba(var(--c-rgb),.05); }
+.ab-meta { font:400 10px var(--font2);color:var(--t3);margin:6px 0 10px;word-break:break-all; }
+.ab-tbl { width:100%;border-collapse:collapse;font-size:12px; }
+.ab-tbl th, .ab-tbl td { text-align:left;padding:6px 8px;border-bottom:1px solid rgba(var(--c-rgb),.1);vertical-align:top; }
+.ab-tbl tbody th { font:700 9px var(--font2);letter-spacing:.07em;text-transform:uppercase;color:var(--t3);width:110px; }
+.ab-tbl td { font-family:var(--font2); }
+.ab-tbl td .adp-btn { margin:0 4px 4px 0; }
+.ab-lbl { display:inline-block;min-width:18px;text-align:center;border:1px solid var(--c);color:var(--c);border-radius:4px;font:700 10px var(--font2); }
+.ab-st { font:700 10px var(--font2);letter-spacing:.06em;text-transform:uppercase; }
+.ab-running, .ab-queued { color:var(--c); }
+.ab-done { color:var(--g); }
+.ab-error { color:var(--r); }
+.ab-stopped { color:var(--o); }
+.ab-err { font-size:10px;color:var(--t3);margin-top:3px;white-space:pre-wrap;max-height:60px;overflow:auto; }
+.ab-win, .ab-kept { font:700 9px var(--font2);letter-spacing:.05em;text-transform:uppercase;color:var(--g);border:1px solid currentColor;border-radius:3px;padding:0 4px;margin-left:4px; }
+.ab-sub { color:var(--t3);font-size:10px; }
+.ab-keep { border-color:var(--g);color:var(--g); }
+.ab-final { white-space:pre-wrap;font-size:12px;line-height:1.55;color:var(--t); }
+.ab-list { display:flex;flex-direction:column;gap:4px;margin-top:4px; }
+.ab-item { display:flex;flex-direction:column;gap:2px;text-align:left;cursor:pointer;background:rgba(var(--c-rgb),.04);border:1px solid rgba(var(--c-rgb),.12);border-radius:6px;padding:6px 10px;color:var(--t); }
+.ab-item:hover { border-color:var(--c); }
+.ab-it-p { font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.ab-it-m { font:400 10px var(--font2);color:var(--t3); }
+.ab-res + .ln-lbl { margin-top:14px; }
+@media (max-width:600px){ .ab-tbl tbody th { width:auto; } .ab-tbl { font-size:11px; } .ab-tbl th, .ab-tbl td { padding:5px 4px; } }
 @media (max-width: 600px) { .td-launch { position:static;margin-top:8px; } }
 .adv-tips { display:flex;flex-direction:column;gap:8px;margin:10px 0 14px; }
 .adv-tip { border:1px solid rgba(var(--c-rgb),.18);border-left:3px solid var(--c);border-radius:0 8px 8px 0;padding:8px 11px;background:rgba(var(--c-rgb),.04); }
@@ -10667,6 +13595,76 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .fm-ex { font:400 10px var(--font2);color:var(--t3);margin-top:2px;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
 .fm-cols { display:grid;grid-template-columns:1fr 1fr;gap:14px; }
 @media (max-width:760px) { .fm-cols { grid-template-columns:1fr; } .fm-ex { max-width:200px; } }
+.mem-wrap { flex-shrink:0;display:flex;flex-direction:column;gap:10px; }
+.hist-kpi.bad .hk-val { color:var(--r); }
+.hist-kpi.warn .hk-val { color:var(--o); }
+.mem-split { display:grid;grid-template-columns:minmax(200px,280px) minmax(0,1fr);gap:12px;align-items:start; }
+.mem-list { border:1px solid var(--bay-edge);border-radius:6px;background:var(--bay);padding:6px 0;max-height:70vh;overflow-y:auto; }
+.mem-grp { font:700 9px var(--font2);letter-spacing:.1em;text-transform:uppercase;color:var(--t3);padding:9px 12px 3px; }
+.mem-file { display:flex;align-items:center;gap:6px;padding:5px 12px;cursor:pointer;font-size:12px;border-left:2px solid transparent; }
+.mem-file:hover { background:rgba(var(--c-rgb),.06); }
+.mem-file.active { background:rgba(var(--c-rgb),.12);border-left-color:var(--c); }
+.mem-fname { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.mem-ftok { font:400 10px var(--font2);color:var(--t3); }
+.mem-badge { font:700 9px var(--font2);padding:1px 5px;border-radius:8px;color:#fff; }
+.mem-badge.err { background:rgba(239,106,87,.85); }
+.mem-badge.warn { background:rgba(224,161,58,.85);color:#1b1b1b; }
+.mem-ed { border:1px solid var(--bay-edge);border-radius:6px;background:var(--bay);padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0; }
+.mem-head { display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap; }
+.mem-head b { font-size:14px; }
+.mem-kind { margin-left:8px;font:400 10px var(--font2);color:var(--t3); }
+.mem-path { display:block;font:400 10px var(--font2);color:var(--t3);word-break:break-all;margin-top:2px; }
+.mem-actions { display:flex;align-items:center;gap:6px;flex-wrap:wrap; }
+.mem-actions .adp-btn[disabled] { opacity:.4;cursor:default; }
+.mem-live,.mem-ro { font:400 10px var(--font2);color:var(--t3); }
+.mem-msg { font-size:12px;padding:6px 10px;border-radius:5px;background:rgba(var(--c-rgb),.08);border:1px solid rgba(var(--c-rgb),.25); }
+.mem-issues { display:flex;flex-direction:column;gap:2px;max-height:180px;overflow-y:auto; }
+.mem-issue { display:flex;gap:8px;align-items:baseline;font-size:12px;padding:3px 6px;border-radius:4px;line-height:1.4; }
+.mem-issue[onclick] { cursor:pointer; }
+.mem-issue[onclick]:hover { background:rgba(var(--c-rgb),.07); }
+.mem-sev { font:700 10px var(--font2);width:14px;text-align:center;flex-shrink:0; }
+.mem-issue.error .mem-sev { color:var(--r); }
+.mem-issue.warn .mem-sev { color:var(--o); }
+.mem-issue.info .mem-sev,.mem-issue.ok .mem-sev { color:var(--t3); }
+.mem-issue.ok .mem-sev { color:rgb(76,194,133); }
+.mem-ln { font:400 10px var(--font2);color:var(--t3);flex-shrink:0;min-width:34px; }
+.mem-text { width:100%;min-height:52vh;resize:vertical;box-sizing:border-box;font:12px/1.55 var(--font2);color:var(--t);background:rgba(0,0,0,.18);border:1px solid var(--bay-edge);border-radius:5px;padding:10px;white-space:pre;overflow:auto;tab-size:2; }
+.mem-text:focus { outline:none;border-color:rgba(var(--c-rgb),.5); }
+body.light .mem-text { background:#fff; }
+@media (max-width:900px){ .mem-split { grid-template-columns:1fr; } .mem-list { max-height:240px; } }
+.rs-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px; }
+.rs-card { border:1px solid var(--bay-edge);border-left:3px solid rgba(var(--c-rgb),.6);border-radius:0 6px 6px 0;padding:9px 11px;display:flex;flex-direction:column;gap:4px;min-width:0;background:rgba(var(--c-rgb),.03); }
+.rs-card.is-open { border-left-color:rgb(76,194,133); }
+.rs-name { font-weight:700;font-size:13px; }
+.rs-folder { margin-left:6px;font:400 9px var(--font2);color:var(--t3);text-transform:uppercase;letter-spacing:.08em; }
+.rs-hook { font-size:11px;color:var(--t2);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical; }
+.rs-meta { font:400 10px var(--font2);color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.rs-prompt { font:400 11px var(--font2);color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.rs-btns { display:flex;gap:5px;flex-wrap:wrap;margin-top:3px; }
+.rs-go { font-weight:700; }
+.rs-go.running { color:rgb(76,194,133);border-color:rgba(76,194,133,.5); }
+.rs-sub { opacity:.8; }
+.ln-wt-note { flex-basis:100%;font-size:10px;color:var(--t3);line-height:1.5; }
+.wt-list { display:flex;flex-direction:column;gap:10px; }
+.wt-group { border:1px solid var(--bay-edge);border-left:3px solid rgba(var(--c-rgb),.6);border-radius:0 6px 6px 0;padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-width:0;background:rgba(var(--c-rgb),.03); }
+.wt-ghead { display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font:400 10px var(--font2);color:var(--t3); }
+.wt-repo { font:700 13px var(--font);color:var(--t); }
+.wt-model { text-transform:uppercase;letter-spacing:.08em; }
+.wt-ago { margin-left:auto; }
+.wt-prompt { font:400 11px var(--font2);color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.wt-row { border-top:1px dashed var(--bay-edge);padding-top:6px;display:flex;flex-direction:column;gap:3px;min-width:0; }
+.wt-main { display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0; }
+.wt-branch { font:600 12px var(--font2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0; }
+.wt-st { font:700 9px var(--font2);letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:3px;border:1px solid currentColor; }
+.wt-st.run { color:rgb(var(--c-rgb)); } .wt-st.wait { color:rgb(224,161,58); } .wt-st.done { color:rgb(76,194,133); }
+.wt-st.idle { color:var(--t3); } .wt-st.gone { color:rgb(239,106,87); }
+.wt-facts { font:400 11px var(--font2);color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.wt-add { color:rgb(76,194,133); } .wt-del { color:rgb(239,106,87); } .wt-dirty { color:rgb(224,161,58); } .wt-none { color:var(--t3); }
+.wt-btns { display:flex;gap:5px;flex-wrap:wrap; }
+.wt-btn { padding:3px 9px;font-size:10px; }
+.wt-btn[disabled] { opacity:.4;cursor:not-allowed; }
+.wt-discard { color:rgb(239,106,87); }
+@media (max-width:600px){ .wt-facts { white-space:normal; } .wt-ago { margin-left:0; } }
 .ctx-sec { margin:14px 0 4px;font:700 9px var(--font2);letter-spacing:.12em;text-transform:uppercase;color:var(--t3); }
 .ctx-unused { color:var(--o); }
 .pa-rule { font:700 11px var(--font2);color:var(--t);word-break:break-all; }
@@ -10691,6 +13689,15 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .cl-card { overflow-x:auto; }
 .cl-assign { font:400 10px var(--font2);padding:2px 4px;border-radius:5px;border:1px solid rgba(var(--c-rgb),.2);background:transparent;color:var(--t2);max-width:130px; }
 .cl-none, .cl-help { font-size:11px;color:var(--t3);margin:2px 0 8px; }
+.wl-custom { display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--t2); }
+.wl-custom label { display:inline-flex;align-items:center;gap:6px; }
+.wl-modes { border:none;margin:0; }
+.wl-sum .cl-actions a { text-decoration:none; }
+.wl-text { white-space:pre-wrap;font-size:12px;line-height:1.55;color:var(--t);margin:4px 0 6px;overflow-wrap:anywhere; }
+.wl-commits { margin:0 0 8px;padding-left:18px;font-size:11px;color:var(--t2); }
+.wl-commits li { margin:2px 0;overflow-wrap:anywhere; }
+.wl-commits .cc-repo { display:inline;margin-left:6px; }
+@media (max-width:600px){ .wl-sum .cl-actions { margin-left:0;flex-wrap:wrap; } }
 .cl-row { display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap; }
 .cl-in-name { flex:0 1 180px;min-width:120px; }
 .cl-in-match { flex:1 1 220px;min-width:140px; }
@@ -10703,6 +13710,24 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .chg-btn:hover { background:rgba(var(--c-rgb),.08); }
 .td-btns { display:flex;flex-direction:column;gap:5px;align-items:flex-end; }
 .chg-box { max-width:760px; }
+.ask-box { max-width:720px; }
+.ask-form { display:flex;gap:8px;margin-bottom:10px; }
+.ask-input { flex:1;min-width:0;background:rgba(var(--c-rgb),.05);border:1px solid rgba(var(--c-rgb),.3);border-radius:6px;
+  color:var(--t);font:400 13px var(--font);padding:8px 10px; }
+.ask-input:focus { outline:none;border-color:var(--c); }
+.ask-answer { font-size:13px;line-height:1.55;color:var(--t);padding:10px 12px;border-left:2px solid rgba(var(--c-rgb),.5);
+  background:rgba(var(--c-rgb),.05);border-radius:0 6px 6px 0;margin-bottom:10px; }
+.ask-answer ul { margin:0;padding-left:18px; }
+.ask-answer p { margin:0 0 6px; }
+.ask-meta { font:400 10px var(--font2);color:var(--t3);margin-top:6px; }
+.ask-ref { background:none;border:none;color:var(--c);cursor:pointer;font:700 11px var(--font2);padding:0;text-decoration:underline dotted; }
+.ask-note { font-size:11px;color:var(--t3);padding:4px 2px; }
+.ask-note.err { color:var(--r); }
+.ask-hint { display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px; }
+.ask-chip { background:none;border:1px solid rgba(var(--c-rgb),.25);color:var(--t2);border-radius:12px;padding:3px 10px;cursor:pointer;font:400 11px var(--font); }
+.ask-chip:hover { color:var(--c);border-color:var(--c); }
+.ask-h-title { font:700 9px var(--font2);letter-spacing:.08em;text-transform:uppercase;color:var(--t3);margin:12px 0 4px; }
+@media (max-width:600px){ .ask-form { flex-direction:column; } }
 .diff-box .diff-body.chg-body { white-space:normal; }
 .chg-repo { margin-bottom:12px; }
 .chg-repo-head { display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:4px;font-size:12px;color:var(--t); }
@@ -10717,6 +13742,21 @@ body.light .rp-more pre { background:rgba(0,0,0,.05); }
 .chg-rel { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
 .chg-num { flex-shrink:0; }
 .chg-empty, .chg-foot { font-size:11px;color:var(--t3);padding:8px 2px; }
+.chg-row { display:flex;align-items:center;gap:4px;min-width:0; }
+.chg-row .chg-file { flex:1;min-width:0; }
+.chg-row.seen .chg-rel { opacity:.6; }
+.chg-row.disc { padding:5px 4px;gap:8px;font:400 11px var(--font2);color:var(--t2);border-bottom:1px solid rgba(var(--c-rgb),.08); }
+.chg-act { flex-shrink:0;background:none;border:1px solid rgba(var(--c-rgb),.22);color:var(--t2);cursor:pointer;font:700 10px var(--font2);border-radius:4px;padding:3px 7px; }
+.chg-act:hover { background:rgba(var(--c-rgb),.08);color:var(--t); }
+.chg-seen.on { color:var(--g);border-color:rgba(76,194,133,.5);background:rgba(76,194,133,.1); }
+.chg-disc:hover { color:var(--r);border-color:rgba(239,106,87,.5); }
+.chg-bar { display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;font:400 11px var(--font2);color:var(--t2); }
+.chg-warn { color:var(--o);flex-basis:100%; }
+.chg-progress { flex:1; }
+.chg-discards { margin-top:10px; }
+.chg-sec { font:700 9px var(--font2);letter-spacing:.12em;text-transform:uppercase;color:var(--t3);margin:6px 0 2px; }
+.chg-when { flex-shrink:0;color:var(--t3);font-size:10px; }
+@media (max-width:600px){ .chg-act { padding:5px 8px; } .chg-row .chg-num { display:none; } }
 .td-away { margin-top:6px;padding:6px 9px;border-left:2px solid rgba(var(--c-rgb),.45);background:rgba(var(--c-rgb),.05);border-radius:0 6px 6px 0; }
 .td-away-head { display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px;font:400 10px var(--font2);color:var(--t2); }
 .td-away-lbl { font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:9px;color:var(--c); }
@@ -10747,6 +13787,7 @@ div.td-recap { padding:0; }
 .ctx-high .ctx-val { color:var(--r); }
 .ctx-cache { color:var(--t3);padding-left:7px;border-left:1px solid rgba(var(--c-rgb),.25); }
 .ctx-cache.cold { color:var(--o); }
+.ctx-cache.soon { color:var(--o);font-weight:600; }
 .sbay > .ctx-meter { margin:-2px 14px 8px; }
 @media (max-width: 600px) { .woy-item { max-width:100%; } }
 .cache-bar { flex-shrink:0;display:flex;gap:2px;height:14px;border-radius:4px;overflow:hidden;margin:4px 0 6px; }
@@ -10798,6 +13839,35 @@ div.td-recap { padding:0; }
 .td-c-cost { font-family:var(--font2);text-align:right;color:var(--t2);font-size:11px; }
 @media (max-width: 900px) { .td-grid { grid-template-columns:minmax(0,1fr); } }
 @media (max-width: 600px) { .td-head h2 { font-size:21px; } .td-commit { grid-template-columns:52px minmax(0,1fr) 50px; } .td-c-time { display:none; } }
+#inbox-area { flex:1;overflow-y:auto;padding:6px 4px 24px;min-height:0; }
+#inbox-area > * { max-width:820px;margin-left:auto;margin-right:auto; }
+.ib-head { display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:12px; }
+.ib-title { font:600 26px var(--font3);letter-spacing:.02em;color:var(--t);margin:0; }
+.ib-sub { font:400 12px var(--font2);color:var(--t3); }
+.ib-list { display:flex;flex-direction:column;gap:10px; }
+.ib-item { border-left:3px solid var(--o) !important;display:flex;flex-direction:column;gap:7px; }
+.ib-item.ib-permission, .ib-item.ib-budget { border-left-color:var(--r) !important; }
+.ib-item.ib-question { border-left-color:var(--o) !important; }
+.ib-item.ib-cache { border-left-color:rgb(224,161,58) !important; }
+.ib-item.ib-loop { border-left-color:rgba(var(--c-rgb),.7) !important; }
+.ib-item.ib-waiting { border-left-color:rgba(var(--c-rgb),.35) !important; }
+.ib-row { display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0; }
+.ib-kind { font:700 9px var(--font2);letter-spacing:.1em;text-transform:uppercase;color:var(--o); }
+.ib-permission .ib-kind, .ib-budget .ib-kind { color:var(--r); }
+.ib-loop .ib-kind, .ib-waiting .ib-kind { color:var(--c); }
+.ib-name { font-weight:700;font-size:14px;color:var(--t);min-width:0;overflow-wrap:anywhere; }
+.ib-when { margin-left:auto;font:400 10px var(--font2);color:var(--t3); }
+.ib-text { font-size:13px;color:var(--t2);line-height:1.45;overflow-wrap:anywhere; }
+.ib-cache { font-size:12px;color:var(--t2);line-height:1.45; }
+.ib-btns { display:flex;gap:6px;flex-wrap:wrap; }
+.ib-btn { font-size:10px;padding:5px 12px; }
+.ib-empty { text-align:center;padding:48px 16px;color:var(--t2);font-size:14px; }
+.ib-empty-mark { font-size:30px;color:var(--g);margin-bottom:6px; }
+.ib-empty-sub { font-size:12px;color:var(--t3);margin-top:6px;max-width:420px;margin-left:auto;margin-right:auto; }
+.mnav-badge { position:absolute;top:2px;right:calc(50% - 20px);min-width:14px;padding:0 4px;border-radius:7px;background:var(--o);color:#111;font:700 9px/14px var(--font2);text-align:center; }
+.mnav-badge:empty { display:none; }
+#mobile-nav .mnav-btn { position:relative; }
+@media (max-width: 600px) { .ib-title { font-size:21px; } .ib-btn, #inbox-area .perm-btn { padding:8px 14px;font-size:11px; } .ib-when { margin-left:0;width:100%; } }
 
 .cc-ins { color:var(--g); }
 .cc-del { color:var(--r); }
@@ -11102,6 +14172,14 @@ body.light .card-cmp-btn { border-color:rgba(0,0,0,.08);background:rgba(0,0,0,.0
 .palette-item .pi-sub { font-size:9px;color:var(--t3);margin-left:auto;letter-spacing:.04em;white-space:nowrap; }
 .palette-item.active { background:rgba(var(--c-rgb),.1); }
 .palette-empty { padding:14px;text-align:center;font-size:10px;color:var(--t3);font-family:var(--font2); }
+.palette-item .pi-ico { width:18px;text-align:center;flex-shrink:0;font-size:12px;opacity:.8; }
+.palette-item .pi-label { min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.palette-item .pi-sub { max-width:45%;overflow:hidden;text-overflow:ellipsis; }
+.palette-item .pi-recent { color:rgba(var(--c-rgb),.8);text-transform:uppercase;letter-spacing:.08em; }
+.palette-item.k-permission .pi-label { color:var(--o); }
+.palette-item.k-danger .pi-label { color:rgb(239,106,87); }
+body.light .palette-item.k-danger .pi-label { color:#b3361f; }
+@media (max-width:600px){ .palette-overlay { padding-top:6vh; } .palette-item .pi-sub { display:none; } }
 .kb-panel { background:linear-gradient(145deg,rgba(34,48,45,.97) 0%,rgba(34,48,45,.99) 100%);border:1px solid rgba(var(--c-rgb),.22);border-top:1px solid rgba(255,255,255,.12);border-radius:18px;padding:20px 24px;max-width:700px;width:92%;box-shadow:0 28px 80px rgba(0,0,0,.75),inset 0 1px 0 rgba(255,255,255,.07); }
 .kb-hdr { display:flex;align-items:center;margin-bottom:14px;border-bottom:1px solid rgba(255,255,255,.06);padding-bottom:12px; }
 .kb-hdr-title { flex:1;font-family:var(--font2);font-size:11px;letter-spacing:.2em;color:var(--c);font-weight:700; }
@@ -11148,6 +14226,20 @@ body.light .notif-entry:hover { background:rgba(0,0,0,.025); }
 .settings-body { flex:1;overflow-y:auto;padding:14px 18px 20px;display:flex;flex-direction:column;gap:10px; }
 .settings-section { font-family:var(--font2);font-size:9px;font-weight:700;letter-spacing:.14em;color:var(--c);padding:8px 0 4px;border-bottom:1px solid rgba(var(--c-rgb),.12);margin-top:4px; }
 .settings-row { display:flex;align-items:center;gap:10px;padding:4px 0; }
+.nc-table { display:grid;grid-template-columns:minmax(0,1fr) repeat(3,52px) 44px;gap:0 4px;align-items:center;font-size:11px; }
+.nc-table .nc-h { font-family:var(--font2);font-size:8px;letter-spacing:.12em;color:var(--t3);text-align:center;padding:4px 0; }
+.nc-table .nc-g { grid-column:1/-1;font-family:var(--font2);font-size:9px;letter-spacing:.1em;color:var(--c);padding:8px 0 2px; }
+.nc-table .nc-l { color:var(--t2);padding:3px 0;min-width:0; }
+.nc-table .nc-l small { color:var(--t3);font-size:9px;margin-left:4px; }
+.nc-table .nc-c { text-align:center; }
+.nc-table .nc-na { color:var(--t3);opacity:.5; }
+.nc-table .nc-c input:disabled { opacity:.35; }
+.nc-log { display:flex;flex-direction:column;gap:2px;max-height:220px;overflow-y:auto;font-size:10px; }
+.nc-log .nc-e { display:flex;gap:8px;align-items:baseline;padding:2px 0;border-bottom:1px solid rgba(var(--c-rgb),.06);min-width:0; }
+.nc-log .nc-e .nc-t { color:var(--t3);flex:0 0 58px;font-family:var(--font2);font-size:9px; }
+.nc-log .nc-e .nc-m { color:var(--t2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.nc-log .nc-e .nc-m span { color:var(--t3); }
+@media (max-width:520px){ .nc-table { grid-template-columns:minmax(0,1fr) repeat(3,40px) 38px; } }
 .settings-lbl { font-family:var(--font2);font-size:10px;color:var(--t2);min-width:140px;flex-shrink:0; }
 .settings-input { background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:7px;color:var(--t1);font-family:var(--font2);font-size:11px;padding:5px 9px;outline:none;transition:border-color .2s;width:80px; }
 .settings-input:focus { border-color:rgba(var(--c-rgb),.4); }
@@ -11421,6 +14513,595 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
 @media (max-width: 480px) {
   .top-stat:nth-child(n+5) { display: none; } /* keep only Run + Done on very small screens */
 }
+
+/* ══ COMMAND CENTER THEME ═══════════════════════════════════════════════
+   Deep navy console, glass panels with a cyan edge glow, a left sidebar
+   for the views, and the COMMAND home view. Tokens first, so every older
+   view picks the palette up; body.light keeps its own day-shift tokens. */
+:root {
+  --bg: #050c18;
+  --console: #050c18;
+  --bay: rgba(11,29,50,.62);
+  --bay-edge: rgba(64,190,255,.22);
+  --groove: rgba(6,16,30,.88);
+  --paper: #0c2036;
+  --paper-edge: rgba(64,190,255,.3);
+  --paper-rule: rgba(64,190,255,.12);
+  --paper-ink: #dff1ff;
+  --paper-ink-2: #8db4d1;
+  --band-run: #1e88d8;
+  --band-done: #16a37a;
+  --band-err: #e0525a;
+  --band-wait: #e0a028;
+  --c: #3fd0ff;
+  --c2: #1e88c8;
+  --c-rgb: 63,208,255;
+  --c2-rgb: 30,136,200;
+  --c3: rgba(30,136,200,.35);
+  --g: #34e0a1;
+  --r: #ff6b7a;
+  --o: #ffbe3d;
+  --t: #e4f3ff;
+  --t2: #9cc2de;
+  --t3: #6f95b2;
+  --border: rgba(64,190,255,.14);
+  --glass: rgba(10,26,46,.62);
+  --specular: rgba(140,220,255,.14);
+  --font3: 'Rajdhani', 'Barlow Condensed', 'Arial Narrow', sans-serif;
+  --font4: 'Orbitron', 'Rajdhani', sans-serif;
+}
+body {
+  background:
+    radial-gradient(1100px 560px at 58% -12%, rgba(30,120,230,.20), transparent 62%),
+    radial-gradient(800px 480px at 102% 104%, rgba(0,170,255,.09), transparent 60%),
+    radial-gradient(700px 420px at -6% 70%, rgba(40,90,200,.08), transparent 60%),
+    var(--console);
+}
+body::before {
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image: linear-gradient(rgba(64,190,255,.035) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(64,190,255,.035) 1px, transparent 1px);
+  background-size: 46px 46px;
+  -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 80%);
+          mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 80%);
+}
+body.light { background: var(--console); }
+body.light::before { content:none; }
+
+/* ── layout: sidebar | topbar / main | right panel ── */
+.root { grid-template-columns: 228px minmax(0,1fr) 290px; grid-template-rows: 60px 1fr; }
+.root.panel-collapsed { grid-template-columns: 228px minmax(0,1fr) 0; }
+.sidebar { grid-column:1; grid-row:1 / span 2; }
+.topbar  { grid-column:2 / -1; grid-row:1; }
+.main    { grid-column:2; grid-row:2; }
+.right   { grid-column:3; grid-row:2; }
+
+/* ── sidebar ── */
+.sidebar {
+  display:flex; flex-direction:column; gap:10px; min-height:0; overflow-y:auto; overflow-x:hidden;
+  padding:12px 12px 14px; z-index:2;
+  background: linear-gradient(180deg, rgba(8,22,42,.94), rgba(5,13,27,.94));
+  border-right:1px solid rgba(var(--c-rgb),.16);
+  box-shadow: inset -1px 0 0 rgba(140,220,255,.04), 8px 0 30px rgba(0,0,0,.25);
+  scrollbar-width:thin;
+}
+.sidebar .logo-wrap {
+  margin:0; padding:4px 4px 12px; gap:10px;
+  border-bottom:1px solid rgba(var(--c-rgb),.14);
+}
+.sidebar .logo-mark { width:44px; height:44px; filter: drop-shadow(0 0 8px rgba(var(--c-rgb),.45)); }
+.sidebar .logo-text .t1 { font:800 21px/1 var(--font4); letter-spacing:.34em; color:#ecf9ff; text-shadow:0 0 14px rgba(var(--c-rgb),.5); }
+.sidebar .logo-text .t2 { font:600 7.5px var(--font4); letter-spacing:.2em; color:#7cc8ec; margin-top:5px; white-space:normal; line-height:1.4; }
+.sb-nav { display:flex; flex-direction:column; gap:3px; }
+.sidebar .vtbtn {
+  display:flex; align-items:center; gap:12px; width:100%; padding:8px 11px; border-radius:9px;
+  border:1px solid transparent; background:transparent; color:#b3d3ea;
+  font:500 13.5px var(--font); letter-spacing:.01em; text-transform:none; text-align:left;
+  cursor:pointer; transition:background .15s, color .15s, border-color .15s;
+}
+.sidebar .vtbtn svg { width:18px; height:18px; stroke:currentColor; fill:none; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; flex-shrink:0; opacity:.9; }
+.sidebar .vtbtn:hover:not(.active) { background:rgba(var(--c-rgb),.07); color:#eaf6ff; }
+.sidebar .vtbtn.active {
+  color:#fff; border-color:rgba(var(--c-rgb),.38);
+  background:linear-gradient(90deg, rgba(var(--c-rgb),.2), rgba(var(--c-rgb),.04));
+  box-shadow: inset 0 0 18px rgba(var(--c-rgb),.08), 0 0 16px rgba(var(--c-rgb),.08);
+}
+.sidebar .vtbtn.active svg { color:var(--c); filter:drop-shadow(0 0 4px rgba(var(--c-rgb),.6)); }
+.sidebar .vtbtn.term-btn, .sidebar .vtbtn.term-btn.active { color:#b3d3ea; }
+.sidebar .vtbtn.term-btn.active { color:#fff; }
+.sb-badge { margin-left:auto; min-width:22px; padding:1px 7px; border-radius:10px; text-align:center;
+  font:700 10px/1.6 var(--font2); background:rgba(var(--c-rgb),.14); color:#9fe6ff; }
+.sb-badge:empty { display:none; }
+.sb-badge.warn { background:rgba(255,190,61,.16); color:var(--o); }
+.sb-sep { height:1px; background:rgba(var(--c-rgb),.1); margin:5px 6px; }
+.sb-attn { margin-top:auto; border:1px solid rgba(var(--c-rgb),.2); border-radius:12px; padding:10px 12px 12px;
+  background:linear-gradient(180deg, rgba(14,36,62,.55), rgba(8,22,40,.55)); display:flex; flex-direction:column; align-items:center; gap:8px; }
+.sb-attn-h { align-self:stretch; font:600 9px var(--font4); letter-spacing:.18em; color:#8fd6f5; }
+.sb-attn-ring { width:74px; height:74px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer;
+  border:1px solid rgba(var(--c-rgb),.45); background:radial-gradient(circle, rgba(var(--c-rgb),.28), rgba(var(--c-rgb),.05) 62%, transparent 70%);
+  box-shadow:0 0 0 6px rgba(var(--c-rgb),.06), 0 0 24px rgba(var(--c-rgb),.25); font:700 26px var(--font4); color:#dff6ff; }
+.sb-attn.warn .sb-attn-ring { border-color:rgba(255,190,61,.6); color:#ffe3a6;
+  background:radial-gradient(circle, rgba(255,190,61,.28), rgba(255,190,61,.05) 62%, transparent 70%);
+  box-shadow:0 0 0 6px rgba(255,190,61,.07), 0 0 26px rgba(255,190,61,.3); animation:ccPulse 2.2s ease-in-out infinite; }
+.sb-attn-txt { font-size:11.5px; color:var(--t2); text-align:center; line-height:1.4; }
+.sb-wave { display:flex; align-items:center; gap:2px; height:22px; }
+.sb-wave i { display:block; width:2px; border-radius:1px; background:rgba(var(--c-rgb),.75); }
+.sb-focus { display:flex; align-items:center; justify-content:center; gap:8px; padding:8px; border-radius:10px; cursor:pointer;
+  border:1px solid rgba(var(--c-rgb),.22); background:rgba(var(--c-rgb),.05); color:#bfe4f7; font:500 12.5px var(--font); }
+.sb-focus:hover { background:rgba(var(--c-rgb),.12); }
+.main.cc-mode #top-projects-bar, .main.cc-mode #waiting-strip { display:none !important; }
+@keyframes ccPulse { 0%,100% { transform:scale(1); } 50% { transform:scale(1.05); } }
+
+/* ── topbar ── */
+.topbar { position:relative; background:rgba(5,14,28,.55); border-bottom:1px solid rgba(var(--c-rgb),.13);
+  backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); padding:0 18px; }
+.topbar > .divider, .topbar > .top-stat:not(.rl-stat) { display:none; }
+.topbar > .rl-stat { margin-left:14px; }
+.topbar-right > .divider, #conn-status { display:none; }
+.cc-pill { display:flex; align-items:center; gap:10px; padding:6px 14px; border-radius:20px; white-space:nowrap;
+  border:1px solid rgba(var(--c-rgb),.25); background:rgba(var(--c-rgb),.06); font:600 10px var(--font4); letter-spacing:.14em; color:#cfeeff; }
+.cc-pill b { display:flex; align-items:center; gap:6px; font-weight:700; color:var(--g); }
+.cc-pill b i { width:7px; height:7px; border-radius:50%; background:currentColor; box-shadow:0 0 8px currentColor; }
+.cc-pill.attn b { color:var(--o); } .cc-pill.bad b { color:var(--r); } .cc-pill.off b { color:var(--t3); }
+.topbar .clock { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); text-align:center;
+  display:flex; flex-direction:column-reverse; align-items:center; pointer-events:none; }
+.topbar .clock-time { font:700 23px/1.05 var(--font4); color:#8fe6ff; letter-spacing:.06em; text-shadow:0 0 14px rgba(var(--c-rgb),.55); }
+.topbar .clock-date { font:500 11px var(--font); color:#a8cbe2; letter-spacing:.04em; margin:0 0 2px; }
+.cc-search { display:flex; align-items:center; gap:8px; width:230px; padding:7px 12px; border-radius:10px; cursor:pointer;
+  border:1px solid rgba(var(--c-rgb),.2); background:rgba(4,14,28,.6); color:var(--t3); font:400 12.5px var(--font); }
+.cc-search svg { width:15px; height:15px; stroke:currentColor; fill:none; stroke-width:2; }
+.cc-search kbd { margin-left:auto; font:500 9.5px var(--font2); color:var(--t3); border:1px solid rgba(var(--c-rgb),.2); border-radius:4px; padding:0 5px; }
+.cc-search:hover { border-color:rgba(var(--c-rgb),.4); color:var(--t2); }
+.topbar .btn-mute { width:36px; height:36px; border-radius:10px; border:1px solid rgba(var(--c-rgb),.2); background:rgba(var(--c-rgb),.05); }
+.topbar .btn-mute:hover { border-color:rgba(var(--c-rgb),.45); background:rgba(var(--c-rgb),.12); }
+
+/* ── panels everywhere get the glass + glow ── */
+.cc-panel, .td-card {
+  position:relative; border:1px solid rgba(var(--c-rgb),.2); border-radius:12px;
+  background:linear-gradient(180deg, rgba(14,36,62,.66), rgba(7,20,37,.66));
+  box-shadow: inset 0 1px 0 rgba(150,225,255,.07), 0 12px 30px rgba(0,0,0,.28);
+  backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+}
+.cc-panel::before { content:""; position:absolute; left:14px; right:14px; top:-1px; height:1px;
+  background:linear-gradient(90deg, transparent, rgba(var(--c-rgb),.65), transparent); }
+.td-card h3, .cc-h { font:600 11px var(--font4) !important; letter-spacing:.16em !important; text-transform:uppercase; color:#bfeaff !important; }
+
+/* ── COMMAND view ── */
+#command-area { flex:1; min-height:0; overflow-y:auto; padding:2px 2px 14px; }
+.cc-wrap { display:flex; flex-direction:column; gap:14px; max-width:1600px; margin:0 auto; }
+.cc-row { display:grid; gap:14px; min-width:0; }
+.cc-r1 { grid-template-columns: minmax(230px,1fr) minmax(0,2.05fr) minmax(260px,1.1fr); }
+.cc-r2 { grid-template-columns: minmax(0,1.55fr) minmax(0,1.05fr) minmax(220px,.8fr); }
+.cc-r3 { grid-template-columns: minmax(0,1fr) minmax(0,1fr) minmax(0,1.55fr); }
+.cc-panel { padding:12px 14px; min-width:0; display:flex; flex-direction:column; gap:10px; }
+.cc-hrow { display:flex; align-items:center; gap:8px; }
+.cc-hrow .cc-more { margin-left:auto; }
+.cc-more { font:500 11px var(--font); color:#7fd9ff; background:none; border:0; cursor:pointer; padding:0; }
+.cc-more:hover { color:#bff0ff; text-decoration:underline; }
+.cc-live { margin-left:auto; display:flex; align-items:center; gap:5px; font:700 9px var(--font4); letter-spacing:.12em; color:var(--g);
+  padding:2px 8px; border-radius:10px; border:1px solid rgba(52,224,161,.35); background:rgba(52,224,161,.08); }
+.cc-live i { width:6px; height:6px; border-radius:50%; background:var(--g); box-shadow:0 0 6px var(--g); animation:pulse 2s infinite; }
+.cc-ico { width:30px; height:30px; border-radius:8px; display:flex; align-items:center; justify-content:center; flex-shrink:0;
+  --ic:63,208,255; color:rgb(var(--ic)); background:rgba(var(--ic),.12); border:1px solid rgba(var(--ic),.32);
+  box-shadow:0 0 12px rgba(var(--ic),.12); }
+.cc-ico svg { width:16px; height:16px; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.ic-purple { --ic:167,139,250; } .ic-green { --ic:52,224,161; } .ic-amber { --ic:255,190,61; } .ic-red { --ic:255,107,122; } .ic-blue { --ic:96,165,250; } .ic-pink { --ic:244,114,182; }
+
+/* overview list */
+.cc-ov { display:flex; flex-direction:column; gap:6px; }
+.cc-ov-row { display:flex; align-items:center; gap:10px; padding:6px 9px; border-radius:9px;
+  border:1px solid rgba(var(--c-rgb),.14); background:rgba(var(--c-rgb),.035); }
+.cc-ov-row b { display:block; font:600 13px var(--font); color:#eef8ff; }
+.cc-ov-row small { display:block; font:500 11px var(--font); color:var(--t2); }
+.cc-ov-row small.ok { color:var(--g); } .cc-ov-row small.warn { color:var(--o); } .cc-ov-row small.bad { color:var(--r); } .cc-ov-row small.info { color:#7fd9ff; }
+
+/* hero */
+.cc-hero { padding:0; overflow:hidden; min-height:300px; align-items:center; justify-content:center; }
+.cc-hero canvas { position:absolute; inset:0; width:100%; height:100%; }
+.cc-hero-txt { position:relative; text-align:center; pointer-events:none; }
+.cc-hero-t1 { font:800 clamp(30px,3.3vw,52px)/1 var(--font4); letter-spacing:.42em; padding-left:.42em; color:#dcf7ff;
+  text-shadow:0 0 22px rgba(var(--c-rgb),.75), 0 0 2px rgba(255,255,255,.8); }
+.cc-hero-t2 { font:600 clamp(8.5px,.75vw,12px) var(--font4); letter-spacing:.32em; padding-left:.32em; color:#8fe0ff; margin-top:12px; }
+.cc-hero-t1 { animation:ccBreath 4.5s ease-in-out infinite; }
+@keyframes ccBreath { 0%,100% { text-shadow:0 0 22px rgba(var(--c-rgb),.75), 0 0 2px rgba(255,255,255,.8); }
+  50% { text-shadow:0 0 34px rgba(var(--c-rgb),.95), 0 0 6px rgba(255,255,255,.9); } }
+/* legend + numbers under the globe; the row is rebuilt only when a value changes, so the pop marks a change */
+.cc-hero-stats { position:absolute; left:0; right:0; bottom:12px; display:flex; justify-content:center; flex-wrap:wrap; gap:6px; padding:0 10px; pointer-events:none; }
+.cc-hs { display:inline-flex; align-items:center; gap:6px; padding:4px 11px 4px 9px; border-radius:20px; background:rgba(4,14,28,.72);
+  border:1px solid rgba(var(--c-rgb),.3); font:500 11px var(--font); color:#9cc7de; animation:ccPop .55s ease-out; }
+.cc-hs b { font:700 13px var(--font4); color:#e2f8ff; letter-spacing:.04em; }
+.cc-hs i { width:7px; height:7px; border-radius:50%; background:var(--c); box-shadow:0 0 7px var(--c); }
+.cc-hs.warn { border-color:rgba(255,190,61,.55); } .cc-hs.warn b { color:#ffd27a; } .cc-hs.warn i { background:#ffbe3d; box-shadow:0 0 7px #ffbe3d; }
+.cc-hs.ok i { background:#4cd68c; box-shadow:0 0 7px #4cd68c; } .cc-hs.dim i { background:rgba(76,214,140,.35); box-shadow:none; }
+.cc-hs.pink i { background:#ff7ab8; box-shadow:0 0 7px #ff7ab8; }
+@keyframes ccPop { 0% { transform:scale(.86); opacity:.35; } 60% { transform:scale(1.06); opacity:1; } 100% { transform:none; } }
+body.light .cc-hs { background:rgba(255,255,255,.85); color:var(--t2); border-color:rgba(var(--c-rgb),.25); }
+body.light .cc-hs b { color:#0d2a3d; } body.light .cc-hs.warn b { color:#8a5a00; }
+@media (prefers-reduced-motion: reduce) { .cc-hero-t1, .cc-hs { animation:none; } }
+@media (max-width: 768px) { .cc-hero { min-height:280px !important; } .cc-hero-stats { gap:4px; padding:0 6px; bottom:10px; flex-wrap:nowrap; }
+  .cc-hs { gap:4px; padding:3px 7px 3px 6px; font-size:9.5px; } .cc-hs b { font-size:11px; } .cc-hs i { width:6px; height:6px; } }
+
+/* feed */
+.cc-feed { display:flex; flex-direction:column; gap:6px; }
+.cc-fi { display:flex; align-items:center; gap:10px; padding:6px 8px; border-radius:9px; border:1px solid rgba(var(--c-rgb),.12); background:rgba(var(--c-rgb),.03); min-width:0; }
+.cc-fi .cc-ico { width:26px; height:26px; }
+.cc-fi-m { min-width:0; flex:1; }
+.cc-fi-m b { display:block; font:600 12.5px var(--font); color:#eaf6ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cc-fi-m small { display:block; font:400 10.5px var(--font); color:var(--t3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cc-tag { font:700 8.5px var(--font4); letter-spacing:.1em; padding:2px 6px; border-radius:4px; flex-shrink:0;
+  --ic:63,208,255; color:rgb(var(--ic)); background:rgba(var(--ic),.1); }
+.cc-fbtn { flex-shrink:0; font:600 10.5px var(--font); padding:3px 9px; border-radius:7px; cursor:pointer; color:#ffd9de;
+  border:1px solid rgba(255,107,122,.45); background:rgba(255,107,122,.12); }
+.cc-fbtn.amber { color:#ffe3a6; border-color:rgba(255,190,61,.45); background:rgba(255,190,61,.12); }
+.cc-empty { font-size:12px; color:var(--t3); padding:10px 4px; }
+
+/* active sessions */
+.cc-ags { display:grid; grid-template-columns:repeat(auto-fill, minmax(215px,1fr)); gap:10px; }
+.cc-ag { display:flex; align-items:center; gap:10px; padding:11px 12px; border-radius:10px; cursor:pointer; min-width:0; position:relative;
+  border:1px solid rgba(var(--c-rgb),.16); background:rgba(var(--c-rgb),.035); transition:border-color .15s, background .15s; }
+.cc-ag:hover { border-color:rgba(var(--c-rgb),.4); background:rgba(var(--c-rgb),.07); }
+.cc-ag-m { min-width:0; flex:1; }
+.cc-ag-m b { display:block; font:600 13px var(--font); color:#eef8ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cc-ag-m small { display:flex; align-items:center; gap:5px; font:500 11px var(--font); color:var(--t2); white-space:nowrap; }
+.cc-ag-m small i { width:6px; height:6px; border-radius:50%; background:currentColor; flex-shrink:0; }
+.cc-ag-m small.run { color:var(--g); } .cc-ag-m small.wait { color:var(--o); } .cc-ag-m small.err { color:var(--r); }
+.cc-wv { display:flex; align-items:center; gap:2px; height:20px; flex-shrink:0; }
+.cc-wv i { display:block; width:2px; border-radius:1px; background:currentColor; opacity:.85; }
+.cc-ag.run .cc-wv { color:var(--g); } .cc-ag.wait .cc-wv { color:var(--o); } .cc-ag.idle .cc-wv { color:var(--t3); }
+.cc-ag.run .cc-wv i { animation:ccWave 1.1s ease-in-out infinite; }
+@keyframes ccWave { 0%,100% { transform:scaleY(.35); } 50% { transform:scaleY(1); } }
+
+/* timeline */
+.cc-tl { display:flex; flex-direction:column; gap:2px; }
+.cc-tl-row { display:grid; grid-template-columns:44px 12px minmax(0,1fr) auto; align-items:center; gap:8px; padding:5px 2px; cursor:pointer; border-radius:6px; }
+.cc-tl-row:hover { background:rgba(var(--c-rgb),.05); }
+.cc-tl-t { font:500 11px var(--font2); color:var(--t3); }
+.cc-tl-d { width:8px; height:8px; border-radius:50%; background:var(--t3); justify-self:center; }
+.cc-tl-row.live .cc-tl-d { background:var(--c); box-shadow:0 0 8px var(--c); }
+.cc-tl-row.wait .cc-tl-d { background:var(--o); box-shadow:0 0 8px var(--o); }
+.cc-tl-row.done .cc-tl-d { background:var(--g); }
+.cc-tl-n { min-width:0; }
+.cc-tl-n b { display:block; font:600 12.5px var(--font); color:#e6f4ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cc-tl-bar { height:2px; margin-top:4px; border-radius:2px; background:rgba(var(--c-rgb),.12); overflow:hidden; }
+.cc-tl-bar span { display:block; height:100%; background:linear-gradient(90deg, rgba(var(--c-rgb),.4), var(--c)); }
+.cc-tl-s { font:500 11px var(--font); color:var(--t2); white-space:nowrap; }
+
+/* quick commands */
+.cc-qc { display:flex; flex-direction:column; gap:6px; }
+.cc-qb { display:flex; align-items:center; gap:10px; padding:7px 10px; border-radius:9px; cursor:pointer; text-align:left;
+  border:1px solid rgba(var(--c-rgb),.16); background:rgba(var(--c-rgb),.035); color:#dff1ff; font:500 12.5px var(--font); }
+.cc-qb svg { width:16px; height:16px; stroke:#7fd9ff; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; flex-shrink:0; }
+.cc-qb:hover { border-color:rgba(var(--c-rgb),.45); background:rgba(var(--c-rgb),.09); }
+
+/* rings */
+.cc-rings { display:flex; justify-content:space-around; align-items:center; gap:8px; flex:1; padding:4px 0; }
+.cc-ring { position:relative; width:96px; height:96px; }
+.cc-ring svg { width:100%; height:100%; transform:rotate(-90deg); }
+.cc-ring-v { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+.cc-ring-v b { font:700 17px var(--font4); color:#e8f8ff; }
+.cc-ring-v small { font:600 10px var(--font); color:var(--t2); letter-spacing:.04em; }
+.cc-sub { font-size:10.5px; color:var(--t3); text-align:center; }
+
+/* cache */
+.cc-cache { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; flex:1; }
+.cc-cache svg { width:100%; height:110px; }
+.cc-kv { display:flex; flex-direction:column; gap:7px; }
+.cc-kv div small { display:block; font:500 10.5px var(--font); color:var(--t3); }
+.cc-kv div b { display:block; font:700 18px var(--font4); color:#e8f8ff; }
+
+/* models */
+.cc-models { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr)); gap:8px; }
+.cc-mod { display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:9px; border:1px solid rgba(var(--c-rgb),.14); background:rgba(var(--c-rgb),.035); min-width:0; }
+.cc-mod .cc-ico { width:26px; height:26px; }
+.cc-mod b { display:block; font:600 12.5px var(--font); color:#eef8ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cc-mod small { display:block; font:500 10.5px var(--font); color:var(--g); white-space:nowrap; }
+.cc-mod small.dim { color:var(--t3); }
+
+/* footer */
+/* row, not the column every .cc-panel gets */
+.cc-foot { display:flex; flex-direction:row; align-items:center; gap:12px; padding:10px 14px; }
+.cc-fitem { display:flex; align-items:center; gap:9px; padding:6px 12px 6px 8px; border-radius:10px; border:1px solid rgba(var(--c-rgb),.14); background:rgba(var(--c-rgb),.035); min-width:0; }
+.cc-fitem .cc-ico { width:26px; height:26px; }
+.cc-fitem small { display:block; font:500 10px var(--font); color:var(--t3); }
+.cc-fitem b { display:block; font:600 12px var(--font); color:#e6f4ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:150px; }
+.cc-fline { flex:1; height:16px; min-width:20px; background:repeating-linear-gradient(90deg, rgba(var(--c-rgb),.45) 0 2px, transparent 2px 9px);
+  -webkit-mask-image:linear-gradient(90deg, transparent, #000 40%, #000 60%, transparent); mask-image:linear-gradient(90deg, transparent, #000 40%, #000 60%, transparent); opacity:.6; }
+.cc-launch { display:flex; flex-direction:column; align-items:center; gap:2px; padding:9px 34px; border-radius:30px; cursor:pointer; flex-shrink:0;
+  border:1px solid rgba(var(--c-rgb),.7); color:#e9fbff;
+  background:radial-gradient(ellipse at 50% 0%, rgba(var(--c-rgb),.45), rgba(10,60,110,.55) 70%);
+  box-shadow:0 0 0 4px rgba(var(--c-rgb),.08), 0 0 28px rgba(var(--c-rgb),.45), inset 0 0 18px rgba(var(--c-rgb),.25); }
+.cc-launch b { font:700 14px var(--font4); letter-spacing:.2em; }
+.cc-launch small { font:500 10.5px var(--font); color:#bdeeff; }
+.cc-launch:hover { box-shadow:0 0 0 5px rgba(var(--c-rgb),.12), 0 0 38px rgba(var(--c-rgb),.6), inset 0 0 20px rgba(var(--c-rgb),.3); }
+.cc-brief { display:flex; align-items:center; gap:8px; padding:8px 14px; border-radius:10px; cursor:pointer; flex-shrink:0;
+  border:1px solid rgba(var(--c-rgb),.3); background:rgba(var(--c-rgb),.07); color:#dff4ff; font:500 12.5px var(--font); }
+.cc-brief svg { width:15px; height:15px; stroke:#7fd9ff; fill:none; stroke-width:1.8; }
+
+/* ── agent strips: glass panels instead of the cream paper ──
+   The face already took the navy --paper tokens; the back (#f4edd4) and the
+   hard-coded dark inks were still the old paper colours, so the drill-down
+   was a cream block with unreadable text. Progress = one real bar in the
+   status colour (the 11 px tick boxes rendered as white squares). */
+.strip-card { border-radius:10px; overflow:hidden; border:1px solid rgba(var(--c-rgb),.18); box-shadow:0 8px 22px rgba(0,0,0,.22); }
+.strip-card.pinned { box-shadow:0 0 0 2px var(--o), 0 8px 22px rgba(0,0,0,.22); }
+.sc-band { border-radius:0; background:linear-gradient(180deg, var(--band), color-mix(in srgb, var(--band) 70%, #000)); }
+.sc-paper { border-radius:0; box-shadow:none; color:var(--paper-ink);
+  background:linear-gradient(180deg, rgba(14,36,62,.78), rgba(8,22,40,.78)); }
+.sc-callsign { color:#eef8ff; }
+.sc-pin { color:var(--o); }
+.sc-flag { border-color:rgba(var(--c-rgb),.3); color:var(--t2); }
+.sc-flag.warn { border-color:rgba(255,190,61,.5); color:var(--o); background:rgba(255,190,61,.1); }
+.sc-ticks { display:none; }
+.sc-prog { height:6px; border-radius:3px; background:rgba(var(--c-rgb),.12); margin:7px 0 6px; overflow:hidden; }
+.sc-prog .prog-fill { background:var(--band); border-radius:3px; box-shadow:0 0 8px color-mix(in srgb, var(--band) 60%, transparent); }
+.sc-cur { color:var(--t2); }
+.sc-cur.err { color:var(--r); }
+.sc-tool:hover { border-color:rgba(var(--c-rgb),.4); color:#fff; }
+.sc-tool.selected { background:rgba(var(--c-rgb),.22); color:#fff; }
+.sc-back { background:rgba(4,13,26,.6); border-top:1px solid var(--paper-rule); border-radius:0; color:var(--t2); }
+.sc-desc { color:var(--t2); }
+.sc-back .task, .sc-back .task.p, .sc-back .task.p .task-lbl, .sc-back .task .task-lbl { color:var(--t); }
+.sc-back .task.d, .sc-back .task.d .task-lbl { color:var(--t3); }
+.sc-back .task-chk { color:var(--c); }
+.sc-back .task.d .task-chk { color:var(--g); }
+.sc-back .fe:hover { background:rgba(var(--c-rgb),.06); }
+.sc-back .log-panel { background:rgba(var(--c-rgb),.04); }
+.sc-back .log-entry { color:var(--t2); border-bottom-color:rgba(var(--c-rgb),.06); }
+.sc-back [data-err] { background:rgba(255,107,122,.08) !important; border-color:rgba(255,107,122,.3) !important; }
+.sc-back [data-err] div { color:#ffb3ba !important; }
+.sc-back [data-err] button { color:#ffd0d5 !important; border-color:rgba(255,107,122,.45) !important; }
+body.light {
+  --paper:#ffffff; --paper-edge:rgba(0,0,0,.1); --paper-rule:rgba(0,0,0,.08);
+  --paper-ink:#1f2420; --paper-ink-2:#56615b;
+}
+body.light .strip-card { border-color:var(--bay-edge); box-shadow:0 1px 4px rgba(0,0,0,.06); }
+body.light .sc-paper { background:#fff; }
+body.light .sc-callsign { color:var(--t); }
+body.light .sc-back { background:#f6f9fb; }
+body.light .sc-tool:hover, body.light .sc-tool.selected { color:var(--t); }
+body.light .sc-back [data-err] div, body.light .sc-back [data-err] button { color:#9b2a1c !important; }
+
+/* topbar fit steps (set by _fitTopbar) */
+.topbar-right { min-width:0; }
+.topbar.tb-lbl .btn-reset-lbl { display:none; }
+.topbar.tb-lbl #btn-reset { padding-left:8px; padding-right:8px; }
+.topbar.tb-tight .cc-search { width:auto; padding:7px 9px; }
+.topbar.tb-tight .cc-search span, .topbar.tb-tight .cc-search kbd { display:none; }
+.topbar.tb-noclock .clock { display:none; }
+.topbar.tb-squeeze #btn-fs, .topbar.tb-squeeze #btn-notes, .topbar.tb-squeeze #btn-reset { display:none; }
+.topbar.tb-squeeze #infra-badge-lbl, .topbar.tb-squeeze #tunnel-badge-lbl, .topbar.tb-squeeze #selfupdate-badge-lbl { display:none; }
+.topbar.tb-squeeze .cc-pill { padding:6px 10px; }
+/* TOP TODAY ticker: its own row, on the KPI row's inset, never against it */
+#top-projects-bar { padding:2px 16px 10px !important; margin-top:2px; line-height:1.5; }
+@media (max-width: 768px) {
+  #top-projects-bar { flex-wrap:nowrap !important; overflow-x:auto; white-space:nowrap; scrollbar-width:none; padding:2px 10px 8px !important; }
+  #top-projects-bar::-webkit-scrollbar { display:none; }
+}
+
+/* ── session views (Timeline / Heat / Graph / Tree with no agents) ── */
+.sv-wrap { width:100%; max-width:1180px; margin:0 auto; padding:4px 2px 18px; display:flex; flex-direction:column; gap:12px; align-self:flex-start; }
+.sv-note { padding:9px 13px; border-radius:10px; border:1px solid rgba(var(--c-rgb),.22); background:rgba(var(--c-rgb),.06); font:500 12px var(--font); color:#9cc7de; }
+.sv-note b { color:#dcf7ff; font-weight:700; margin-right:2px; }
+.sv-legend { display:flex; flex-wrap:wrap; gap:14px; font:500 11px var(--font); color:var(--t3); }
+.sv-legend span { display:inline-flex; align-items:center; gap:6px; }
+.sv-legend i { width:10px; height:10px; border-radius:3px; background:var(--c); }
+.sv-legend i.wait { background:var(--o); } .sv-legend i.done { background:rgba(140,170,190,.45); } .sv-legend i.act { background:#bff0ff; box-shadow:0 0 5px var(--c); }
+.sv-scale i { width:60px; height:8px; border-radius:4px; background:linear-gradient(90deg, rgba(var(--c-rgb),.12), rgba(var(--c-rgb),1)); }
+/* timeline */
+.sv-tl { position:relative; padding:24px 0 4px; border-radius:12px; border:1px solid rgba(var(--c-rgb),.18);
+  background:linear-gradient(180deg, rgba(14,36,62,.55), rgba(7,20,37,.55)); }
+.sv-axis { position:absolute; left:232px; right:18px; top:6px; height:14px; font:500 10px var(--font2); color:var(--t3); }
+.sv-axis span { position:absolute; transform:translateX(-50%); white-space:nowrap; }
+.sv-axis span.now { color:var(--c); transform:translateX(-100%); }
+.sv-row { display:grid; grid-template-columns:208px 1fr; gap:12px; align-items:center; padding:7px 18px 7px 12px; cursor:pointer; border-top:1px solid rgba(var(--c-rgb),.07); }
+.sv-row:hover { background:rgba(var(--c-rgb),.06); }
+.sv-name { min-width:0; } .sv-name b, .sv-name small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sv-name b { font:600 12.5px var(--font); color:#e6f4ff; } .sv-name small { font:500 10.5px var(--font); color:var(--t3); margin-top:2px; }
+.sv-track { position:relative; height:22px; border-radius:6px; background:repeating-linear-gradient(90deg, rgba(var(--c-rgb),.05) 0 1px, transparent 1px 60px); }
+.sv-bar { position:absolute; top:3px; bottom:3px; border-radius:5px; background:rgba(var(--c-rgb),.22); border:1px solid rgba(var(--c-rgb),.6); box-shadow:0 0 10px rgba(var(--c-rgb),.25); }
+.sv-row.wait .sv-bar { background:rgba(255,190,61,.2); border-color:rgba(255,190,61,.75); box-shadow:0 0 10px rgba(255,190,61,.3); }
+.sv-row.done .sv-bar { background:rgba(140,170,190,.14); border-color:rgba(140,170,190,.4); box-shadow:none; }
+.sv-track i { position:absolute; top:7px; bottom:7px; min-width:2px; border-radius:2px; background:#bff0ff; box-shadow:0 0 4px var(--c); pointer-events:none; }
+.sv-row.wait .sv-track i { background:#ffe2a6; }
+/* heat */
+.sv-heat { display:grid; gap:3px; padding:14px; border-radius:12px; border:1px solid rgba(var(--c-rgb),.18); background:linear-gradient(180deg, rgba(14,36,62,.55), rgba(7,20,37,.55)); overflow-x:auto; }
+.sv-hcol { font:500 9.5px var(--font2); color:var(--t3); white-space:nowrap; overflow:visible; height:14px; }
+.sv-hname { font:600 11.5px var(--font); color:#dcefff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:8px; cursor:pointer; align-self:center; }
+.sv-hname.wait { color:#ffd27a; } .sv-hname.done { color:var(--t3); } .sv-hname:hover { color:var(--c); }
+.sv-cell { height:20px; border-radius:3px; background:rgba(var(--c-rgb),calc(.05 + var(--a)*.95)); box-shadow:0 0 calc(var(--a)*8px) rgba(var(--c-rgb),calc(var(--a)*.6)); }
+/* graph */
+.sv-graph { width:100%; max-height:560px; border-radius:12px; border:1px solid rgba(var(--c-rgb),.18); background:radial-gradient(ellipse at 50% 45%, rgba(var(--c-rgb),.09), rgba(7,20,37,.4) 70%); }
+.sv-node { cursor:pointer; } .sv-node:hover circle { fill-opacity:.4; }
+.sv-nval { font:700 13px var(--font4); fill:#e6f8ff; } .sv-nlab { font:600 12px var(--font); fill:#dcefff; } .sv-nsub { font:500 10px var(--font); fill:#7f9db3; }
+.sv-elab { font:600 10px var(--font); fill:#9fe6ff; }
+/* tree */
+.sv-tree { padding:14px 16px 16px; border-radius:12px; border:1px solid rgba(var(--c-rgb),.18); background:linear-gradient(180deg, rgba(14,36,62,.55), rgba(7,20,37,.55)); }
+.sv-troot { font:700 11px var(--font4); letter-spacing:.2em; color:var(--c); margin-bottom:10px; text-transform:uppercase; }
+.sv-tg { margin:0 0 12px 8px; padding-left:16px; border-left:1px solid rgba(var(--c-rgb),.3); }
+.sv-tgh { position:relative; margin-bottom:6px; } .sv-tgh::before { content:""; position:absolute; left:-16px; top:9px; width:12px; border-top:1px solid rgba(var(--c-rgb),.3); }
+.sv-tgh b { font:700 13px var(--font); color:#e6f4ff; margin-right:8px; } .sv-tgh small { font:500 11px var(--font); color:var(--t3); }
+.sv-tn { position:relative; display:flex; gap:10px; margin:0 0 6px 14px; padding:8px 12px; border-radius:9px; cursor:pointer; border:1px solid rgba(var(--c-rgb),.18); background:rgba(var(--c-rgb),.04); }
+.sv-tn::before { content:""; position:absolute; left:-15px; top:16px; width:14px; border-top:1px dashed rgba(var(--c-rgb),.3); }
+.sv-tn:hover { background:rgba(var(--c-rgb),.1); border-color:rgba(var(--c-rgb),.4); }
+.sv-tn > i { width:9px; height:9px; margin-top:4px; border-radius:50%; flex-shrink:0; background:var(--c); box-shadow:0 0 7px var(--c); }
+.sv-tn.wait > i { background:var(--o); box-shadow:0 0 7px var(--o); } .sv-tn.done > i { background:rgba(140,170,190,.5); box-shadow:none; }
+.sv-tn b { display:block; font:600 12.5px var(--font); color:#e6f4ff; } .sv-tn small { display:block; font:500 11px var(--font); color:var(--t3); margin-top:2px; }
+.sv-tn small.sv-tsub { font-size:10px; opacity:.7; }
+@media (max-width: 768px) {
+  .sv-row { grid-template-columns:1fr; gap:4px; padding:8px 10px; } .sv-axis { left:10px; right:10px; }
+}
+body.light .sv-note { background:rgba(var(--c-rgb),.07); color:var(--t2); } body.light .sv-note b { color:#0d2a3d; }
+body.light .sv-tl, body.light .sv-heat, body.light .sv-tree { background:#f6f9fb; border-color:rgba(0,0,0,.08); }
+body.light .sv-graph { background:#f6f9fb; border-color:rgba(0,0,0,.08); }
+body.light .sv-name b, body.light .sv-hname, body.light .sv-tgh b, body.light .sv-tn b { color:var(--t); }
+body.light .sv-track i { background:var(--c); box-shadow:none; }
+body.light .sv-nval { fill:#0d2a3d; } body.light .sv-nlab { fill:var(--t); } body.light .sv-elab { fill:var(--c); }
+body.light .sv-tn { background:#fff; border-color:rgba(0,0,0,.08); }
+
+/* ── right panel, in the command-center look (mirrors the sidebar) ── */
+#right-panel { background:linear-gradient(180deg, rgba(8,22,42,.94), rgba(5,13,27,.94)); border-left:1px solid rgba(var(--c-rgb),.16);
+  box-shadow:inset 1px 0 0 rgba(140,220,255,.04), -8px 0 30px rgba(0,0,0,.25); backdrop-filter:none; -webkit-backdrop-filter:none; }
+#right-panel .panel-toggle { background:rgba(8,22,42,.95); border-color:rgba(var(--c-rgb),.25); color:rgba(var(--c-rgb),.8); }
+#right-panel .adp-tabs { gap:2px; padding:10px 8px 0; background:none; border-bottom:1px solid rgba(var(--c-rgb),.14) !important; }
+#right-panel .adp-tab { flex:1 1 auto; min-width:0; display:flex; align-items:center; justify-content:center; gap:4px; padding:8px 1px 9px; white-space:nowrap;
+  font:600 9px var(--font4); letter-spacing:.08em; color:#6f8fa6; border-bottom:2px solid transparent; border-radius:8px 8px 0 0; }
+#right-panel .adp-tab:hover:not(.active) { color:#bfe6f7; background:rgba(var(--c-rgb),.05); }
+#right-panel .adp-tab.active { color:#c9f3ff; border-bottom-color:var(--c); text-shadow:0 0 8px rgba(var(--c-rgb),.6);
+  background:linear-gradient(180deg, rgba(var(--c-rgb),0), rgba(var(--c-rgb),.1)); box-shadow:0 6px 14px -8px rgba(var(--c-rgb),.9); }
+.rp-n { font:700 9px var(--font); letter-spacing:0; padding:1px 5px; border-radius:8px; background:rgba(var(--c-rgb),.14); color:var(--c); text-shadow:none; }
+.rp-n.bad { background:rgba(239,106,87,.16); color:var(--r); }
+.rp-n:empty { display:none; }
+.rp-empty { text-align:center; padding:38px 14px; color:#8fb3c8; font:500 12px var(--font); }
+.rp-empty small { display:block; margin-top:6px; color:var(--t3); font-size:11px; }
+.rp-sec { display:flex; justify-content:space-between; padding:8px 2px 2px; font:600 9px var(--font4); letter-spacing:.18em; text-transform:uppercase; color:#6f8fa6; }
+.rp-foot { text-align:center; padding:10px 0 4px; font:500 10px var(--font); color:var(--t3); }
+/* log */
+#log-area { padding:8px 8px 10px; }
+#log-area .le { padding:6px 8px; border-radius:8px; font-size:11.5px; border:1px solid transparent; }
+#log-area .le:hover { background:rgba(var(--c-rgb),.05); border-color:rgba(var(--c-rgb),.12); }
+#log-area .le-t { font:500 10px var(--font2); color:rgba(var(--c-rgb),.5); padding-top:1px; }
+/* files */
+#rp-files { gap:4px !important; padding:6px 8px 10px !important; }
+.rp-srow { display:flex; align-items:center; gap:8px; width:100%; padding:8px 10px; border-radius:9px; cursor:pointer; text-align:left;
+  border:1px solid rgba(var(--c-rgb),.16); background:rgba(var(--c-rgb),.04); color:#dcefff; font:600 12px var(--font); }
+.rp-srow:hover { background:rgba(var(--c-rgb),.1); border-color:rgba(var(--c-rgb),.35); }
+.rp-sdot { width:7px; height:7px; border-radius:50%; background:var(--c); box-shadow:0 0 6px var(--c); flex-shrink:0; }
+.rp-sname { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rp-scount { font:600 10px var(--font); color:var(--c); flex-shrink:0; }
+.rp-chev { color:var(--t3); flex-shrink:0; }
+#rp-files .fe { cursor:pointer; border-radius:0 8px 8px 0; padding:6px 9px; font-size:11.5px; }
+.fe-agent { font:500 9.5px var(--font2); color:var(--t3); flex-shrink:0; max-width:80px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* audit */
+#rp-audit { gap:3px !important; padding:6px 8px 10px !important; }
+.rp-arow { display:flex; gap:9px; padding:6px 8px; border-radius:8px; border-left:2px solid rgba(var(--c-rgb),.35); background:rgba(var(--c-rgb),.035); }
+.rp-at { font:500 10px var(--font2); color:rgba(var(--c-rgb),.55); flex-shrink:0; padding-top:1px; }
+.rp-am { min-width:0; }
+.rp-am b { display:block; font:600 10px var(--font4); letter-spacing:.1em; color:#bfe6f7; }
+.rp-am small { display:block; margin-top:2px; font:500 11px var(--font); color:var(--t2); overflow-wrap:anywhere; }
+.rp-arow.ev-SESSION_START, .rp-arow.ev-AGENT_DONE, .rp-arow.ev-TASK_COMPLETE { border-left-color:var(--g); }
+.rp-arow.ev-SESSION_START b, .rp-arow.ev-AGENT_DONE b, .rp-arow.ev-TASK_COMPLETE b { color:var(--g); }
+.rp-arow.ev-SESSION_RESET { border-left-color:var(--o); } .rp-arow.ev-SESSION_RESET b { color:var(--o); }
+.rp-arow.ev-AGENT_START b { color:var(--c); }
+/* errors */
+#rp-errors { gap:6px !important; padding:2px 8px 10px !important; }
+#rp-errors-search { padding:10px 8px 6px !important; }
+#rp-errors-types { padding:0 8px 6px !important; }
+.rp-err { position:relative; padding:9px 10px 8px; border-radius:9px; cursor:pointer; border:1px solid rgba(239,106,87,.22); border-left:3px solid var(--r);
+  background:linear-gradient(180deg, rgba(239,106,87,.08), rgba(239,106,87,.03)); }
+.rp-err:hover { border-color:rgba(239,106,87,.45); }
+.rp-err-h { display:flex; align-items:center; gap:6px; min-width:0; }
+.rp-err-h b { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:600 12px var(--font); color:#ffb3a6; }
+.rp-err-n { flex-shrink:0; font:700 10px var(--font); padding:1px 6px; border-radius:8px; background:rgba(239,106,87,.18); color:var(--r); }
+.rp-err-meta { margin:3px 0 5px; font:500 10px var(--font2); color:var(--t3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rp-err-msg { font:500 11px/1.5 var(--font2); color:rgba(240,170,158,.9); white-space:pre-wrap; overflow-wrap:anywhere;
+  display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden; }
+.rp-err.open .rp-err-msg { display:block; -webkit-line-clamp:unset; max-height:260px; overflow-y:auto; }
+.rp-err-more { margin-top:4px; padding:0; border:0; background:none; cursor:pointer; font:600 10px var(--font); color:rgba(239,106,87,.85); }
+.rp-err-more:hover { color:var(--r); text-decoration:underline; }
+/* day shift */
+body.light #right-panel { background:#eef3f6; border-left-color:rgba(0,0,0,.08); box-shadow:none; }
+body.light #right-panel .panel-toggle { background:#eef3f6; border-color:rgba(0,0,0,.1); color:var(--t3); }
+body.light #right-panel .adp-tabs { border-bottom-color:rgba(0,0,0,.08) !important; }
+body.light #right-panel .adp-tab { color:#5d7485; }
+body.light #right-panel .adp-tab.active { color:#0d2a3d; text-shadow:none; box-shadow:none; background:rgba(var(--c-rgb),.1); }
+body.light .rp-empty, body.light .rp-sec { color:var(--t3); }
+body.light #log-area .le:hover { background:rgba(var(--c-rgb),.06); }
+body.light .rp-srow { background:#f6f9fb; border-color:rgba(0,0,0,.08); color:var(--t); }
+body.light .rp-arow { background:#f6f9fb; }
+body.light .rp-am b { color:var(--t2); }
+body.light .rp-err { background:#fbf3f1; border-color:rgba(200,70,50,.2); }
+body.light .rp-err-h b { color:#a53a2a; }
+body.light .rp-err-msg { color:#7d3a2e; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cc-ag.run .cc-wv i, .sb-attn.warn .sb-attn-ring { animation:none; }
+}
+@media (max-width: 1400px) {
+  .cc-r1 { grid-template-columns: minmax(220px,1fr) minmax(0,1.6fr) minmax(240px,1fr); }
+  .cc-r3 { grid-template-columns: minmax(0,1fr) minmax(0,1fr); } .cc-r3 > :last-child { grid-column:1 / -1; }
+  .cc-search { width:170px; }
+}
+@media (max-width: 1200px) {
+  .root { grid-template-columns: 66px minmax(0,1fr) 290px; }
+  .root.panel-collapsed { grid-template-columns: 66px minmax(0,1fr) 0; }
+  .sidebar { padding:10px 8px; align-items:center; }
+  .sidebar .logo-text, .sidebar .vtbtn span, .sb-attn-txt, .sb-attn-h, .sb-focus span, .sb-wave { display:none; }
+  .sidebar .logo-wrap { padding:0 0 10px; }
+  .sidebar .vtbtn { justify-content:center; padding:9px 0; position:relative; }
+  .sidebar .sb-badge { position:absolute; top:1px; right:1px; min-width:16px; padding:0 4px; font-size:8.5px; }
+  .sb-attn { padding:8px 4px; border-radius:10px; }
+  .sb-attn-ring { width:42px; height:42px; font-size:16px; }
+  .cc-r1, .cc-r2 { grid-template-columns: minmax(0,1fr) minmax(0,1fr); }
+  .cc-r1 > .cc-hero { grid-column:1 / -1; grid-row:1; }
+  .cc-r2 > :first-child { grid-column:1 / -1; }
+  .topbar .clock { display:none; }
+  .cc-foot { flex-wrap:wrap; justify-content:center; } .cc-fline { display:none; }
+}
+@media (max-width: 768px) {
+  .root { grid-template-columns: minmax(0,1fr) !important; grid-template-rows: 48px auto 1fr; }
+  .topbar { grid-column:1; grid-row:1; }
+  .sidebar { grid-column:1; grid-row:2; flex-direction:row; padding:4px 8px; overflow-x:auto; overflow-y:hidden;
+    border-right:0; border-bottom:1px solid rgba(var(--c-rgb),.12); box-shadow:none; align-items:center; scrollbar-width:none; }
+  .sidebar::-webkit-scrollbar { display:none; }
+  .main { grid-column:1; grid-row:3; }
+  .sidebar .logo-wrap, .sb-attn, .sb-focus, .sb-sep { display:none; }
+  .sb-nav { flex-direction:row; gap:4px; }
+  .sidebar .vtbtn { width:auto; padding:5px 10px; justify-content:flex-start; font-size:11.5px; white-space:nowrap; }
+  .sidebar .vtbtn span { display:inline; }
+  .sidebar .vtbtn svg { display:none; }
+  .sidebar .sb-badge { position:static; }
+  .cc-pill span, .cc-search span, .cc-search kbd { display:none; }
+  .cc-search { width:auto; padding:7px 9px; }
+  .cc-r1, .cc-r2, .cc-r3 { grid-template-columns: minmax(0,1fr); }
+  .cc-r3 > :last-child, .cc-r2 > :first-child { grid-column:auto; }
+  .cc-hero { min-height:220px; } .cc-hero-t1 { font-size:34px; }
+}
+
+/* day shift (light) keeps the layout, drops the glow */
+body.light .sidebar { background:#eef3f6; border-right-color:rgba(0,0,0,.08); box-shadow:none; }
+body.light .sidebar .vtbtn { color:#3c5566; }
+body.light .sidebar .vtbtn.active { color:#0d2a3d; background:rgba(var(--c-rgb),.12); }
+body.light .sidebar .logo-text .t1 { color:#123; text-shadow:none; }
+body.light .topbar { background:rgba(255,255,255,.6); }
+body.light .topbar .clock-time { color:var(--c); text-shadow:none; }
+body.light .topbar .clock-date { color:var(--t3); }
+body.light .cc-pill, body.light .cc-search { background:rgba(255,255,255,.7); color:var(--t2); }
+body.light .cc-panel, body.light .td-card { background:#f6f9fb; box-shadow:0 2px 10px rgba(0,0,0,.05); backdrop-filter:none; }
+body.light .td-card h3, body.light .cc-h { color:var(--t2) !important; }
+body.light .cc-ov-row b, body.light .cc-fi-m b, body.light .cc-ag-m b, body.light .cc-tl-n b, body.light .cc-mod b,
+body.light .cc-fitem b, body.light .cc-ring-v b, body.light .cc-kv div b, body.light .cc-qb, body.light .cc-brief { color:var(--t); }
+body.light .cc-hero-t1 { color:#0d2a3d; text-shadow:0 0 18px rgba(var(--c-rgb),.35); }
+body.light .cc-launch { color:#fff; }
+body.light .sidebar .vtbtn { background:transparent; border-color:transparent; }
+body.light .sidebar .vtbtn:hover:not(.active) { background:rgba(var(--c-rgb),.07); color:var(--t); }
+body.light .sidebar .vtbtn.active { border-color:rgba(var(--c-rgb),.35); }
+body.light .sidebar .logo-text .t2 { color:var(--t3); }
+body.light .sb-badge { background:rgba(var(--c-rgb),.14); color:var(--c); }
+body.light .sb-attn, body.light .sb-focus { background:#f6f9fb; border-color:rgba(0,0,0,.08); color:var(--t2); }
+body.light .sb-attn-h { color:var(--t3); }
+body.light .sb-attn-ring { color:var(--t); }
+body.light .sb-attn.warn .sb-attn-ring { color:#8a5a00; }
+body.light .cc-hero-t2 { color:var(--c); }
+body.light .cc-hero-t3, body.light .cc-ov-row small.info, body.light .cc-more { color:var(--t2); }
+body.light .cc-fbtn.amber { color:#8a5a00; }
+body.light .cc-fbtn { color:#9b1c2c; }
+body.light .cc-tag { filter:saturate(1.4) brightness(.75); }
+/* History: groups on top, the open group's tabs below (_histTabsHtml) */
+.hist-nav { display:flex;flex-direction:column;gap:2px;min-width:0;max-width:100%; }
+.hg-tabs { display:flex;gap:4px;flex-wrap:wrap; }
+.hg-tab, .viz-tab { font:700 10px var(--font2);letter-spacing:.1em;color:var(--t3);background:rgba(var(--c-rgb),.04);border:1px solid rgba(var(--c-rgb),.14);border-radius:999px;padding:4px 11px;cursor:pointer;white-space:nowrap;transition:color .15s,background .15s,border-color .15s; }
+.hg-tab:hover, .viz-tab:hover { color:var(--t); border-color:rgba(var(--c-rgb),.35); }
+.hg-tab.active, .viz-tab.active { color:var(--c);background:rgba(var(--c-rgb),.12);border-color:rgba(var(--c-rgb),.55); }
+.hist-tabs { min-width:0;max-width:100%;overflow-x:auto;scrollbar-width:none; }
+.hist-tabs::-webkit-scrollbar { display:none; }
+.hist-tabs .adp-tab { white-space:nowrap; }
+.viz-switch { display:flex;gap:6px;flex-wrap:wrap;padding:0 0 10px;flex-shrink:0; }
+body.light .hg-tab, body.light .viz-tab { color:var(--t2);background:rgba(0,0,0,.025);border-color:rgba(0,0,0,.12); }
+body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);background:rgba(var(--c-rgb),.1);border-color:rgba(var(--c-rgb),.5); }
+@media (max-width:768px){
+  .hist-nav { flex:1 1 100%; }
+  .hist-tabs .adp-tab { padding:8px 10px; }
+}
 </style>
 </head>
 <body>
@@ -11432,7 +15113,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
     <div class="ro-text">RECONNECTING...</div>
   </div>
 
-  <div class="topbar">
+  <aside class="sidebar" id="sidebar">
     <div class="logo-wrap">
       <svg class="logo-mark" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
         <!-- hex outer border -->
@@ -11501,6 +15182,30 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
       </div>
     </div>
 
+    <nav class="sb-nav">
+      <button class="vtbtn" id="vt-command" onclick="setView('command')" title="Command Center: everything at a glance"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg><span>Command Center</span></button>
+      <button class="vtbtn" id="vt-today" onclick="setView('today')" title="Today: what needs you, what's running, today's spend and commits (Y)"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg><span>Today</span><b class="sb-badge" id="sb-n-today"></b></button>
+      <button class="vtbtn" id="vt-inbox" onclick="setView('inbox')" title="Inbox: everything that needs you, with one-tap answers (J)"><svg viewBox="0 0 24 24"><path d="M3 13l3-8h12l3 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 13h5l1.5 3h5l1.5-3h5"/></svg><span>Inbox</span><b class="sb-badge" id="sb-n-inbox"></b></button>
+      <button class="vtbtn" id="vt-agents" onclick="setView('agents')" title="Live agents"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Agents</span><b class="sb-badge" id="sb-n-agents"></b></button>
+      <button class="vtbtn" id="vt-cli" onclick="setView('cli')" title="Claude Code sessions (CLI)"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg><span>Sessions</span><b class="sb-badge" id="sb-n-cli"></b></button>
+      <button class="vtbtn" id="vt-views" onclick="setView(_vizView)" title="Live views: timeline (T), graph (G), heat map (X), agent tree (W)"><svg viewBox="0 0 24 24"><path d="M3 12h18"/><circle cx="7" cy="12" r="2"/><circle cx="14" cy="12" r="2"/><path d="M7 6v4M14 14v4M19 8v8"/></svg><span>Views</span></button>
+      <button class="vtbtn" id="vt-summary" onclick="setView('summary')" title="Summary"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Summary</span></button>
+      <div class="sb-sep"></div>
+      <button class="vtbtn" id="vt-history" onclick="setView('history')" title="Session history, analytics, cache, failures, permissions"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg><span>History</span></button>
+      <button class="vtbtn" id="vt-diag" onclick="setView('diag')" title="Health"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span>Health</span></button>
+      <button class="vtbtn term-btn" id="vt-term" onclick="setView('term')" title="Terminal"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Terminal</span></button>
+    </nav>
+    <div class="sb-attn" id="sb-attn">
+      <div class="sb-attn-h">NEEDS YOU</div>
+      <span class="sb-wave"><i style="height:30%"></i><i style="height:55%"></i><i style="height:40%"></i><i style="height:80%"></i><i style="height:60%"></i><i style="height:95%"></i><i style="height:50%"></i><i style="height:70%"></i><i style="height:35%"></i><i style="height:85%"></i><i style="height:45%"></i><i style="height:65%"></i><i style="height:30%"></i><i style="height:75%"></i><i style="height:50%"></i><i style="height:90%"></i><i style="height:40%"></i><i style="height:60%"></i><i style="height:30%"></i><i style="height:50%"></i></span>
+      <div class="sb-attn-ring" id="sb-attn-n" onclick="setView('today')" title="Open Today">0</div>
+      <div class="sb-attn-txt" id="sb-attn-txt">No session open</div>
+    </div>
+    <button class="sb-focus" onclick="toggleRightPanel()" title="Hide or show the right panel [P]"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span>Focus mode</span></button>
+  </aside>
+
+  <div class="topbar">
+    <div class="cc-pill ok" id="cc-pill"><span>SYSTEM STATUS</span><b><i></i>OPTIMAL</b></div>
     <div class="divider"></div>
     <div class="top-stat"><div class="val" id="s-run">—</div><div class="lbl">Online</div></div>
     <div class="divider"></div>
@@ -11523,6 +15228,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
     </div>
 
     <div class="topbar-right">
+      <button class="cc-search" onclick="openPalette()" title="Command palette (Ctrl+K)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><span>Search…</span><kbd>Ctrl K</kbd></button>
       <button class="btn-reset" id="btn-reset" onclick="resetSession()" title="Reset session">
         <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
         <span class="btn-reset-lbl">RESET SESSION</span>
@@ -11559,24 +15265,6 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
 
   <!-- MAIN -->
   <div class="main" id="main-area">
-    <div class="view-toggle">
-      <!-- Group 1: live-agent visualizations -- 7 different views of the exact same running-agent/session data -->
-      <button class="vtbtn"        id="vt-today"  onclick="setView('today')" title="Today: what needs you, what's running, today's spend and commits (Y)">TODAY</button>
-      <button class="vtbtn active" id="vt-agents" onclick="setView('agents')">AGENTS</button>
-      <button class="vtbtn"        id="vt-cli"    onclick="setView('cli')">CLI</button>
-      <button class="vtbtn"        id="vt-tl"      onclick="setView('timeline')">TIMELINE</button>
-      <button class="vtbtn"        id="vt-summary" onclick="setView('summary')">SUMMARY</button>
-      <button class="vtbtn"        id="vt-graph"   onclick="setView('graph')">GRAPH</button>
-      <button class="vtbtn"        id="vt-heat"    onclick="setView('heat')">HEAT</button>
-      <button class="vtbtn"        id="vt-tree"    onclick="setView('tree')">TREE</button>
-      <div class="vt-sep"></div>
-      <!-- Group 2: history -- a different data source entirely (past sessions, not live agents) -->
-      <button class="vtbtn"        id="vt-history" onclick="setView('history')">HISTORY</button>
-      <div class="vt-sep"></div>
-      <!-- Group 3: utility tools -- unrelated to agent visualization -->
-      <button class="vtbtn"        id="vt-diag"    onclick="setView('diag')">HEALTH</button>
-      <button class="vtbtn term-btn" id="vt-term"    onclick="setView('term')">TERM</button>
-    </div>
     <div class="kpi-bar" id="kpi-bar">
       <div class="kpi-card" title="Agents currently running">
         <div class="kpi-val" id="kpi-running">0</div>
@@ -11627,7 +15315,10 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
       <div id="status-filter-bar" style="display:none;gap:6px;padding:0 0 8px;flex-wrap:wrap"></div>
       <div class="agents" id="agents"></div>
     </div>
+    <div id="command-area" style="display:none"></div>
     <div id="today-area" style="display:none"></div>
+    <div id="inbox-area" style="display:none"></div>
+    <div id="viz-switch" class="viz-switch" style="display:none"></div>
     <div id="timeline-area" style="display:none"></div>
     <div id="summary-area" style="display:none;flex-direction:column;gap:0;flex:1;align-items:center"></div>
     <div id="graph-area"   style="display:none;flex:1;align-items:center;justify-content:center;padding:20px;overflow:auto;min-height:0"></div>
@@ -11668,9 +15359,9 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
     <button class="panel-toggle" id="panel-toggle-btn" onclick="toggleRightPanel()" title="Toggle sidebar [P]">◀</button>
     <div class="adp-tabs" style="flex-shrink:0;border-top:none;border-bottom:1px solid rgba(255,255,255,.06)" role="tablist">
       <div class="adp-tab active" id="rpt-log"   role="tab" aria-selected="true"  tabindex="0" onclick="setRightTab('log')">LOG</div>
-      <div class="adp-tab"        id="rpt-files" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('files')">FILES</div>
-      <div class="adp-tab"        id="rpt-audit" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('audit')">AUDIT</div>
-      <div class="adp-tab"        id="rpt-errors" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('errors')">ERRORS</div>
+      <div class="adp-tab"        id="rpt-files" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('files')">FILES<b class="rp-n"></b></div>
+      <div class="adp-tab"        id="rpt-audit" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('audit')">AUDIT<b class="rp-n"></b></div>
+      <div class="adp-tab"        id="rpt-errors" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('errors')">ERRORS<b class="rp-n"></b></div>
       <button id="rp-mobile-close" onclick="_mnavToggleLogs(false)" aria-label="Close" style="display:none;margin-left:auto;margin-right:8px;background:none;border:none;color:var(--t3);font-size:16px;cursor:pointer;padding:4px 8px;line-height:1">✕</button>
     </div>
     <div class="log-area" id="log-area" style="flex:1;overflow-y:auto"></div>
@@ -11689,6 +15380,10 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
 
   <!-- MOBILE BOTTOM NAV -->
   <nav id="mobile-nav">
+    <button class="mnav-btn" id="mnav-command" onclick="_mnavGo('command')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>
+      HOME
+    </button>
     <button class="mnav-btn" id="mnav-today" onclick="_mnavGo('today')">
       <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
       TODAY
@@ -11697,9 +15392,9 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
       <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
       AGENTS
     </button>
-    <button class="mnav-btn" id="mnav-summary" onclick="_mnavGo('summary')">
-      <svg viewBox="0 0 24 24"><path d="M3 3h18M3 9h18M3 15h12M3 21h8"/></svg>
-      SUMMARY
+    <button class="mnav-btn" id="mnav-inbox" onclick="_mnavGo('inbox')">
+      <svg viewBox="0 0 24 24"><path d="M3 13l3-8h12l3 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 13h5l1.5 3h5l1.5-3h5"/></svg>
+      INBOX<b class="mnav-badge" id="mnav-n-inbox"></b>
     </button>
     <button class="mnav-btn" id="mnav-term" onclick="_mnavGo('term')">
       <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
@@ -11753,7 +15448,7 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
   <!-- COMMAND PALETTE -->
   <div class="palette-overlay" id="palette-overlay" role="dialog" aria-modal="true" aria-label="Command Palette" onclick="if(event.target===this)closePalette()">
     <div class="palette-panel">
-      <input id="palette-input" class="palette-input" type="text" placeholder="Jump to a session, agent, or setting…" spellcheck="false" autocomplete="off" oninput="_paletteRender(this.value)" onkeydown="_paletteInputKeydown(event)">
+      <input id="palette-input" class="palette-input" type="text" placeholder="Type a command, session, project or setting…" spellcheck="false" autocomplete="off" oninput="_paletteRender(this.value)" onkeydown="_paletteInputKeydown(event)">
       <div id="palette-results" class="palette-results"></div>
     </div>
   </div>
@@ -11849,6 +15544,14 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
         </div>
 
         <div class="settings-pane" data-pane="notify" style="display:none">
+        <div class="settings-section">NOTIFICATION CENTER</div>
+        <div id="nc-status" style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 6px"></div>
+        <div id="nc-table" class="nc-table"></div>
+        <div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">
+          <span style="font-size:9px;font-family:var(--font2);color:var(--t3);letter-spacing:1px">RECENTLY SENT</span>
+          <button class="adp-btn" onclick="_ncClear()" style="font-size:9px;padding:2px 8px;margin-left:auto">Clear</button>
+        </div>
+        <div id="nc-log" class="nc-log"></div>
         <div class="settings-section">REMOTE APPROVE</div>
         <div class="settings-row" style="gap:10px;flex-wrap:wrap">
           <label class="settings-lbl">Permission prompts</label>
@@ -11879,6 +15582,32 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
         <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
           Uses the same "away" time. A held turn shows <b>Reply…</b> on the session; Claude carries on with what you write.
           Up to 7 replies in a row, then the session waits in its terminal.
+        </div>
+        <div class="settings-section">DANGEROUS COMMANDS</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Guard</label>
+          <select class="settings-input" id="st-dg-mode" style="width:auto" onchange="_dgSave()"
+            title="Before Claude runs a destructive shell command, AOC holds it until you allow it here or on your phone -- in every permission mode, auto and bypass included.">
+            <option value="hold">Hold for my OK</option>
+            <option value="off">Off</option>
+          </select>
+          <span style="display:inline-flex;align-items:center;gap:6px">
+            <span style="color:var(--t3);font-size:11px">deny if no answer in</span>
+            <input class="settings-input" id="st-dg-hold" type="number" min="1" max="60" style="width:64px" onchange="_dgSave()">
+            <span style="color:var(--t3);font-size:11px">min</span>
+          </span>
+        </div>
+        <div id="st-dg-hook" style="font-size:10px;color:var(--o);line-height:1.5;margin:0 0 6px;display:none">
+          The guard's hook is not in Claude Code's settings yet. Run <b>python setup.py</b> in the AOC folder once.
+        </div>
+        <div class="dg-rules" id="st-dg-rules"></div>
+        <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
+          <label class="settings-lbl">Your own patterns <span style="color:var(--t3);font-weight:400">(regex, one per line, matched against the whole command)</span></label>
+          <textarea class="settings-input" id="st-dg-patterns" rows="3" placeholder="e.g. \bkubectl\s+delete\b" onchange="_dgSave()"
+            style="font-family:var(--font2);font-size:11px;resize:vertical"></textarea>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          A held command shows <b>Run it</b> / <b>Deny</b> on the session and goes to your phone. If AOC isn't running, commands run as usual.
         </div>
         <div class="settings-section">PHONE PUSH</div>
         <div class="settings-row" style="gap:10px;flex-wrap:wrap">
@@ -11912,7 +15641,9 @@ body.light ::-webkit-scrollbar-thumb:hover { background:rgba(var(--c-rgb),.38); 
           <label class="settings-lbl">Webhook URL</label>
           <input class="settings-input settings-input-wide" id="st-webhook" type="text" placeholder="https://hooks.slack.com/..." spellcheck="false">
         </div>
-        <div class="settings-row" style="gap:16px;flex-wrap:wrap">
+        <!-- per-event webhook toggles moved to the notification center above;
+             kept hidden so saveSettings()/the settings bundle still round-trip them -->
+        <div class="settings-row" style="display:none">
           <label class="settings-toggle"><input type="checkbox" id="st-wh-done" checked> Agent done</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-error" checked> Agent error</label>
           <label class="settings-toggle"><input type="checkbox" id="st-wh-stuck"> Agent stuck / session looping</label>
@@ -12633,24 +16364,58 @@ function setRightTab(tab){
   if(tab==='audit') _renderRpAudit();
   if(tab==='errors') _renderRpErrors();
 }
+/* the count badge on a right-panel tab (empty = hidden) */
+function _rpTabCount(tab, n, bad){
+  const b=document.querySelector('#rpt-'+tab+' .rp-n');
+  if(!b) return;
+  b.textContent=n?String(n):'';
+  b.classList.toggle('bad', !!bad&&n>0);
+}
+/* Pure: FILES tab html -- the files each open session edited (edited_count,
+   opens the session's changes) and then the files subagents reported. */
+function _rpFilesParts(data){
+  const sessions=((data&&data.sessions_list)||[]).filter(s=>s&&s.session_active!==false&&s.edited_count>0)
+    .sort((a,b)=>b.edited_count-a.edited_count);
+  const agents=((data&&data.agents)||[]).filter(a=>!String(a.id||'').startsWith('hook_'));
+  const seen=new Set(), files=[];
+  agents.forEach(a=>(a.files_changed||[]).forEach(f=>{ if(f&&f.path&&!seen.has(f.path)){ seen.add(f.path); files.push({...f,agent:a.unit||a.name||''}); } }));
+  const nameOf=s=>s.display_name||s.project||String(s.id||'').slice(0,8);
+  const count=sessions.reduce((n,s)=>n+s.edited_count,0)+files.length;
+  if(!count) return {count, html:'<div class="rp-empty">No file changes yet.<small>Files an open session or an agent edits show up here.</small></div>'};
+  let html='';
+  if(sessions.length) html+=`<div class="rp-sec"><span>Sessions</span><span>${sessions.length}</span></div>`+sessions.map(s=>
+    `<button class="rp-srow" onclick="openSessionChanges(${jsq(s.id)},${jsq(s.machine||'')},${jsq(nameOf(s))})" title="Uncommitted changes in the files this session edited">
+      <span class="rp-sdot"></span><span class="rp-sname">${escHtml(nameOf(s))}</span><span class="rp-scount">${s.edited_count} file${s.edited_count===1?'':'s'}</span><span class="rp-chev">›</span></button>`).join('');
+  if(files.length) html+=`<div class="rp-sec"><span>Agents</span><span>${files.length}</span></div>`+files.map(f=>
+    `<div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff(${jsq(f.path)});event.stopPropagation()" title="${escHtml(f.path)}">
+      <span class="fe-badge">${f.type==='new'?'NEW':'MOD'}</span>
+      <span class="fe-name">${escHtml(f.path.split(/[\\/]/).pop())}</span>
+      ${f.lines?`<span class="fe-lines">${f.lines}L</span>`:''}
+      <span class="fe-agent">${escHtml(f.agent)}</span></div>`).join('');
+  return {count, html};
+}
+const _rpPainted=new WeakMap();
 function _renderRpFiles(data){
   const el=document.getElementById('rp-files');
-  if(!el || _rightTab!=='files') return;
-  const agents=(data.agents||[]).filter(a=>!String(a.id||'').startsWith('hook_'));
-  const seen=new Set(); const files=[];
-  agents.forEach(a=>(a.files_changed||[]).forEach(f=>{ if(!seen.has(f.path)){seen.add(f.path);files.push({...f,agent:a.unit||a.name});} }));
-  const ftEl=document.getElementById('rpt-files');
-  if(ftEl) ftEl.textContent=`FILES (${files.length})`;
-  if(!files.length){
-    el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no file changes</div>';
-    return;
-  }
-  el.innerHTML=files.map(f=>`<div class="fe ${f.type==='new'?'new':'changed'}" onclick="showDiff(${jsq(f.path)});event.stopPropagation()" style="cursor:pointer;border-radius:6px;padding:5px 8px">
-    <span class="fe-badge">${f.type==='new'?'NEW':'MOD'}</span>
-    <span class="fe-name" style="font-size:11px">${escHtml(f.path.split('/').pop())}</span>
-    ${f.lines?`<span class="fe-lines">${f.lines}L</span>`:''}
-    <span style="font-size:9px;color:var(--t3);font-family:var(--font2);flex-shrink:0">${escHtml(f.agent)}</span>
-  </div>`).join('');
+  const p=_rpFilesParts(data);
+  _rpTabCount('files', p.count);
+  if(!el || _rightTab!=='files' || _rpPainted.get(el)===p.html) return;
+  el.innerHTML=p.html; _rpPainted.set(el,p.html);
+}
+/* Pure: AUDIT tab html from the audit log lines ("ts | EVENT | details"),
+   newest first; POLL heartbeats are only counted, they carry no event. */
+function _rpAuditParts(lines){
+  const rows=[]; let polls=0;
+  (lines||[]).slice().reverse().forEach(l=>{
+    const parts=String(l).split('|').map(x=>x.trim());
+    const ev=parts[1]||'';
+    if(ev==='POLL'){ polls++; return; }
+    const ts=parts[0]||'', rest=parts.slice(2).filter(x=>x&&!/=$/.test(x)).join(' · ');
+    rows.push(`<div class="rp-arow ev-${ev.replace(/\W/g,'')}" title="${escHtml(ts)}"><span class="rp-at">${escHtml(ts.slice(11,19)||ts)}</span>
+      <div class="rp-am"><b>${escHtml(ev.replace(/_/g,' ')||'EVENT')}</b>${rest?`<small>${escHtml(rest)}</small>`:''}</div></div>`);
+  });
+  const foot=polls?`<div class="rp-foot">${polls} heartbeat poll${polls===1?'':'s'} hidden</div>`:'';
+  return {count:rows.length, html:(rows.join('')||'<div class="rp-empty">No events in this session yet.<small>Session start, resets and agent events land here.</small></div>')+foot};
 }
 let _auditLastRender=0;
 async function _renderRpAudit(){
@@ -12661,13 +16426,9 @@ async function _renderRpAudit(){
   _auditLastRender=now;
   try{
     const d=await fetch('/auditlog').then(r=>r.json());
-    const atEl=document.getElementById('rpt-audit');
-    if(atEl) atEl.textContent=d.current?`AUDIT (${d.lines.length})`:'AUDIT';
-    if(!d.lines||!d.lines.length){
-      el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no audit log</div>';
-      return;
-    }
-    el.innerHTML=d.lines.slice().reverse().map(l=>`<div class="al ${eventClass(l)}" style="font-size:10px">${l}</div>`).join('');
+    const p=_rpAuditParts(d.lines);
+    _rpTabCount('audit', d.current?p.count:0);
+    if(_rpPainted.get(el)!==p.html){ el.innerHTML=p.html; _rpPainted.set(el,p.html); }
   }catch(e){}
 }
 /* /errors already returns session_id per error (needed for the join
@@ -12738,23 +16499,31 @@ function _renderErrorsList(){
   if(!el) return;
   const errs=_filterErrors(_errorsCache,_errorSearchQuery,_errorTypeFilter);
   if(!_errorsCache.length){
-    el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no errors recorded</div>';
+    el.innerHTML='<div class="rp-empty">No errors recorded.<small>Failed agents and tool errors show up here.</small></div>';
     return;
   }
   if(!errs.length){
-    el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;text-align:center;padding:30px 0;letter-spacing:.08em">// no errors match your filters</div>';
+    el.innerHTML='<div class="rp-empty">No errors match your filters.</div>';
     return;
   }
-  el.innerHTML=errs.map(e=>`<div style="padding:8px 10px;border-radius:8px;background:rgba(239,106,87,.06);border:1px solid rgba(239,106,87,.2);border-left:3px solid var(--r);cursor:pointer" onclick="_jumpToSessionHistory(${jsq(e.session_id)})" title="Open this session in History">
-      <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px;font-size:9px;font-family:var(--font2);letter-spacing:.06em;color:var(--t3)">
-        <span style="display:flex;align-items:center;gap:6px;min-width:0">
-          <span style="color:var(--r);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(e.name||e.agent_id||'agent')}</span>
-          ${e.detected_via==='transcript'?`<span class="hookmiss-badge" style="flex-shrink:0" title="${escHtml(_hookMissTitle(e))}">⚠ HOOK MISS</span>`:''}
-        </span>
-        <span style="flex-shrink:0">${e.model?escHtml(e.model)+' · ':''}${escHtml(e.project||'')} · ${escHtml(e.date||'')} ${escHtml(e.completed_at||'')}</span>
-      </div>
-      <div style="font-size:11px;color:rgba(240,164,151,.85);font-family:var(--font2);line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto">${escHtml(e.error_msg||'')}</div>
-    </div>`).join('');
+  el.innerHTML=_groupErrors(errs).map(g=>{
+    const e=g[0], names=[...new Set(g.map(x=>x.name||x.agent_id||'agent'))];
+    const who=names[0]+(names.length>1?` +${names.length-1} more`:'');
+    return `<div class="rp-err" onclick="_jumpToSessionHistory(${jsq(e.session_id)})" title="Open the latest of these sessions in History">
+      <div class="rp-err-h"><b>${escHtml(who)}</b>${g.length>1?`<span class="rp-err-n">×${g.length}</span>`:''}
+        ${g.some(x=>x.detected_via==='transcript')?`<span class="hookmiss-badge" title="${escHtml(_hookMissTitle(e))}">⚠ HOOK MISS</span>`:''}</div>
+      <div class="rp-err-meta">${escHtml([e.model, e.project, `${e.date||''} ${e.completed_at||''}`.trim()].filter(Boolean).join(' · '))}${g.length>1?' · latest':''}</div>
+      <div class="rp-err-msg">${escHtml(e.error_msg||'')}</div>
+      ${(e.error_msg||'').length>160||(e.error_msg||'').split('\n').length>4?`<button class="rp-err-more" onclick="event.stopPropagation();this.parentNode.classList.toggle('open');this.textContent=this.parentNode.classList.contains('open')?'less':'more'">more</button>`:''}
+    </div>`;
+  }).join('');
+}
+/* Pure: errors with the same message grouped, keeping the list's order
+   (newest first) -- one model outage logged ten times is one card, ×10. */
+function _groupErrors(errs){
+  const by=new Map();
+  (errs||[]).forEach(e=>{ const k=(e.error_msg||'').trim(); if(!by.has(k)) by.set(k,[]); by.get(k).push(e); });
+  return [...by.values()];
 }
 function _setErrorSearch(val){
   _errorSearchQuery=val.toLowerCase();
@@ -12772,8 +16541,7 @@ async function _renderRpErrors(){
   _errorsLastRender=now;
   try{
     _errorsCache=await fetch('/errors').then(r=>r.json());
-    const etEl=document.getElementById('rpt-errors');
-    if(etEl) etEl.textContent=_errorsCache.length?`ERRORS (${_errorsCache.length})`:'ERRORS';
+    _rpTabCount('errors', _errorsCache.length, true);
     _renderErrorTypeBar();
     _renderErrorsList();
   }catch(e){}
@@ -12802,7 +16570,7 @@ function _mnavToggleLogs(force){
   if(btn) btn.classList.toggle('active', _mnavLogsOpen);
 }
 function _savePrefs(){
-  try{ localStorage.setItem('aoc_prefs',JSON.stringify({view:currentView,list:listMode,sf:statusFilter,muted:_soundMuted,theme:_theme,collapsed:[..._collapsedIds],pinned:[..._pinnedIds],bays:[..._collapsedBays],panelCollapsed:_panelCollapsed,today:1})); }catch(e){}
+  try{ localStorage.setItem('aoc_prefs',JSON.stringify({view:currentView,list:listMode,sf:statusFilter,muted:_soundMuted,theme:_theme,collapsed:[..._collapsedIds],pinned:[..._pinnedIds],bays:[..._collapsedBays],panelCollapsed:_panelCollapsed,viz:_vizView,today:1,cc:1,pal:typeof _paletteRecent!=='undefined'?_paletteRecent:[]})); }catch(e){}
 }
 function _loadPrefs(){
   try{
@@ -12814,13 +16582,17 @@ function _loadPrefs(){
     if(v==='cards') v=(p.cardsTab==='cli')?'cli':'agents';
     // TODAY is the home view: first run, and once for prefs saved before it existed
     if(!v||!p.today) v='today';
+    // COMMAND is the home view since the Command Center redesign (once for older prefs)
+    if(!p.cc) v='command';
     if(p.list)  listMode=p.list;
     if(p.sf && p.sf!=='all') statusFilter=p.sf;
     if(p.muted) { _soundMuted=true; _applyMuteUI(); }
     if(p.theme) { _theme=p.theme; _applyTheme(); }
     if(Array.isArray(p.collapsed)) _collapsedIds=new Set(p.collapsed);
     if(Array.isArray(p.pinned)) _pinnedIds=new Set(p.pinned);
+    if(_isVizView(p.viz)) _vizView=p.viz;
     if(Array.isArray(p.bays)) _collapsedBays=new Set(p.bays.filter(k=>typeof k==='string'));
+    if(Array.isArray(p.pal)) _paletteRecent=p.pal.filter(k=>typeof k==='string').slice(0,8);
     if(p.panelCollapsed){ _panelCollapsed=true; document.querySelector('.root').classList.add('panel-collapsed'); const btn=document.getElementById('panel-toggle-btn'); if(btn) btn.textContent='▶'; }
     // Last: setView() calls _savePrefs(), so running it before the state
     // above was restored wrote them back empty -- pinned/collapsed/panel state
@@ -12872,11 +16644,21 @@ function toggleTheme(){
   log('Theme → '+_theme.toUpperCase(),'info');
 }
 
+/* ── VIEWS: Timeline / Graph / Heat / Tree share one sidebar entry and a
+   switcher above them. The view names stay as they were, so setView('graph'),
+   the T/G/X/W hotkeys and a saved view keep working. ── */
+const _VIZ_VIEWS=[['timeline','Timeline','T'],['graph','Graph','G'],['heat','Heat map','X'],['tree','Agent tree','W']];
+let _vizView='timeline';   // the one the sidebar's Views entry opens: the last one you used
+function _isVizView(v){ return _VIZ_VIEWS.some(x=>x[0]===v); }
+/* Pure: the switcher's buttons, the current view marked. */
+function _vizSwitchHtml(v){
+  return _VIZ_VIEWS.map(([k,l,key])=>`<button class="viz-tab${k===v?' active':''}" onclick="setView(${jsq(k)})" title="${l} (${key})" aria-pressed="${k===v}">${l}</button>`).join('');
+}
 function setView(v){
   currentView=v;
   _savePrefs();
-  const areas = { today:'block', timeline:'flex', summary:'flex', graph:'flex', heat:'flex', tree:'flex', history:'flex', term:'flex' };
-  ['today-area','timeline-area','summary-area','graph-area','heat-area','diag-area','tree-area','history-area','term-area'].forEach(id=>{
+  const areas = { command:'block', today:'block', inbox:'block', timeline:'flex', summary:'flex', graph:'flex', heat:'flex', tree:'flex', history:'flex', term:'flex' };
+  ['command-area','today-area','inbox-area','timeline-area','summary-area','graph-area','heat-area','diag-area','tree-area','history-area','term-area'].forEach(id=>{
     const key=id.replace('-area','');
     document.getElementById(id).style.display = v===key ? (areas[key]||'flex') : 'none';
   });
@@ -12885,23 +16667,31 @@ function setView(v){
      which reads currentView to decide which to draw into #agents. */
   const cardsAreaEl=document.getElementById('cards-area');
   if(cardsAreaEl) cardsAreaEl.style.display = (v==='agents'||v==='cli') ? 'flex' : 'none';
-  [['vt-today','today'],['vt-agents','agents'],['vt-cli','cli'],['vt-tl','timeline'],['vt-summary','summary'],['vt-graph','graph'],['vt-heat','heat'],['vt-diag','diag'],['vt-tree','tree'],['vt-history','history'],['vt-term','term']].forEach(([id,val])=>{
+  [['vt-command','command'],['vt-today','today'],['vt-inbox','inbox'],['vt-agents','agents'],['vt-cli','cli'],['vt-summary','summary'],['vt-diag','diag'],['vt-history','history'],['vt-term','term']].forEach(([id,val])=>{
     const el=document.getElementById(id); if(el) el.classList.toggle('active',v===val);
   });
-  ['today','agents','summary','term'].forEach(x=>{
+  ['command','today','inbox','agents','term'].forEach(x=>{
     const b=document.getElementById('mnav-'+x);
     if(b) b.classList.toggle('active', v===x||(x==='agents'&&v==='cli'));
   });
+  if(_isVizView(v)) _vizView=v;
+  const vizBtn=document.getElementById('vt-views');
+  if(vizBtn) vizBtn.classList.toggle('active', _isVizView(v));
+  const vizSw=document.getElementById('viz-switch');
+  if(vizSw){ vizSw.style.display=_isVizView(v)?'flex':'none'; if(_isVizView(v)) vizSw.innerHTML=_vizSwitchHtml(v); }
   /* KPI bar covers both AGENTS and CLI (same underlying live data) */
   const kpiEl=document.getElementById('kpi-bar');
   if(kpiEl) kpiEl.style.display=(v==='agents'||v==='cli')?'flex':'none';
   /* term-mode removes main padding so xterm fills space */
   const mainEl=document.getElementById('main-area');
   if(mainEl) mainEl.classList.toggle('term-mode', v==='term');
+  if(mainEl) mainEl.classList.toggle('cc-mode', v==='command');
   if(v==='term') { _initTerm(); return; }
   if(!lastStatus) return;
   if(v==='agents'||v==='cli') renderAgents(lastStatus);
+  if(v==='command')  renderCommand(lastStatus);
   if(v==='today')    renderToday(lastStatus);
+  if(v==='inbox')    renderInbox(lastStatus);
   if(v==='timeline') renderTimeline(lastStatus);
   if(v==='summary')  renderSummary(lastStatus);
   if(v==='graph')    renderGraph(lastStatus);
@@ -12916,12 +16706,541 @@ function setView(v){
   if(v==='history')  return renderHistory();
 }
 
-/* ── TODAY: the home view ── */
+/* ── COMMAND: the Command Center home view ──
+   A shell (panels with ids + the globe canvas) is drawn once; every status
+   update only swaps the panels whose html changed, so the globe keeps
+   spinning. Everything shown comes from AOC itself: /status, /analytics,
+   /cache_stats (7 days), /history, /sysinfo and the event log. */
+const _ccData={an:null, anAt:0, cache:null, cacheAt:0, hist:null, histAt:0, sys:null, sysAt:0, cm:null, cmAt:0, act:null, actAt:0};
+let _ccStatusAt=0, _ccGlobe=null;
+const _CC_ICONS={
+  term:'<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
+  agents:'<circle cx="12" cy="8" r="3.2"/><path d="M5 20c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5"/>',
+  bell:'<path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
+  gauge:'<path d="M4 16a8 8 0 1 1 16 0"/><path d="M12 16l4-5"/>',
+  coin:'<circle cx="12" cy="12" r="8"/><path d="M14.5 9.5c-.5-1-1.5-1.5-2.5-1.5-1.4 0-2.5.8-2.5 2s1.1 1.6 2.5 2 2.5.8 2.5 2-1.1 2-2.5 2c-1 0-2-.5-2.5-1.5M12 6.5v11"/>',
+  shield:'<path d="M12 3l7 3v6c0 4.2-3 7.5-7 9-4-1.5-7-4.8-7-9V6z"/><path d="M9 12l2 2 4-4"/>',
+  info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/>',
+  warn:'<path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17v.5"/>',
+  x:'<circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>',
+  check:'<circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/>',
+  chip:'<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+  plus:'<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
+  cmd:'<path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z"/>',
+  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  lock:'<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  pc:'<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+  wifi:'<path d="M2 9a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/>',
+  week:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  doc:'<path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
+};
+/* AOC's own start-up lines and the shortcut hint aren't events */
+const _CC_FEED_SKIP=/^(INITIALIZING A\.O\.C|CONNECTING TO ORCHESTRATOR|WAITING FOR AGENT STATUS|REAL-TIME AGENT TRACKING|Shortcuts:)/;
+const _ccI=k=>`<svg viewBox="0 0 24 24">${_CC_ICONS[k]||''}</svg>`;
+const _ccIco=(k,tone)=>`<span class="cc-ico ${tone?'ic-'+tone:''}">${_ccI(k)}</span>`;
+/* Pure: 'claude-opus-5-5' -> 'Opus 5.5', 'claude-haiku-4-5-20251001' -> 'Haiku 4.5'. */
+function _ccModelName(m){
+  const s=String(m||'').replace(/^claude-/,'').replace(/-\d{8}$/,'');
+  const mm=/^([a-z]+)-(\d+)(?:-(\d+))?$/.exec(s);
+  if(!mm) return s||'?';
+  return mm[1][0].toUpperCase()+mm[1].slice(1)+' '+mm[2]+(mm[3]!=null?'.'+mm[3]:'');
+}
+/* Pure: deterministic bar heights (0.25..1) for a mini waveform. */
+function _ccWave(seed, n){
+  let h=0; for(const ch of String(seed||'x')) h=(h*31+ch.charCodeAt(0))>>>0;
+  const out=[];
+  for(let i=0;i<n;i++){ h=(h*1103515245+12345)>>>0; out.push(.25+((h>>>8)%1000)/1000*.75); }
+  return out;
+}
+function _ccWaveHtml(seed, n, cls){
+  return `<span class="${cls||'cc-wv'}">${_ccWave(seed,n).map((v,i)=>`<i style="height:${Math.round(v*100)}%;animation-delay:${(i*0.07).toFixed(2)}s"></i>`).join('')}</span>`;
+}
+function _ccRing(pct, label){
+  const p=typeof pct==='number'?Math.max(0,Math.min(100,pct)):null;
+  const C=2*Math.PI*40, col=p==null?'rgba(120,150,170,.5)':p>=90?'var(--r)':p>=75?'var(--o)':'var(--c)';
+  return `<div class="cc-ring"><svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" stroke="rgba(var(--c-rgb),.12)" stroke-width="8" fill="none"/>
+    <circle cx="50" cy="50" r="40" stroke="${col}" stroke-width="8" fill="none" stroke-linecap="round" stroke-dasharray="${((p||0)/100*C).toFixed(1)} ${C.toFixed(1)}" style="filter:drop-shadow(0 0 4px ${col})"/></svg>
+    <div class="cc-ring-v"><small>${label}</small><b>${p==null?'—':Math.round(p)+'%'}</b></div></div>`;
+}
+/* Pure: html of every COMMAND panel. sr = /status, d = _ccData, nowS = epoch
+   s, todayStr = local YYYY-MM-DD, notifs = the event log (oldest first). */
+function _commandParts(sr, d, nowS, todayStr, notifs){
+  sr=sr||{}; d=d||{};
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const pl=(n,w)=>`${n} ${w}${n===1?'':'s'}`;
+  const nameOf=s=>s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||String(s.id||'').slice(0,8);
+  const sessions=(sr.sessions_list||[]).filter(s=>s&&s.session_active!==false);
+  const waiting=_waitingSessions(sessions, 0);
+  const running=(sr.agents||[]).filter(a=>a.status==='running');
+  const an=d.an||{}, todayCost=(an.today&&an.today.cost)||0;
+  const wins=((sr.rate_limits||{}).windows)||[];
+  const w5=wins.find(w=>w.kind==='five_hour'&&typeof w.pct==='number'), w7=wins.find(w=>w.kind==='seven_day'&&typeof w.pct==='number');
+  const wd=((sr.infra_health||{}).watchdog)||null;
+  const parts={};
+
+  const ovRow=(ico,tone,label,sub,cls)=>`<div class="cc-ov-row">${_ccIco(ico,tone)}<div><b>${label}</b><small class="${cls}">${escHtml(sub)}</small></div></div>`;
+  const pct5=w5?Math.round(w5.pct):null;
+  parts.ov=[
+    ovRow('term','','Claude Code',sessions.length?pl(sessions.length,'session')+' open':'No session open',sessions.length?'ok':'info'),
+    ovRow('agents','purple','Agents',running.length?`${running.length} running`:'Idle',running.length?'ok':'info'),
+    ovRow('bell','amber','Needs you',waiting.length?`${waiting.length} waiting`:'Nothing waiting',waiting.length?'warn':'ok'),
+    ovRow('gauge','green','Plan limit',pct5==null?'No data yet':(w5.status==='hit'?'Limit reached':`${pct5}% of the 5-hour window`),pct5==null?'info':w5.status==='hit'||pct5>=90?'bad':pct5>=80?'warn':'ok'),
+    ovRow('coin','pink','Spend today',money(todayCost),'info'),
+    ovRow('shield','blue','Watchdog',wd?(wd.pid_alive?'Running':'Not running'):'Checking…',wd?(wd.pid_alive?'ok':'bad'):'info'),
+  ].join('');
+
+  parts.hero=`<div class="cc-hero-t1">AOC</div><div class="cc-hero-t2">AGENT OPERATIONS CENTER</div>`;
+  /* the numbers the globe draws, as a legend row under it (the dot colours
+     match the satellites: cyan = session, amber = waiting, green = agents) */
+  const chip=(n,label,cls)=>`<span class="cc-hs ${cls}"><i></i><b>${escHtml(String(n))}</b>${label}</span>`;
+  parts.heroStats=[chip(sessions.length, sessions.length===1?'session':'sessions', 'c'),
+    waiting.length?chip(waiting.length, 'waiting', 'warn'):'',
+    chip(running.length, running.length===1?'agent live':'agents live', running.length?'ok':'dim'),
+    chip(money(todayCost), 'today', 'pink')].join('');
+
+  const tagOf={error:['ERROR','red','x'], err:['ERROR','red','x'], warn:['WARN','amber','warn'], warning:['WARN','amber','warn'], success:['DONE','green','check'], done:['DONE','green','check']};
+  const feed=waiting.slice(0,3).map(s=>{
+    const wl=_waitLabel(s);
+    const info=_lastMessageInfo(s.last_message, 120);
+    const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'Waiting for your reply');
+    return `<div class="cc-fi">${_ccIco(wl.blocked?'lock':'bell',wl.blocked?'red':'amber')}<div class="cc-fi-m"><b>${escHtml(nameOf(s))} needs you</b><small>${escHtml(text)}</small></div>
+      <button class="cc-fbtn${wl.blocked?'':' amber'}" onclick="setView('today')">Open</button></div>`;
+  });
+  (notifs||[]).slice(-40).reverse().forEach(n=>{
+    if(feed.length>=6||!n||!n.msg||_CC_FEED_SKIP.test(n.msg)) return;
+    const [tag,tone,ico]=tagOf[n.type]||['INFO','','info'];
+    feed.push(`<div class="cc-fi">${_ccIco(ico,tone)}<div class="cc-fi-m"><b>${escHtml(n.tag?n.tag+' · '+n.msg:n.msg)}</b><small>${escHtml(n.t||'')}</small></div>
+      <span class="cc-tag ${tone?'ic-'+tone:''}">${tag}</span></div>`);
+  });
+  const commits=((d.cm&&d.cm.stats&&d.cm.stats.commits)||[]).slice(0,6);
+  commits.forEach(c=>{
+    if(feed.length>=6) return;
+    const tm=c.epoch?new Date(c.epoch*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}):'';
+    feed.push(`<div class="cc-fi">${_ccIco('check','purple')}<div class="cc-fi-m"><b>${escHtml(c.subject||'(no message)')}</b><small>${escHtml([c.repo, tm, c.cost?money(c.cost):''].filter(Boolean).join(' · '))}</small></div>
+      <span class="cc-tag ic-purple">COMMIT</span></div>`);
+  });
+  parts.feed=feed.join('')||'<div class="cc-empty">Nothing has happened yet today.</div>';
+
+  const order=[...waiting, ...sessions.filter(s=>!waiting.includes(s))].slice(0,6);
+  const tones=['','purple','blue','amber','green','pink'];
+  parts.ags=order.map((s,i)=>{
+    const isWait=waiting.includes(s), n=running.filter(a=>a.session_id===s.id).length;
+    const st=isWait?['wait','Waiting on you']:['run',n?`Working · ${pl(n,'agent')}`:'Working'];
+    const model=s.model?_ccModelName(s.model):'';
+    return `<div class="cc-ag ${st[0]}" onclick="setView('cli')" title="${escHtml([model, s.estimated_cost?money(s.estimated_cost):''].filter(Boolean).join(' · '))}">${_ccIco('term',tones[i%tones.length])}
+      <div class="cc-ag-m"><b>${escHtml(nameOf(s))}</b><small class="${st[0]}"><i></i>${escHtml(st[1])}</small></div>${_ccWaveHtml(s.id,10)}</div>`;
+  }).join('')||`<div class="cc-empty">No Claude Code session is open. <button class="cc-more" onclick="openLaunch()">Start one ›</button></div>`;
+
+  const live=new Set(sessions.map(s=>s.id)), waitIds=new Set(waiting.map(s=>s.id));
+  const rows=(Array.isArray(d.hist)?d.hist:[]).filter(h=>h&&h.date===todayStr&&h.started_at)
+    .sort((a,b)=>String(a.started_at).localeCompare(String(b.started_at))).slice(-5);
+  const dmax=Math.max(...rows.map(h=>h.duration_s||0),1);
+  parts.tl=rows.map(h=>{
+    const cls=waitIds.has(h.id)?'wait':live.has(h.id)?'live':'done';
+    const status=cls==='wait'?'Waiting':cls==='live'?'Live':_fmtDurShort(h.duration_s||0);
+    return `<div class="cc-tl-row ${cls}" onclick="_jumpToSessionHistory(${jsq(h.id)})" title="Open this session in History"><span class="cc-tl-t">${escHtml(String(h.started_at).slice(0,5))}</span><span class="cc-tl-d"></span>
+      <div class="cc-tl-n"><b>${escHtml(h.title||h.project||String(h.id).slice(0,8))}</b><div class="cc-tl-bar"><span style="width:${Math.max(4,(h.duration_s||0)/dmax*100).toFixed(0)}%"></span></div></div>
+      <span class="cc-tl-s">${escHtml(status)}</span></div>`;
+  }).join('')||'<div class="cc-empty">No sessions yet today.</div>';
+
+  const sy=d.sys||{};
+  const gb=b=>b?Math.round(b/1073741824)+' GB':'';
+  parts.sys=`<div class="cc-rings">${_ccRing(sy.cpu,'CPU')}${_ccRing(sy.ram,'RAM')}${_ccRing(sy.disk,'Disk')}</div>
+    <div class="cc-sub">${escHtml([sy.ram_total?'RAM '+gb(sy.ram_total):'', sy.disk_total?`Disk ${sy.disk_path||''} ${gb(sy.disk_total)}`:''].filter(Boolean).join(' · '))}</div>`;
+
+  const cs=(d.cache&&d.cache.stats)||null, tot=(cs&&cs.total)||{};
+  const days=((cs&&cs.by_day)||[]).slice(-14);
+  let constel='<div class="cc-empty">Not enough days yet.</div>';
+  if(days.length>=2){
+    const cmax=Math.max(...days.map(x=>x.cost||0),0.01), W=240, H=100;
+    const pts=days.map((x,i)=>[10+i*(W-20)/(days.length-1), H-12-(x.cost||0)/cmax*(H-26)]);
+    constel=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline points="${pts.map(p=>p.map(v=>v.toFixed(1)).join(',')).join(' ')}" fill="none" stroke="rgba(var(--c-rgb),.45)" stroke-width="1"/>
+      ${pts.map((p,i)=>`<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${i===pts.length-1?3.2:2.2}" fill="#bff0ff" style="filter:drop-shadow(0 0 3px rgba(var(--c-rgb),.9))"><title>${escHtml(days[i].day||'')}: ${money(days[i].cost)}</title></circle>`).join('')}</svg>`;
+  }
+  parts.cache=cs?`<div class="cc-cache"><div>${constel}</div><div class="cc-kv">
+      <div><small>Cache hit rate</small><b>${tot.hit_rate!=null?Math.round(tot.hit_rate*100)+'%':'—'}</b></div>
+      <div><small>Saved by cache</small><b>${money(tot.saved)}</b></div>
+      <div><small>Spent, 7 days</small><b>${money(tot.cost)}</b></div></div></div>`
+    :'<div class="cc-empty">Reading your transcripts…</div>';
+
+  const mods=((cs&&cs.by_model)||[]).filter(m=>m&&m.model);
+  parts.modelsN=mods.length?`${mods.length} in use`:'';
+  const mt=['','purple','green','amber','blue','pink'];
+  parts.models=mods.map((m,i)=>`<div class="cc-mod">${_ccIco('chip',mt[i%mt.length])}<div style="min-width:0"><b>${escHtml(_ccModelName(m.model))}</b>
+      <small>${money(m.cost)} · ${(m.n||0).toLocaleString()} calls</small></div></div>`).join('')||'<div class="cc-empty">No API calls in the last 7 days.</div>';
+
+  const tun=sr.tunnel||{};
+  const fitem=(ico,tone,label,val)=>`<div class="cc-fitem">${_ccIco(ico,tone)}<div><small>${label}</small><b>${escHtml(val)}</b></div></div>`;
+  parts.foot=`${fitem('pc','','Machine',sy.host||'This PC')}${fitem('wifi','green','Remote access',tun.status==='ready'?'Tunnel live':'Local only')}
+    ${fitem('week','purple','Weekly limit',w7?Math.round(w7.pct)+'% used':'No data yet')}
+    <span class="cc-fline"></span><button class="cc-launch" onclick="openLaunch()"><b>LAUNCH SESSION</b><small>Start Claude Code in a folder</small></button><span class="cc-fline"></span>
+    <button class="cc-brief" onclick="setView('today')">${_ccI('doc')}Today's briefing</button>`;
+  return parts;
+}
+function _commandShell(){
+  const panel=(cls,title,id,extra)=>`<section class="cc-panel ${cls}"><div class="cc-hrow"><span class="cc-h">${title}</span>${extra||''}</div><div id="${id}"${['cc-ov','cc-feed','cc-ags','cc-tl','cc-models'].includes(id)?` class="${id}"`:''}></div></section>`;
+  const qb=(ico,label,fn)=>`<button class="cc-qb" onclick="${fn}">${_ccI(ico)}${label}</button>`;
+  return `<div class="cc-wrap">
+    <div class="cc-row cc-r1">
+      ${panel('','System overview','cc-ov','')}
+      <section class="cc-panel cc-hero" id="cc-hero"><canvas id="cc-globe"></canvas><div class="cc-hero-txt" id="cc-hero-txt"></div><div class="cc-hero-stats" id="cc-hero-stats"></div></section>
+      ${panel('','Live feed','cc-feed','<span class="cc-live"><i></i>LIVE</span>')}
+    </div>
+    <div class="cc-row cc-r2">
+      ${panel('','Active sessions','cc-ags','<button class="cc-more" onclick="setView(\'cli\')">View all ›</button>')}
+      ${panel('','Today\'s timeline','cc-tl','<button class="cc-more" onclick="setView(\'history\')">Full history ›</button>')}
+      <section class="cc-panel"><div class="cc-hrow"><span class="cc-h">Quick commands</span></div><div class="cc-qc">
+        ${qb('plus','Start new session','openLaunch()')}${qb('term','Open terminal',"setView('term')")}${qb('cmd','Command palette','openPalette()')}
+        ${qb('clock','Session history',"_histTab='sessions';setView('history')")}${qb('lock','Permission advisor',"_histTab='permissions';setView('history')")}</div></section>
+    </div>
+    <div class="cc-row cc-r3">
+      ${panel('','System monitor','cc-sys','')}
+      ${panel('','Cache · 7 days','cc-cache','<button class="cc-more" onclick="_histTab=\'cache\';setView(\'history\')">Cache report ›</button>')}
+      ${panel('','Models · 7 days','cc-models','<span class="cc-more" id="cc-models-n" style="color:var(--g);cursor:default"></span>')}
+    </div>
+    <section class="cc-panel cc-foot" id="cc-foot"></section>
+  </div>`;
+}
+async function _ccFetch(key, url, maxAge){
+  const now=Date.now();
+  if(now-_ccData[key+'At']<maxAge) return;
+  _ccData[key+'At']=now;
+  try{ _ccData[key]=await fetch(url).then(r=>r.json()); }catch(e){}
+}
+let _ccFetching=false;
+/* html last written per panel: compared against the new html instead of
+   n.innerHTML, which the browser re-serialises (<circle/> -> <circle></circle>,
+   so every panel with an icon looked changed and was rebuilt on each push) */
+const _ccPainted=new WeakMap();
+async function renderCommand(sr){
+  const el=document.getElementById('command-area');
+  if(!el||!sr) return;
+  if(!document.getElementById('cc-ov')) el.innerHTML=_commandShell();
+  const paint=()=>{
+    if(currentView!=='command') return;
+    const p=_commandParts(lastStatus||sr, _ccData, Date.now()/1000, _localDateStr(), _notifHistory);
+    [['cc-ov','ov'],['cc-hero-txt','hero'],['cc-hero-stats','heroStats'],['cc-feed','feed'],['cc-ags','ags'],['cc-tl','tl'],['cc-sys','sys'],['cc-cache','cache'],['cc-models','models'],['cc-models-n','modelsN'],['cc-foot','foot']]
+      .forEach(([id,k])=>{ const n=document.getElementById(id); if(n&&_ccPainted.get(n)!==p[k]){ n.innerHTML=p[k]; _ccPainted.set(n,p[k]); } });
+    _ccGlobeRun();
+  };
+  paint();
+  if(_ccFetching) return;
+  _ccFetching=true;
+  try{
+    await Promise.all([_ccFetch('an','/analytics',30000), _ccFetch('cache','/cache_stats?days=7',120000),
+      _ccFetch('hist','/history',60000), _ccFetch('sys','/sysinfo',5000), _ccFetch('cm','/commit_costs?days=1',60000)]);
+  }finally{ _ccFetching=false; }
+  paint();
+}
+/* Pure: a satellite's opacity at (px,py) given the title box {l,r,t,b} --
+   `min` inside it (0 = hidden), rising to 1 over the 16 px around it. */
+function _ccSatAlpha(px, py, b, min){
+  const dx=Math.max(b.l-px, 0, px-b.r), dy=Math.max(b.t-py, 0, py-b.b);
+  const lo=min||0;
+  return lo+(1-lo)*Math.min(1, Math.hypot(dx, dy)/16);
+}
+/* Pure: what the globe draws -- one satellite per open session (name,
+   waiting on you, running agents = its moons), the totals, and a signature
+   that changes whenever any of that does (each change sends out a ripple). */
+function _ccGlobeState(sr){
+  const sess=((sr&&sr.sessions_list)||[]).filter(s=>s&&s.session_active!==false);
+  const waitIds=new Set(_waitingSessions(sess,0).map(s=>s.id));
+  const run=((sr&&sr.agents)||[]).filter(a=>a&&a.status==='running');
+  const sats=sess.map(s=>({id:s.id, name:String(s.display_name||s.project||String(s.id||'').slice(0,8)),
+    wait:waitIds.has(s.id), agents:run.filter(a=>a.session_id===s.id).length}));
+  return {sats, waiting:waitIds.size, running:run.length, sig:sats.map(s=>s.id+(s.wait?':w':'')+':'+s.agents).join('|')};
+}
+/* The globe: points on a sphere joined to their near neighbours, two orbit
+   rings, and one labelled satellite per open session -- amber with a pulse
+   when it waits on you, a comet trail behind it, dimmed while it passes
+   behind the sphere, and a small moon per running agent. It spins faster
+   while agents run, takes an amber tint while anything waits, and sends a
+   ripple out whenever a session, its waiting state or its agents change. */
+function _ccGlobeRun(){
+  const cv=document.getElementById('cc-globe');
+  if(!cv) return;
+  if(_ccGlobe&&_ccGlobe.cv===cv) return;
+  const N=230, pts=[];
+  for(let i=0;i<N;i++){ const y=1-2*(i+.5)/N, r=Math.sqrt(1-y*y), th=i*2.39996; pts.push([Math.cos(th)*r, y, Math.sin(th)*r]); }
+  const links=[];
+  for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){ const dx=pts[i][0]-pts[j][0], dy=pts[i][1]-pts[j][1], dz=pts[i][2]-pts[j][2]; if(dx*dx+dy*dy+dz*dz<0.045) links.push([i,j]); }
+  const g=_ccGlobe={cv, a:0, last:0, sig:null, waiting:0, ripples:[]};
+  const still=typeof matchMedia!=='undefined'&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const AMBER='255,190,61', GREEN='76,214,140';
+  const font=getComputedStyle(document.body).fontFamily||'sans-serif';
+  const frame=(t)=>{
+    if(_ccGlobe!==g||!cv.isConnected){ return; }
+    if(currentView!=='command'||document.hidden){ requestAnimationFrame(frame); return; }
+    if(t-g.last<33){ requestAnimationFrame(frame); return; }
+    g.last=t;
+    const gs=_ccGlobeState(lastStatus);
+    if(gs.sig!==g.sig){
+      if(g.sig!==null&&!still) g.ripples.push({t0:t, col:gs.waiting>g.waiting?AMBER:null});
+      g.sig=gs.sig; g.waiting=gs.waiting;
+    }
+    if(!still) g.a+=0.0035+0.0022*Math.min(gs.running,6);
+    const tt=still?0:t;
+    const dpr=Math.min(2,window.devicePixelRatio||1), w=cv.clientWidth, h=cv.clientHeight;
+    if(!w||!h){ requestAnimationFrame(frame); return; }
+    /* the title sits over the canvas: satellites fade out as they pass behind it --
+       only to half on phones, where the title spans most of the globe */
+    const te=document.getElementById('cc-hero-txt'), tr=te&&te.getBoundingClientRect(), cr=cv.getBoundingClientRect();
+    const satMin=window.innerWidth<=768?0.5:0;
+    const tb=tr&&tr.width?{l:tr.left-cr.left-6, r:tr.right-cr.left+6, t:tr.top-cr.top-4, b:tr.bottom-cr.top+4}:null;
+    if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){ cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr); }
+    const x=cv.getContext('2d'); x.setTransform(dpr,0,0,dpr,0,0); x.clearRect(0,0,w,h);
+    const light=document.body.classList.contains('light');
+    const C=light?'30,120,190':'90,215,255';
+    const cx=w/2, cy=h*0.45, R=Math.min(w*0.3, h*0.37);
+    const glow=x.createRadialGradient(cx,cy,R*0.2,cx,cy,R*1.5);
+    glow.addColorStop(0,`rgba(${C},.18)`); glow.addColorStop(1,`rgba(${C},0)`);
+    x.fillStyle=glow; x.fillRect(0,0,w,h);
+    if(gs.waiting){
+      const breath=0.07+0.05*Math.sin(tt/700);
+      const wg=x.createRadialGradient(cx,cy,R*0.5,cx,cy,R*1.35);
+      wg.addColorStop(0,`rgba(${AMBER},0)`); wg.addColorStop(0.75,`rgba(${AMBER},${breath.toFixed(3)})`); wg.addColorStop(1,`rgba(${AMBER},0)`);
+      x.fillStyle=wg; x.fillRect(0,0,w,h);
+    }
+    const ca=Math.cos(g.a), sa=Math.sin(g.a), tilt=0.38, ct=Math.cos(tilt), st=Math.sin(tilt);
+    const P=pts.map(p=>{ const X=p[0]*ca+p[2]*sa, Z0=-p[0]*sa+p[2]*ca, Y=p[1]*ct-Z0*st, Z=p[1]*st+Z0*ct; return [cx+X*R, cy+Y*R, Z]; });
+    x.lineWidth=0.6;
+    links.forEach(([i,j])=>{ const z=(P[i][2]+P[j][2])/2; x.strokeStyle=`rgba(${C},${(0.05+0.22*(z+1)/2).toFixed(3)})`; x.beginPath(); x.moveTo(P[i][0],P[i][1]); x.lineTo(P[j][0],P[j][1]); x.stroke(); });
+    P.forEach(p=>{ const k=(p[2]+1)/2; x.fillStyle=`rgba(${C},${(0.25+0.75*k).toFixed(3)})`; x.beginPath(); x.arc(p[0],p[1],0.7+1.4*k,0,6.283); x.fill(); });
+    /* ripples: something changed */
+    g.ripples=g.ripples.filter(r=>t-r.t0<1600);
+    g.ripples.forEach(r=>{
+      const p=(t-r.t0)/1600, col=r.col||C;
+      x.strokeStyle=`rgba(${col},${(0.55*(1-p)).toFixed(3)})`; x.lineWidth=2*(1-p)+0.5;
+      x.beginPath(); x.arc(cx,cy,R*(1+0.75*p),0,6.283); x.stroke();
+    });
+    const labels=[];
+    /* rounder, wider orbits than the sphere's own rings, so satellites spend
+       most of their lap around the title rather than behind it */
+    const orbits=[[1.5,0.3,0.9],[1.78,-0.2,-0.6]], OV=0.42;
+    orbits.forEach(([rr,tl,sp])=>{ x.strokeStyle=`rgba(${C},.28)`; x.lineWidth=1; x.beginPath(); x.ellipse(cx,cy,R*rr,R*rr*OV,tl,0,6.283); x.stroke(); });
+    const posOn=(rr,tl,th)=>{ const ex=Math.cos(th)*R*rr, ey=Math.sin(th)*R*rr*OV;
+      return [cx+ex*Math.cos(tl)-ey*Math.sin(tl), cy+ex*Math.sin(tl)+ey*Math.cos(tl), Math.sin(th)]; };
+    orbits.forEach(([rr,tl,sp],ri)=>{
+      gs.sats.filter((_,i)=>i%2===ri).forEach((s,i,arr)=>{
+        const th=g.a*sp*3+i*6.283/Math.max(1,arr.length);
+        const [px,py,depth]=posOn(rr,tl,th);
+        const col=s.wait?AMBER:C;
+        /* far half of the orbit, inside the sphere's disc: behind the globe */
+        const behind=depth<0&&Math.hypot(px-cx,py-cy)<R;
+        const al=(tb?_ccSatAlpha(px,py,tb,satMin):1)*(behind?0.35:1);
+        if(al<=0) return;
+        const dir=sp>0?1:-1;
+        for(let k=1;k<=12;k++){
+          const [qx,qy]=posOn(rr,tl,th-dir*k*0.035);
+          x.fillStyle=`rgba(${col},${(al*0.45*(1-k/13)).toFixed(3)})`;
+          x.beginPath(); x.arc(qx,qy,2.8*(1-k/15),0,6.283); x.fill();
+        }
+        if(s.wait){
+          const ph=(tt/1100)%1;
+          x.strokeStyle=`rgba(${AMBER},${(al*(1-ph)*0.9).toFixed(3)})`; x.lineWidth=1.5;
+          x.beginPath(); x.arc(px,py,6+10*ph,0,6.283); x.stroke();
+        }
+        x.fillStyle=`rgba(${col},${al.toFixed(3)})`; x.shadowColor=`rgba(${col},${al.toFixed(3)})`; x.shadowBlur=14;
+        x.beginPath(); x.arc(px,py,4.6,0,6.283); x.fill(); x.shadowBlur=0;
+        x.fillStyle=`rgba(255,255,255,${(al*0.85).toFixed(3)})`; x.beginPath(); x.arc(px,py,1.7,0,6.283); x.fill();
+        for(let j=0;j<s.agents;j++){
+          const ma=tt/520+j*6.283/s.agents, mx=px+Math.cos(ma)*11, my=py+Math.sin(ma)*8;
+          x.fillStyle=`rgba(${GREEN},${al.toFixed(3)})`; x.shadowColor=`rgba(${GREEN},${al.toFixed(3)})`; x.shadowBlur=6;
+          x.beginPath(); x.arc(mx,my,2.2,0,6.283); x.fill(); x.shadowBlur=0;
+        }
+        if(w>=300&&!behind) labels.push({px,py,al,s,col});
+      });
+    });
+    /* labels last, so no orbit or satellite crosses them */
+    x.font=`600 11px ${font}`; x.textBaseline='middle';
+    labels.forEach(({px,py,al,s,col})=>{
+      const txt=(s.name.length>18?s.name.slice(0,17)+'…':s.name)+(s.agents?` · ${s.agents}`:'');
+      const tw=x.measureText(txt).width, bw=tw+14, bh=18;
+      let lx=px+10; if(lx+bw>w-4) lx=px-10-bw;
+      const ly=Math.max(2,Math.min(h-bh-2,py-bh-4));
+      /* labels always hide behind the title, even where satellites only dim (phones) */
+      const la=Math.min(al, tb?Math.min(_ccSatAlpha(lx,ly,tb),_ccSatAlpha(lx+bw,ly+bh,tb),_ccSatAlpha(lx,ly+bh,tb),_ccSatAlpha(lx+bw,ly,tb)):1);
+      if(la<=0.02) return;
+      x.globalAlpha=la;
+      x.fillStyle=light?'rgba(255,255,255,.88)':'rgba(4,14,28,.78)'; x.strokeStyle=`rgba(${col},.55)`; x.lineWidth=1;
+      x.beginPath(); if(x.roundRect) x.roundRect(lx,ly,bw,bh,9); else x.rect(lx,ly,bw,bh); x.fill(); x.stroke();
+      x.fillStyle=s.wait?(light?'#8a5a00':'#ffd27a'):(light?'#0d2a3d':'#dcf7ff'); x.fillText(txt,lx+7,ly+bh/2+0.5);
+      x.globalAlpha=1;
+    });
+    x.strokeStyle=`rgba(${C},.35)`; x.lineWidth=1;
+    for(let k=0;k<3;k++){ x.beginPath(); x.ellipse(cx,cy+R*1.12+k*5,R*(0.9+k*0.18),R*0.1+k*2,0,0,6.283); x.globalAlpha=0.6-k*0.18; x.stroke(); }
+    x.globalAlpha=1;
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+/* Sidebar badges + the "needs you" block, and the topbar status pill. */
+function _sbUpdate(sr){
+  const sessions=((sr&&sr.sessions_list)||[]).filter(s=>s&&s.session_active!==false);
+  const waiting=_waitingSessions(sessions,0);
+  const running=((sr&&sr.agents)||[]).filter(a=>a.status==='running').length;
+  const set=(id,v,warn)=>{ const e=document.getElementById(id); if(e){ e.textContent=v?String(v):''; e.classList.toggle('warn',!!warn); } };
+  set('sb-n-today', waiting.length, true);
+  const inbox=_inboxItems(sr, Date.now()/1000).length;
+  set('sb-n-inbox', inbox, true);
+  set('mnav-n-inbox', inbox, true);
+  set('sb-n-agents', running, false);
+  set('sb-n-cli', sessions.length, false);
+  const box=document.getElementById('sb-attn');
+  if(box){
+    box.classList.toggle('warn', waiting.length>0);
+    const n=document.getElementById('sb-attn-n'), t=document.getElementById('sb-attn-txt');
+    if(n) n.textContent=String(waiting.length);
+    if(t) t.textContent=waiting.length?`${waiting.length===1?'A session is':waiting.length+' sessions are'} waiting on you`:(sessions.length?'All sessions are working':'No session open');
+  }
+}
+/* Pure: the status pill's state. */
+function _ccPillState(sr, ageMs){
+  if(!sr||ageMs>20000) return ['off','OFFLINE'];
+  const wd=((sr.infra_health||{}).watchdog)||null;
+  if((wd&&!wd.pid_alive)||((sr.agents||[]).some(a=>a.status==='error'))) return ['bad','DEGRADED'];
+  const sessions=(sr.sessions_list||[]).filter(s=>s&&s.session_active!==false);
+  if(_waitingSessions(sessions,0).length) return ['attn','ATTENTION'];
+  return ['ok','OPTIMAL'];
+}
+function _ccPillUpdate(){
+  const el=document.getElementById('cc-pill');
+  if(!el) return;
+  const [cls,label]=_ccPillState(lastStatus, Date.now()-_ccStatusAt);
+  el.className='cc-pill '+cls;
+  const b=el.querySelector('b'); if(b) b.innerHTML='<i></i>'+label;
+}
+setInterval(_ccPillUpdate, 5000);
+
+/* ── TODAY ── */
 let _todayCommits=null, _todayCommitsAt=0;
+/* ── Today -> Pick up where you left off: one card per project ── */
+let _resumeCards=null, _resumeAt=0;
+/* Pure: the cards (GET /resume_projects). A project with a session open
+   offers a switch to it instead of a second session. */
+function _resumeHtml(cards, nowS){
+  if(!cards||!cards.length) return '';
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  return `<div class="rs-grid">${cards.map((c,i)=>{
+    const ago=c.last&&c.last.at?_fmtDurationDHM(Math.max(60,nowS-c.last.at))+' ago':'';
+    const meta=[c.last&&c.last.title?'last: '+c.last.title:'', ago, `${c.sessions} session${c.sessions===1?'':'s'} · ${money(c.cost)} in 30 days`].filter(Boolean).join(' · ');
+    const open=(c.open||[]).length;
+    const main=open
+      ?`<button class="adp-btn rs-go running" onclick="_focusSession(${jsq(c.open[0])})" title="A session for this project is open: switch to its terminal">● Running · Switch</button>`
+      :`<button class="adp-btn rs-go" onclick="_resumeGo(${i},false)" title="New session in ${escHtml(c.cwd)} that starts with: ${escHtml(c.prompt)}">▶ Continue</button>`;
+    return `<div class="rs-card${open?' is-open':''}">
+      <div class="rs-name">${escHtml(c.name)}${c.folder?'<span class="rs-folder">folder</span>':''}</div>
+      ${c.hook?`<div class="rs-hook" title="${escHtml(c.hook)}">${escHtml(c.hook)}</div>`:''}
+      <div class="rs-meta">${escHtml(meta)}</div>
+      <div class="rs-prompt" title="What the new session starts with">“${escHtml(c.prompt)}”</div>
+      <div class="rs-btns">${main}
+        <button class="adp-btn rs-sub" onclick="_resumeGo(${i},true)" title="Reopen the last conversation itself (claude --resume): its full history, nothing new typed">⟲ Last conversation</button>
+        <button class="adp-btn rs-sub" onclick="_resumeEdit(${i})" title="Change the folder, message or model first">✎</button></div></div>`;
+  }).join('')}</div>`;
+}
+async function _resumeGo(i, resume){
+  const c=(_resumeCards||[])[i];
+  if(!c) return;
+  const body=resume?{cwd:c.cwd, resume:c.resume_id}:{cwd:c.cwd, prompt:c.prompt};
+  try{
+    const d=await fetch('/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+    if(d.ok){ _resumeAt=0; showToast('done', resume?'Conversation reopened':'Session started', c.name+(d.trusted===false?' · accept "trust this folder" in the new window first.':' shows up here in a few seconds.'), d.trusted===false?12000:5000); }
+    else showToast('warning','Not started', d.error||'Could not start it.');
+  }catch(e){ showToast('warning','Not started','Could not reach AOC.'); }
+}
+function _resumeEdit(i){
+  const c=(_resumeCards||[])[i];
+  if(!c) return;
+  openLaunch();
+  const f=document.querySelector('.ln-box form')||document.querySelector('form #ln-cwd')?.closest('form');
+  if(!f) return;
+  f.querySelector('#ln-cwd').value=c.cwd;
+  f.querySelector('#ln-prompt').value=c.prompt;
+}
+/* ── Today -> Parallel worktrees (GET /worktrees) ── */
+let _wtItems=null, _wtAt=0;
+/* Pure: the Start button's label for the form's Start + Where choices. */
+function _launchGoLabel(when, wt){
+  if(when!=='now') return 'Add to queue';
+  return wt>1?`Start ${wt} sessions`:wt===1?'Start in a worktree':'Start session';
+}
+/* Pure: why Merge is not possible for this worktree yet ('' = it is). */
+function _wtMergeBlock(w){
+  if(!w.exists) return 'The worktree folder is gone';
+  if((w.sessions||[]).some(s=>s.active)) return 'A session is still open in it — close it first';
+  if(w.dirty) return `${w.dirty} uncommitted file${w.dirty===1?'':'s'} — have the session commit (or discard)`;
+  if(!w.ahead) return 'No commits on this branch yet';
+  return '';
+}
+/* Pure: the panel -- one block per launch (group), one row per worktree. */
+function _wtHtml(items, nowS){
+  if(!items||!items.length) return '';
+  const groups=[];
+  items.forEach(w=>{ let g=groups.find(x=>x.id===w.group); if(!g){ g={id:w.group, items:[]}; groups.push(g); } g.items.push(w); });
+  return `<div class="wt-list">${groups.map(g=>{
+    const f=g.items[0];
+    const ago=f.created?_fmtDurationDHM(Math.max(60,nowS-f.created))+' ago':'';
+    const head=`<div class="wt-ghead"><span class="wt-repo">${escHtml(f.repo_name||f.repo||'')}</span><span class="wt-base">from ${escHtml(f.base||'')}</span>
+      ${f.model?`<span class="wt-model">${escHtml(f.model)}</span>`:''}<span class="wt-ago">${escHtml(ago)}</span></div>
+      ${f.prompt?`<div class="wt-prompt" title="${escHtml(f.prompt)}">“${escHtml(f.prompt)}”</div>`:''}`;
+    const rows=g.items.map(w=>{
+      const ss=w.sessions||[];
+      const open=ss.find(s=>s.active);
+      const sess=!w.exists?'<span class="wt-st gone">folder gone</span>'
+        :open?(open.waiting?'<span class="wt-st wait">Waiting on you</span>':'<span class="wt-st run">Working</span>')
+        :ss.length?'<span class="wt-st done">Closed</span>'
+        :w.error?`<span class="wt-st gone" title="${escHtml(w.error)}">not started</span>`:'<span class="wt-st idle">starting…</span>';
+      const cost=ss.reduce((a,s)=>a+(Number(s.cost)||0),0);
+      const facts=[w.ahead?`${w.ahead} commit${w.ahead===1?'':'s'}`:'', (w.add||w.del)?`<span class="wt-add">+${w.add}</span> <span class="wt-del">−${w.del}</span> in ${w.files} file${w.files===1?'':'s'}`:'',
+        w.dirty?`<span class="wt-dirty">${w.dirty} uncommitted</span>`:'', w.behind?`${escHtml(w.base)} moved ${w.behind} ahead`:'', cost?'$'+cost.toFixed(2):''].filter(Boolean).join(' · ');
+      const block=_wtMergeBlock(w);
+      return `<div class="wt-row" data-wt="${escHtml(w.id)}">
+        <div class="wt-main"><span class="wt-branch" title="${escHtml(w.path||'')}">${escHtml(w.branch||'')}</span>${sess}
+          ${open?`<button class="adp-btn wt-btn" onclick="_focusSession(${jsq(open.id)})" title="Bring its terminal to the front">Switch</button>`:''}</div>
+        <div class="wt-facts">${facts||'<span class="wt-none">no changes yet</span>'}${w.last_subject?` · <span class="wt-subj" title="${escHtml(w.last_subject)}">${escHtml(w.last_subject)}</span>`:''}</div>
+        <div class="wt-btns">
+          <button class="adp-btn wt-btn" onclick="_wtDiff(${jsq(w.id)},${jsq(w.branch||'')})"${w.exists||w.ahead?'':' disabled'} title="Everything this branch changed compared with ${escHtml(w.base||'')}">Diff</button>
+          <button class="adp-btn wt-btn wt-merge" onclick="_wtAct(${jsq(w.id)},'merge')"${block?` disabled title="${escHtml(block)}"`:` title="Merge into ${escHtml(w.base||'')} (checked for conflicts first), then remove the worktree"`}>Merge</button>
+          <button class="adp-btn wt-btn wt-discard" onclick="_wtAct(${jsq(w.id)},'discard')" title="Delete the worktree and its branch, with everything done in it">Discard</button></div></div>`;
+    }).join('');
+    return `<div class="wt-group">${head}${rows}</div>`;
+  }).join('')}</div>`;
+}
+async function _wtLoad(){
+  try{ _wtItems=(await fetch('/worktrees').then(r=>r.json())).items||[]; }catch(e){}
+}
+async function _wtAct(id, kind){
+  const w=(_wtItems||[]).find(x=>x.id===id);
+  const name=w?w.branch:id;
+  if(kind==='discard'&&!confirm(`Discard ${name}? The worktree folder and the branch are deleted, with every change made in it. This can't be undone.`)) return;
+  if(kind==='merge'&&!confirm(`Merge ${name} into ${w?w.base:'its base branch'}? The worktree and branch are removed afterwards.`)) return;
+  let d={};
+  const post=force=>fetch('/worktrees/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id, force})}).then(r=>r.json());
+  try{
+    d=await post(false);
+    if(!d.ok&&kind==='discard'&&/still open/.test(d.error||'')&&confirm('A session is still open in it. Discard anyway? (Close that terminal first, or Windows may keep the folder.)')) d=await post(true);
+  }catch(e){ d={ok:false, error:'Could not reach AOC.'}; }
+  if(d.ok) showToast('done', kind==='merge'?'Merged':'Discarded', kind==='merge'?`${name} → ${w?w.base:''}${d.sha?' @'+d.sha.slice(0,7):''}${d.cleanup_error?' · worktree not removed: '+d.cleanup_error:''}`:name, 6000);
+  else showToast('warning', kind==='merge'?'Not merged':'Not discarded', d.error||'failed', 9000);
+  _wtAt=0;
+  await _wtLoad();
+  if(lastStatus&&currentView==='today') renderToday(lastStatus);
+}
+async function _wtDiff(id, branch){
+  const o=_overlay('// '+branch, '<span style="color:var(--t3)">Loading…</span>');
+  try{
+    const d=await fetch('/worktrees/diff?id='+encodeURIComponent(id)).then(r=>r.json());
+    o.querySelector('.diff-body').innerHTML=d.ok?(_diffLinesHtml(d.diff)||'<span style="color:var(--t3)">(no changes yet)</span>'):escHtml(d.error||'failed');
+  }catch(e){ o.querySelector('.diff-body').textContent='Could not load the diff.'; }
+}
 async function renderToday(sr){
   const el=document.getElementById('today-area');
   if(!el||!sr) return;
   const now=Date.now();
+  if(now-_wtAt>((_wtItems||[]).length?15000:60000)){
+    _wtAt=now;
+    await _wtLoad();
+  }
   if(now-_kpiLastFetch>30000){
     _kpiLastFetch=now;
     try{ _kpiAnalytics=await fetch('/analytics').then(r=>r.json()); }catch(e){}
@@ -12930,8 +17249,12 @@ async function renderToday(sr){
     _todayCommitsAt=now;
     try{ _todayCommits=await fetch('/commit_costs?days=1').then(r=>r.json()); }catch(e){}
   }
+  if(now-_resumeAt>60000){
+    _resumeAt=now;
+    try{ _resumeCards=(await fetch('/resume_projects').then(r=>r.json())).cards||[]; }catch(e){}
+  }
   if(currentView!=='today') return;
-  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr(), _recaps, _recapMode);
+  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr(), _recaps, _recapMode, _resumeCards, _wtItems);
   if(el.innerHTML!==html) el.innerHTML=html;
   _recapAuto(sr);
 }
@@ -13021,7 +17344,81 @@ async function _queueCancel(id){
     if(!d.ok) showToast('warning','Not found','That task is gone already.');
   }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
 }
-function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
+/* ── INBOX: everything that needs you, one card per session, most urgent
+   first. Only /status data: a prompt AOC holds (perm_requests) or one
+   Claude Code shows in the terminal (waiting_kind), a turn waiting for an
+   answer, a hard budget cap, a prompt cache about to go cold (same lead
+   times and $0.25 floor as _cache_expiry_alerts), a session that looks
+   stuck, and finally plain "your turn". ── */
+const _INBOX_KINDS={
+  permission:{rank:0, label:'Needs your OK'},
+  question:  {rank:1, label:'Claude asks'},
+  budget:    {rank:2, label:'Budget cap hit'},
+  cache:     {rank:3, label:'Cache going cold'},
+  loop:      {rank:4, label:'Looks stuck'},
+  waiting:   {rank:5, label:'Your turn'},
+};
+/* Pure: [{kind, rank, label, s, secs, cacheLeft}] for sessions that need you. */
+function _inboxItems(sr, nowS){
+  const out=[];
+  ((sr&&sr.sessions_list)||[]).forEach(s=>{
+    if(!s||s.session_active===false) return;
+    const waiting=!!s.waiting_on_you, wl=_waitLabel(s);
+    const c=s.context||{};
+    let cacheLeft=null;
+    if(waiting&&c.cache_expires_at){
+      const left=c.cache_expires_at-nowS, lead=c.cache_ttl==='5m'?120:600;
+      const extra=(c.recache_usd||0)-(c.warm_usd||0);
+      if(left>0&&left<=lead&&c.recache_usd!=null&&extra>=0.25) cacheLeft=left;
+    }
+    const msg=_lastMessageInfo((s.reply_request&&s.reply_request.message)||s.last_message);
+    let kind=null;
+    if((s.perm_requests||[]).length||(waiting&&s.waiting_kind==='permission')) kind='permission';
+    else if(waiting&&(s.waiting_kind==='question'||(!wl.blocked&&msg&&msg.asked))) kind='question';
+    else if(s.budget&&typeof s.budget.spent==='number') kind='budget';
+    else if(cacheLeft!=null) kind='cache';
+    else if(s.loop&&s.loop.text) kind='loop';
+    else if(waiting||s.reply_request) kind='waiting';
+    if(!kind) return;
+    out.push({kind, rank:_INBOX_KINDS[kind].rank, label:_INBOX_KINDS[kind].label, s, secs:s.waiting_secs||0, cacheLeft});
+  });
+  return out.sort((a,b)=>(a.rank-b.rank)||(b.secs-a.secs));
+}
+/* Pure: the Inbox page for those items. */
+function _inboxHtml(items, nowS){
+  const nameOf=s=>s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||String(s.id||'').slice(0,8);
+  const head=`<div class="ib-head"><h2 class="ib-title">Inbox</h2><span class="ib-sub">${items.length?`${items.length} thing${items.length===1?'':'s'} need${items.length===1?'s':''} you`:'All clear'}</span></div>`;
+  if(!items.length) return head+`<div class="ib-empty"><div class="ib-empty-mark">✓</div><div>Nothing needs you right now.</div><div class="ib-empty-sub">Permission prompts, questions, budget caps, caches about to go cold and stuck sessions show up here.</div></div>`;
+  const usd=n=>'$'+(Number(n)||0).toFixed(2);
+  return head+`<div class="ib-list">${items.map(it=>{
+    const s=it.s, wl=_waitLabel(s);
+    const info=_lastMessageInfo(s.last_message, 220);
+    const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
+    const ask=_permAskHtml(s)||_replyAskHtml(s)
+      ||(text&&s.waiting_on_you?`<div class="ib-text">${wl.icon?wl.icon+' ':(info&&info.asked?'❓ ':'')}${escHtml(text)}</div>`:'');
+    const cache=it.kind==='cache'
+      ?`<div class="ib-cache">⏱ Reply within ${escHtml(_fmtDurationDHM(Math.max(60,Math.ceil(it.cacheLeft/60)*60)))} to keep the cache warm (~${usd(s.context.warm_usd)}) — after that the next message re-caches for ~${usd(s.context.recache_usd)}.</div>`:'';
+    const when=[s.machine||'', s.waiting_on_you?_fmtDurationDHM(Math.max(60,it.secs)):''].filter(Boolean).join(' · ');
+    const btns=[
+      s._isLocal===false?'':`<button class="adp-btn ib-btn" onclick="_focusSession(${jsq(s.id)})" title="Switch to this session's terminal window">Terminal</button>`,
+      `<button class="adp-btn ib-btn" onclick="setView('cli')" title="Open the Sessions view">Sessions</button>`,
+    ].join('');
+    return `<article class="td-card ib-item ib-${it.kind}">
+      <div class="ib-row"><span class="ib-kind">${escHtml(it.label)}</span><span class="ib-name">${escHtml(nameOf(s))}</span>
+        <span class="ib-when">${escHtml(when)}</span></div>
+      ${ask}${cache}${_budgetBadgeHtml(s)}${_loopBadgeHtml(s)}${_ctxMeterHtml(s, nowS)}
+      <div class="ib-btns">${btns}</div></article>`;
+  }).join('')}</div>`;
+}
+function renderInbox(sr){
+  const el=document.getElementById('inbox-area');
+  if(!el||!sr||currentView!=='inbox') return;
+  /* don't swap the DOM under an open "Details" or a focused button */
+  if(el.contains(document.activeElement)&&document.activeElement!==el&&document.activeElement.tagName!=='BUTTON') return;
+  const html=_inboxHtml(_inboxItems(sr, Date.now()/1000), Date.now()/1000);
+  if(el.innerHTML!==html) el.innerHTML=html;
+}
+function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode, resume, worktrees){
   const awayOf=s=>_awayBlockHtml(s, (recaps||{})[(s.machine||'')+'|'+s.id], nowS, recapMode||'auto');
   sr=sr||{}; an=an||{};
   const money=v=>'$'+(Number(v)||0).toFixed(2);
@@ -13085,12 +17482,15 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode){
   const sec=(title,body,empty,extra)=>`<section class="td-card"><h3>${title}${extra||''}</h3>${body||`<div class="td-empty">${empty}</div>`}</section>`;
   return `<div class="td-wrap">
     <header class="td-head"><h2>${escHtml(dateStr)}</h2><div class="td-facts">${facts.map(f=>`<span>${f}</span>`).join('')}</div>
-      <button class="adp-btn td-launch" onclick="openLaunch()" title="Start a new Claude Code session in a folder, with your first message">+ New session</button></header>
+      <div class="td-launch"><button class="adp-btn" onclick="openAsk()" title="Ask about your own history in plain words: spend, failures, commits, clients (Claude Haiku, about 1 cent)">Ask AOC</button>
+      <button class="adp-btn" onclick="openLaunch()" title="Start a new Claude Code session in a folder, with your first message">+ New session</button></div></header>
     <div class="td-grid">
       <div class="td-col">
         ${sec(`Needs you${waiting.length?` <span class="td-count">${waiting.length}</span>`:''}`, waitRows, 'Nothing is waiting on you.')}
         ${sec('Working', workRows, sessions.length?'Every open session is waiting on you.':'No Claude Code session is open.')}
         ${(sr.queue||[]).length?sec(`Queued <span class="td-count">${sr.queue.filter(t=>t.state==='queued').length}</span>`, _queueHtml(sr.queue, nowS), ''):''}
+        ${(worktrees||[]).length?sec(`Parallel worktrees <span class="td-count">${worktrees.length}</span>`, _wtHtml(worktrees, nowS), ''):''}
+        ${(resume||[]).length?sec('Pick up where you left off', _resumeHtml(resume, nowS), ''):''}
       </div>
       <div class="td-col">
         ${lim?sec('Plan limits', lim, ''):''}
@@ -13113,13 +17513,142 @@ function _tlClickAgent(id, frac){
   if(lastStatus) renderTimeline(lastStatus);
 }
 
+/* ── Session views: what Timeline / Heat / Graph / Tree draw when no agent
+   ran. They were agent-only, so on a day of plain sessions (no subagents)
+   all four stayed empty. Items = the open sessions plus today's history,
+   with transcript activity per minute and the files each one edited. ── */
+/* Pure: [{id, name, start, end (ms), state: 'wait'|'live'|'done', cost,
+   model, group, edited: [paths], minutes: [[epoch_s, lines]]}], oldest first. */
+function _sessionItems(sr, hist, act, todayStr, nowMs){
+  const live=((sr&&sr.sessions_list)||[]).filter(s=>s&&s.session_active!==false);
+  const waitIds=new Set(_waitingSessions(live,0).map(s=>s.id));
+  const by=new Map();
+  const base=p=>String(p||'').split(/[\\/]/).filter(Boolean).pop()||'';
+  (Array.isArray(hist)?hist:[]).forEach(h=>{
+    if(!h||h.date!==todayStr||!h.started_at) return;
+    const start=new Date(`${h.date}T${h.started_at}`).getTime();
+    if(!isFinite(start)) return;
+    by.set(h.id,{id:h.id, name:h.title||h.project||String(h.id).slice(0,8), start, end:start+(h.duration_s||0)*1000,
+      state:'done', cost:h.cost||0, model:'', group:h.project||'', edited:[], minutes:[]});
+  });
+  live.forEach(s=>{
+    const it=by.get(s.id)||{id:s.id, start:Date.parse(s.first_ts)||nowMs, cost:0, edited:[], minutes:[]};
+    it.name=s.display_name||it.name||s.project||String(s.id).slice(0,8);
+    it.end=nowMs; it.state=waitIds.has(s.id)?'wait':'live';
+    it.cost=s.estimated_cost||it.cost||0; it.model=s.model||''; it.group=base(s.cwd)||it.group||s.project||'';
+    if(!isFinite(it.start)) it.start=nowMs;
+    by.set(s.id,it);
+  });
+  const a=act||{};
+  by.forEach(it=>{ const x=a[it.id]; if(x){ it.minutes=x.minutes||[]; it.edited=x.edited||[];
+    if(it.minutes.length) it.start=Math.min(it.start, it.minutes[0][0]*1000); } });
+  return [...by.values()].sort((p,q)=>p.start-q.start);
+}
+const _svNote=n=>`<div class="sv-note"><b>No agents ran</b> — showing your ${n} session${n===1?'':'s'} from today instead. Click one to open it in History.</div>`;
+const _svEmpty='<div class="rp-empty" style="padding:60px 14px">No sessions today yet.<small>Agents and sessions show up here as soon as they start.</small></div>';
+const _svStateLabel={wait:'Waiting on you', live:'Live', done:'Finished'};
+const _svClock=ms=>new Date(ms).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+/* Pure: the span shown -- first session start .. now, at least 1 h. */
+function _svRange(items, nowMs){
+  const min=Math.min(...items.map(i=>i.start), nowMs-3600e3);
+  return [min, Math.max(nowMs, min+3600e3)];
+}
+function _sessTimelineHtml(items, nowMs){
+  if(!items.length) return _svEmpty;
+  const [t0,t1]=_svRange(items,nowMs), span=t1-t0, pct=t=>((t-t0)/span*100);
+  const stepH=span>8*3600e3?2:1, ticks=[];
+  const first=new Date(t0); first.setMinutes(0,0,0);
+  for(let t=first.getTime()+3600e3; t<t1; t+=stepH*3600e3) ticks.push(t);
+  const axis=`<div class="sv-axis">${ticks.map(t=>`<span style="left:${pct(t).toFixed(2)}%">${_svClock(t)}</span>`).join('')}<span class="now" style="left:100%">now</span></div>`;
+  const rows=items.map(it=>{
+    const bucket=Math.max(60e3, span/160), heat=new Map();
+    it.minutes.forEach(([m,n])=>{ const k=Math.floor((m*1000-t0)/bucket); heat.set(k,(heat.get(k)||0)+n); });
+    const hmax=Math.max(1,...heat.values());
+    const marks=[...heat].filter(([k])=>k>=0).map(([k,n])=>`<i style="left:${((k*bucket)/span*100).toFixed(2)}%;width:${(bucket/span*100).toFixed(2)}%;opacity:${(0.25+0.75*n/hmax).toFixed(2)}"></i>`).join('');
+    const dur=_fmtDurShort(Math.max(0,(it.end-it.start)/1000));
+    const meta=[_svStateLabel[it.state], dur, it.cost?'$'+it.cost.toFixed(2):'', it.edited.length?`${it.edited.length} file${it.edited.length===1?'':'s'}`:''].filter(Boolean).join(' · ');
+    return `<div class="sv-row ${it.state}" onclick="_jumpToSessionHistory(${jsq(it.id)})" title="${escHtml(it.name+' · '+_svClock(it.start)+'–'+(it.state==='done'?_svClock(it.end):'now'))}">
+      <div class="sv-name"><b>${escHtml(it.name)}</b><small>${escHtml(meta)}</small></div>
+      <div class="sv-track"><span class="sv-bar" style="left:${pct(it.start).toFixed(2)}%;width:${Math.max(0.6,pct(it.end)-pct(it.start)).toFixed(2)}%"></span>${marks}</div></div>`;
+  }).join('');
+  return `<div class="sv-wrap">${_svNote(items.length)}<div class="sv-tl">${axis}${rows}</div>
+    <div class="sv-legend"><span><i class="live"></i>Live</span><span><i class="wait"></i>Waiting on you</span><span><i class="done"></i>Finished</span><span><i class="act"></i>Activity (brighter = busier)</span></div></div>`;
+}
+/* Pure: heat grid -- one row per session, one column per time bin, cell = transcript lines. */
+function _sessHeatHtml(items, nowMs){
+  if(!items.length) return _svEmpty;
+  const [t0,t1]=_svRange(items,nowMs);
+  const binMin=[5,10,15,30,60].find(b=>(t1-t0)/(b*60e3)<=48)||60, bin=binMin*60e3, n=Math.ceil((t1-t0)/bin);
+  const grid=items.map(it=>{ const c=new Array(n).fill(0); it.minutes.forEach(([m,v])=>{ const k=Math.floor((m*1000-t0)/bin); if(k>=0&&k<n) c[k]+=v; }); return c; });
+  const max=Math.max(1,...grid.flat());
+  const every=Math.ceil(n/8);
+  const head=`<div class="sv-hname"></div>${Array.from({length:n},(_,k)=>`<div class="sv-hcol">${k%every===0?_svClock(t0+k*bin):''}</div>`).join('')}`;
+  const rows=items.map((it,r)=>`<div class="sv-hname ${it.state}" onclick="_jumpToSessionHistory(${jsq(it.id)})" title="${escHtml(it.name)}">${escHtml(it.name)}</div>`
+    +grid[r].map((v,k)=>`<div class="sv-cell" style="--a:${v?(0.15+0.85*v/max).toFixed(2):0}" title="${escHtml(`${it.name} · ${_svClock(t0+k*bin)} · ${v} line${v===1?'':'s'}`)}"></div>`).join('')).join('');
+  return `<div class="sv-wrap">${_svNote(items.length)}<div class="sv-heat" style="grid-template-columns:minmax(110px,170px) repeat(${n},minmax(8px,1fr))">${head}${rows}</div>
+    <div class="sv-legend"><span>${binMin}-minute bins</span><span class="sv-scale">less<i></i>more</span><span>transcript lines (messages + tool calls)</span></div></div>`;
+}
+/* Pure: the session graph -- nodes = sessions, edges = files both edited
+   (number on the edge) or the same folder (dashed). */
+function _sessGraphHtml(items){
+  if(!items.length) return _svEmpty;
+  const norm=p=>String(p).replace(/\\/g,'/').toLowerCase();
+  const W=680, n=items.length, H=n>4?500:400, cx=W/2, cy=H/2-10, R=n===1?0:Math.min(cx-110, cy-70, 170);
+  const pos=items.map((_,i)=>{ const a=2*Math.PI*i/n-Math.PI/2; return [cx+R*Math.cos(a), cy+R*Math.sin(a)]; });
+  const sets=items.map(it=>new Set(it.edited.map(norm)));
+  const edges=[];
+  for(let i=0;i<n;i++) for(let j=i+1;j<n;j++){
+    let shared=0; sets[i].forEach(p=>{ if(sets[j].has(p)) shared++; });
+    const same=items[i].group&&items[i].group===items[j].group;
+    if(shared||same) edges.push({i,j,shared,same});
+  }
+  const col={wait:'var(--o)', live:'var(--c)', done:'var(--t3)'};
+  const maxCost=Math.max(0.01,...items.map(i=>i.cost||0));
+  const edgeSvg=edges.map(e=>{ const [x1,y1]=pos[e.i], [x2,y2]=pos[e.j];
+    return `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" style="stroke:var(--c)" stroke-opacity="${e.shared?0.65:0.3}" stroke-width="${e.shared?Math.min(6,1.5+e.shared/2):1.2}"${e.shared?'':' stroke-dasharray="5 4"'}/>`
+      +(e.shared?`<text x="${((x1+x2)/2).toFixed(1)}" y="${((y1+y2)/2-6).toFixed(1)}" text-anchor="middle" class="sv-elab">${e.shared} shared file${e.shared===1?'':'s'}</text>`:''); }).join('');
+  const nodeSvg=items.map((it,i)=>{ const [x,y]=pos[i], r=16+14*Math.sqrt((it.cost||0)/maxCost);
+    return `<g class="sv-node" onclick="_jumpToSessionHistory(${jsq(it.id)})"><title>${escHtml(`${it.name} · ${_svStateLabel[it.state]} · $${(it.cost||0).toFixed(2)} · ${it.edited.length} files`)}</title>
+      <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(r+6).toFixed(1)}" style="fill:${col[it.state]}" fill-opacity=".12"/>
+      <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" style="fill:${col[it.state]};stroke:${col[it.state]}" fill-opacity=".25" stroke-width="2"/>
+      <text x="${x.toFixed(1)}" y="${(y+4).toFixed(1)}" text-anchor="middle" class="sv-nval">${it.edited.length}</text>
+      <text x="${x.toFixed(1)}" y="${(y+r+18).toFixed(1)}" text-anchor="middle" class="sv-nlab">${escHtml(it.name.length>24?it.name.slice(0,23)+'…':it.name)}</text>
+      <text x="${x.toFixed(1)}" y="${(y+r+32).toFixed(1)}" text-anchor="middle" class="sv-nsub">${escHtml(`${_svStateLabel[it.state]} · $${(it.cost||0).toFixed(2)}`)}</text></g>`; }).join('');
+  return `<div class="sv-wrap">${_svNote(n)}<svg class="sv-graph" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${edgeSvg}${nodeSvg}</svg>
+    <div class="sv-legend"><span><i class="live"></i>Live</span><span><i class="wait"></i>Waiting</span><span><i class="done"></i>Finished</span><span>number = files edited · size = cost</span><span>line = files both edited · dashed = same folder</span></div></div>`;
+}
+/* Pure: folder -> sessions, with what each one did. */
+function _sessTreeHtml(items){
+  if(!items.length) return _svEmpty;
+  const groups=new Map();
+  items.forEach(it=>{ const g=it.group||'Other'; if(!groups.has(g)) groups.set(g,[]); groups.get(g).push(it); });
+  const body=[...groups].map(([g,list])=>{
+    const cost=list.reduce((s,i)=>s+(i.cost||0),0), files=list.reduce((s,i)=>s+i.edited.length,0);
+    return `<div class="sv-tg"><div class="sv-tgh"><b>${escHtml(g)}</b><small>${list.length} session${list.length===1?'':'s'} · ${files} file${files===1?'':'s'} · $${cost.toFixed(2)}</small></div>
+      ${list.map(it=>`<div class="sv-tn ${it.state}" onclick="_jumpToSessionHistory(${jsq(it.id)})"><i></i><div><b>${escHtml(it.name)}</b>
+        <small>${escHtml([_svStateLabel[it.state], _svClock(it.start)+'–'+(it.state==='done'?_svClock(it.end):'now'), it.model?_ccModelName(it.model):'', it.edited.length?`${it.edited.length} files`:'', '$'+(it.cost||0).toFixed(2)].filter(Boolean).join(' · '))}</small>
+        <small class="sv-tsub">No subagents</small></div></div>`).join('')}</div>`;
+  }).join('');
+  return `<div class="sv-wrap">${_svNote(items.length)}<div class="sv-tree"><div class="sv-troot">Today</div>${body}</div></div>`;
+}
+const _svPainted=new WeakMap();
+/* No agents: draw the session version of `view` into `el`. Fetches /history
+   and /session_activity (cached) and redraws once when fresh data lands. */
+function _sessFallback(view, el, sr){
+  const before=_ccData.histAt+_ccData.actAt;
+  const pending=Promise.all([_ccFetch('hist','/history',60000), _ccFetch('act','/session_activity?hours=24',30000)]);
+  if(_ccData.histAt+_ccData.actAt!==before)
+    pending.then(()=>{ if(currentView===view&&lastStatus) ({timeline:renderTimeline, heat:renderHeatmap, graph:renderGraph, tree:renderTree})[view](lastStatus); });
+  const now=Math.floor(Date.now()/60e3)*60e3; // to the minute, so a status push alone doesn't redraw
+  const items=_sessionItems(sr, _ccData.hist, _ccData.act, _localDateStr(), now);
+  const html=({timeline:_sessTimelineHtml, heat:_sessHeatHtml, graph:_sessGraphHtml, tree:_sessTreeHtml})[view](items, now);
+  if(_svPainted.get(el)!==html){ el.innerHTML=html; _svPainted.set(el,html); }
+}
 function renderTimeline(data){
   const tl=document.getElementById('timeline-area');
   const agents=(data.agents||[]).filter(a=>!String(a.id||'').startsWith('hook_')&&a.started_at);
-  if(!agents.length){
-    tl.innerHTML='<div style="color:var(--t3);text-align:center;padding:60px;font-family:var(--font2);font-size:9px;letter-spacing:.12em">NO AGENT DATA FOR TIMELINE</div>';
-    return;
-  }
+  if(!agents.length){ _sessFallback('timeline', tl, data); return; }
+  _svPainted.delete(tl);
   const now=Date.now();
   let minT=Infinity, maxT=-Infinity;
   agents.forEach(a=>{
@@ -13662,13 +18191,71 @@ function _changesBtnHtml(s){
 function _sessionChangesHtml(d, sid, machine){
   if(!d||!d.ok) return `<div class="chg-empty">${escHtml((d&&d.error)||'Could not load the changes.')}</div>`;
   const kindTag={modified:'M',added:'A',deleted:'D',renamed:'R',untracked:'NEW'};
+  // review actions write to the repo: only on this PC's own sessions
+  const act=!!d.local&&!machine;
+  const all=(d.repos||[]).flatMap(r=>r.files);
+  const seenFiles=all.filter(f=>f.seen);
   const repos=(d.repos||[]).map(r=>`<div class="chg-repo"><div class="chg-repo-head"><b>${escHtml(r.name)}</b>${r.branch?`<span class="chg-branch">⎇ ${escHtml(r.branch)}</span>`:''}<span class="chg-root">${escHtml(r.root)}</span></div>
-    ${r.files.map(f=>`<button class="chg-file" onclick="_showSessionFileDiff(${jsq(sid)},${jsq(machine)},${jsq(f.path)},${jsq(f.rel)})">
+    ${r.files.map(f=>`<div class="chg-row${f.seen?' seen':''}"><button class="chg-file" onclick="_showSessionFileDiff(${jsq(sid)},${jsq(machine)},${jsq(f.path)},${jsq(f.rel)})">
       <span class="chg-kind k-${f.kind}">${kindTag[f.kind]||'M'}</span><span class="chg-rel">${escHtml(f.rel)}</span>
-      <span class="chg-num">${f.ins!=null?`<span class="cc-ins">+${f.ins}</span>`:''} ${f.dels?`<span class="cc-del">−${f.dels}</span>`:''}</span></button>`).join('')}</div>`).join('');
-  const n=(d.repos||[]).reduce((a,r)=>a+r.files.length,0);
+      <span class="chg-num">${f.ins!=null?`<span class="cc-ins">+${f.ins}</span>`:''} ${f.dels?`<span class="cc-del">−${f.dels}</span>`:''}</span></button>${act?`
+      <button class="chg-act chg-seen${f.seen?' on':''}" onclick="_chgSeen(${jsq(sid)},${jsq(f.path)},${!f.seen})" title="${f.seen?'Reviewed — click to unmark':'Mark as reviewed (cleared if the file changes again)'}">✓</button>${f.kind==='renamed'?'':`
+      <button class="chg-act chg-disc" onclick="_chgDiscard(${jsq(sid)},${jsq(f.path)},${jsq(f.rel)},${jsq(f.kind)},${!!d.working},${f.sig==null?'null':jsq(f.sig)})" title="${f.kind==='untracked'||f.kind==='added'?'Remove this new file (kept in AOC\'s backup, can be restored)':'Throw away the uncommitted changes (AOC keeps a copy, can be restored)'}">Discard</button>`}`:''}</div>`).join('')}</div>`).join('');
+  const n=all.length;
+  const head=act&&n?`<div class="chg-bar">${d.working?'<span class="chg-warn">⚠ The session is still working — it may edit these files again.</span>':''}
+    <span class="chg-progress">${seenFiles.length}/${n} reviewed</span>
+    ${seenFiles.length?`<button class="adp-btn chg-stage" onclick="_chgStage(${jsq(sid)},${escHtml(JSON.stringify(seenFiles.map(f=>String(f.path))))})" title="git add the reviewed files">Stage reviewed (${seenFiles.length})</button>`:''}</div>`:'';
+  const disc=act&&(d.discards||[]).length?`<div class="chg-discards"><div class="chg-sec">Discarded — can be put back</div>${d.discards.map(m=>`<div class="chg-row disc">
+      <span class="chg-kind k-${escHtml(m.kind||'modified')}">${kindTag[m.kind]||'M'}</span><span class="chg-rel">${escHtml(m.rel||m.path)}</span>
+      <span class="chg-when">${m.at?escHtml(new Date(m.at*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})):''}</span>
+      <button class="chg-act" onclick="_chgUndo(${jsq(sid)},${jsq(m.id)},${jsq(m.rel||m.path)})" title="Put the file back as it was before the discard">↶ Restore</button></div>`).join('')}</div>`:'';
   const foot=[d.clean?`${d.clean} edited file${d.clean===1?' is':'s are'} committed or unchanged`:'', d.outside?`${d.outside} outside any git repo`:''].filter(Boolean).join(' · ');
-  return `${n?repos:'<div class="chg-empty">Nothing uncommitted — everything this session edited is committed.</div>'}${foot?`<div class="chg-foot">${escHtml(foot)}</div>`:''}`;
+  return `${head}${n?repos:'<div class="chg-empty">Nothing uncommitted — everything this session edited is committed.</div>'}${disc}${foot?`<div class="chg-foot">${escHtml(foot)}</div>`:''}`;
+}
+/* Review actions in the Changes panel (this PC only, see _sessionChangesHtml). */
+let _chgCtx=null;
+async function _chgReload(){
+  const x=_chgCtx;
+  if(!x||!document.body.contains(x.o)) return;
+  try{
+    const d=await fetch(_apiUrl(_machineFor(x.machine),'/session_changes?session_id='+encodeURIComponent(x.sid))).then(r=>r.json());
+    x.o.querySelector('.chg-body').innerHTML=_sessionChangesHtml(d, x.sid, x.machine);
+  }catch(e){ x.o.querySelector('.chg-body').innerHTML=_sessionChangesHtml(null); }
+}
+async function _chgPost(route, body){
+  try{ return await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()); }
+  catch(e){ return {ok:false,error:'Could not reach AOC.'}; }
+}
+async function _chgSeen(sid, path, seen){
+  const r=await _chgPost('/session_changes/seen',{session_id:sid, path, seen});
+  if(!r.ok) showToast('warning','Not saved', r.error||'failed');
+  _chgReload();
+}
+async function _chgDiscard(sid, path, rel, kind, working, sig){
+  const isNew=kind==='untracked'||kind==='added';
+  const msg=(isNew?`Remove the new file "${rel}"?\n\nIt moves into AOC's backup — you can restore it from this panel.`
+    :`Throw away the uncommitted changes in "${rel}" and go back to the last commit?\n\nAOC keeps a copy — you can restore it from this panel.`)
+    +(working?'\n\n⚠ The session is still working and may edit this file again.':'');
+  if(!confirm(msg)) return;
+  const r=await _chgPost('/session_changes/discard',sig==null?{session_id:sid, path}:{session_id:sid, path, sig});
+  if(r.ok) showToast('done','Discarded', rel+' · ↶ Restore is in the Changes panel.');
+  else if(r.conflict) showToast('warning','Not discarded', rel+' changed since you opened the panel — the list is refreshed, check it again.');
+  else showToast('warning','Not discarded', r.error||'failed');
+  _chgReload();
+}
+async function _chgUndo(sid, id, rel){
+  let r=await _chgPost('/session_changes/undo',{session_id:sid, id});
+  if(!r.ok&&r.conflict&&confirm(`"${rel}" changed again after the discard.\n\nRestore the old copy anyway? The newer changes in that file will be lost.`))
+    r=await _chgPost('/session_changes/undo',{session_id:sid, id, force:true});
+  if(r.ok) showToast('done','Restored', rel);
+  else if(!r.conflict) showToast('warning','Not restored', r.error||'failed');
+  _chgReload();
+}
+async function _chgStage(sid, paths){
+  const r=await _chgPost('/session_changes/stage',{session_id:sid, paths});
+  if(r.ok) showToast('done','Staged', `${r.staged.length} file${r.staged.length===1?'':'s'} added to the index — ready to commit.`);
+  else showToast('warning','Not staged', r.error||((r.failed||[]).length+' file(s) failed'));
+  _chgReload();
 }
 function _overlay(title, bodyHtml, cls){
   const o=document.createElement('div');
@@ -13679,8 +18266,97 @@ function _overlay(title, bodyHtml, cls){
   document.body.appendChild(o);
   return o;
 }
+/* Ask AOC: a question about your own history, answered by Haiku from facts
+   AOC gathers locally (POST /ask). One question at a time. */
+const _ASK_EXAMPLES=['How much did I spend this week?','Which sessions failed the most in the last 7 days?',
+  'Koľko ma stál OmniSocial tento mesiac?','What did I commit yesterday?'];
+let _askState={busy:false, last:null, error:'', history:null};
+/* Pure: an answer's text -> html. Escaped first; [#1a2b3c4d] ids the server
+   sent in `sessions` become Replay buttons, '- ' lines a list. */
+function _askAnswerHtml(entry){
+  if(!entry||!entry.answer) return '';
+  const sessions=entry.sessions||{};
+  const inline=t=>escHtml(t).replace(/\[#([0-9a-f]{8})\]/gi,(m,k)=>{
+    const s=sessions[k]||sessions[k.toLowerCase()];
+    if(!s||!s.id) return m;
+    const label=s.title||k;
+    return `<button class="ask-ref" onclick="openReplay(${jsq(s.id)},'',${jsq(label)})" title="Replay ${escHtml(label)}">${escHtml(label.length>40?label.slice(0,39)+'…':label)}</button>`;
+  });
+  const lines=String(entry.answer).split(/\n+/).map(l=>l.trim()).filter(Boolean);
+  let html='', list=[];
+  const flush=()=>{ if(list.length){ html+=`<ul>${list.map(l=>`<li>${l}</li>`).join('')}</ul>`; list=[]; } };
+  lines.forEach(l=>{
+    if(/^[-*•]\s/.test(l)) list.push(inline(l.replace(/^[-*•]\s+/,'')));
+    else { flush(); html+=`<p>${inline(l)}</p>`; }
+  });
+  flush();
+  const p=entry.period||{};
+  const meta=[p.label?`${escHtml(p.label)}${p.from?` (${escHtml(p.from)}${p.to&&p.to!==p.from?' – '+escHtml(p.to):''})`:''}`:'',
+    entry.cached?'cached answer':(entry.cost!=null?'$'+(Number(entry.cost)||0).toFixed(3):'')].filter(Boolean).join(' · ');
+  return `<div class="ask-answer">${html}${meta?`<div class="ask-meta">${meta}</div>`:''}</div>`;
+}
+/* Pure: the whole overlay body (state = _askState). */
+function _askBodyHtml(state){
+  state=state||{};
+  let out='';
+  if(state.busy) out+='<div class="ask-note">Gathering facts and asking Claude Haiku…</div>';
+  else if(state.error) out+=`<div class="ask-note err">${escHtml(state.error)}</div>`;
+  if(state.last) out+=`<div class="ask-q-echo ask-h-title">${escHtml(state.last.q||'')}</div>`+_askAnswerHtml(state.last)
+    +(state.last.cached&&!state.busy?`<button class="ask-chip" onclick="_askRun(${jsq(state.last.q||'')},true)">Ask again (fresh)</button>`:'');
+  if(!state.last&&!state.busy){
+    out+=`<div class="ask-hint">${_ASK_EXAMPLES.map(q=>`<button class="ask-chip" onclick="_askRun(${jsq(q)})">${escHtml(q)}</button>`).join('')}</div>`;
+  }
+  const hist=(state.history||[]).filter(h=>!state.last||h.key!==state.last.key).slice(0,8);
+  if(hist.length){
+    out+=`<div class="ask-h-title">Earlier questions</div><div class="ask-hint">${hist.map(h=>
+      `<button class="ask-chip" onclick="_askShow(${jsq(h.key)})" title="${escHtml(h.q||'')}">${escHtml((h.q||'').length>60?h.q.slice(0,59)+'…':h.q||'')}</button>`).join('')}</div>`;
+  }
+  out+='<div class="ask-note">Answers come only from your own AOC data (sessions, spend, commits, failures, clients). Claude Haiku, about 1 cent per question; repeats on the same day are free.</div>';
+  return out;
+}
+function _askRender(){
+  const o=document.getElementById('ask-overlay');
+  if(o) o.querySelector('.ask-out').innerHTML=_askBodyHtml(_askState);
+  const b=o&&o.querySelector('.ask-go'); if(b) b.disabled=_askState.busy;
+}
+async function openAsk(q){
+  let o=document.getElementById('ask-overlay');
+  if(!o){
+    o=_overlay('Ask AOC', `<form class="ask-form" onsubmit="event.preventDefault();_askRun(this.q.value)">
+      <input class="ask-input" name="q" maxlength="500" autocomplete="off" placeholder="e.g. How much did the AOC sessions cost last week?">
+      <button class="adp-btn ask-go" type="submit">Ask</button></form><div class="ask-out"></div>`, 'ask-box');
+    o.id='ask-overlay';
+  }
+  _askRender();
+  const input=o.querySelector('.ask-input');
+  if(q){ input.value=q; }
+  setTimeout(()=>input.focus(),30);
+  try{ _askState.history=(await fetch('/ask/history').then(r=>r.json())).items||[]; _askRender(); }catch(e){}
+}
+function _askShow(key){
+  const h=(_askState.history||[]).find(x=>x.key===key);
+  if(h){ _askState.last={...h, cached:true}; _askState.error=''; _askRender();
+    const i=document.querySelector('#ask-overlay .ask-input'); if(i) i.value=h.q||''; }
+}
+async function _askRun(q, force){
+  q=String(q||'').trim();
+  if(!q||_askState.busy) return;
+  const i=document.querySelector('#ask-overlay .ask-input'); if(i) i.value=q;
+  _askState.busy=true; _askState.error=''; _askRender();
+  try{
+    const d=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q, force:!!force})}).then(r=>r.json());
+    if(d.ok){
+      _askState.last=d;
+      const h=(_askState.history||[]).filter(x=>x.key!==d.key);
+      _askState.history=[d].concat(h);
+    } else _askState.error=d.error||'failed';
+  }catch(e){ _askState.error='Could not reach AOC.'; }
+  _askState.busy=false;
+  _askRender();
+}
 async function openSessionChanges(sid, machine, label){
   const o=_overlay('Changes · '+label, '<div class="chg-empty">Loading…</div>', 'chg-box');
+  _chgCtx={o, sid, machine};
   try{
     const d=await fetch(_apiUrl(_machineFor(machine),'/session_changes?session_id='+encodeURIComponent(sid))).then(r=>r.json());
     o.querySelector('.chg-body').innerHTML=_sessionChangesHtml(d, sid, machine);
@@ -14077,10 +18753,8 @@ function renderGraph(data){
   if(!el) return;
   if(!data){ el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;letter-spacing:.1em">WAITING FOR DATA</div>'; return; }
   const agents=(data.agents||[]).filter(a=>!String(a.id||'').startsWith('hook_'));
-  if(!agents.length){
-    el.innerHTML='<div style="color:var(--t3);font-family:var(--font2);font-size:10px;letter-spacing:.12em">NO AGENTS TO GRAPH</div>';
-    return;
-  }
+  if(!agents.length){ _sessFallback('graph', el, data); return; }
+  _svPainted.delete(el);
   const tc=_graphThemeColors();
   const W=680, H=Math.max(360, agents.length>4?500:360);
   const cx=W/2, cy=H/2, R=Math.min(cx-90, cy-80, 170);
@@ -14315,11 +18989,12 @@ function _permAskHtml(s){
   const call=(d)=>`_permDecide(${jsq(s.machine||'')},${jsq(q.id)},'${d}')`;
   const more=reqs.length>1?`<span class="perm-more">+${reqs.length-1} more after this</span>`:'';
   const detail=q.detail?`<details class="perm-detail"><summary>Details</summary><pre>${escHtml(q.detail)}</pre></details>`:'';
-  return `<div class="perm-ask" onclick="event.stopPropagation()">
-    <div class="perm-head"><span class="woy-lbl">🔐 Needs your OK</span>${more}</div>
+  const lbl=q.danger?`⚠ Dangerous command · ${escHtml(q.danger)}`:'🔐 Needs your OK';
+  return `<div class="perm-ask${q.danger?' danger':''}" onclick="event.stopPropagation()">
+    <div class="perm-head"><span class="woy-lbl">${lbl}</span>${more}</div>
     <div class="perm-sum">${escHtml(q.summary)}</div>${detail}
     <div class="perm-btns">
-      <button class="perm-btn allow" onclick="${call('allow')}">Allow</button>
+      <button class="perm-btn allow" onclick="${call('allow')}">${q.danger?'Run it':'Allow'}</button>
       <button class="perm-btn deny" onclick="${call('deny')}">Deny…</button>
       <button class="perm-btn term" onclick="${call('terminal')}" title="Let go of the prompt: Claude Code shows its normal dialog in the terminal">Answer in terminal</button>
     </div></div>`;
@@ -14361,6 +19036,35 @@ function _raSyncIdle(){
   const m=document.getElementById('st-ra-mode'), w=document.getElementById('st-ra-idle-wrap');
   const rp=document.getElementById('st-ra-reply');
   if(m&&w) w.style.display=m.value==='away'||(rp&&rp.value==='away')?'inline-flex':'none';
+}
+/* Pure: the built-in guard rules as checkboxes (checked = guarded). */
+function _dgRulesHtml(rules, off){
+  return (rules||[]).map(r=>`<label class="dg-rule"><input type="checkbox" data-rule="${escHtml(r.id)}" ${(off||[]).includes(r.id)?'':'checked'} onchange="_dgSave()">
+    <span><b>${escHtml(r.label)}</b><br><small>${escHtml(r.why)}</small></span></label>`).join('');
+}
+function _dgApply(d){
+  const v=n=>document.getElementById(n);
+  if(v('st-dg-mode')) v('st-dg-mode').value=d.mode||'hold';
+  if(v('st-dg-hold')) v('st-dg-hold').value=d.hold_min||10;
+  if(v('st-dg-patterns')) v('st-dg-patterns').value=(d.patterns||[]).join('\n');
+  if(d.rules&&v('st-dg-rules')) v('st-dg-rules').innerHTML=_dgRulesHtml(d.rules,d.off_rules);
+  if(v('st-dg-hook')&&'hook_installed' in d) v('st-dg-hook').style.display=d.hook_installed?'none':'block';
+}
+async function _dgLoad(){
+  try{ _dgApply(await (await fetch('/danger_guard')).json()); }catch(e){}
+}
+async function _dgSave(){
+  const v=n=>document.getElementById(n);
+  const off_rules=[...document.querySelectorAll('#st-dg-rules input[data-rule]')].filter(x=>!x.checked).map(x=>x.dataset.rule);
+  const patterns=(v('st-dg-patterns').value||'').split('\n').map(x=>x.trim()).filter(Boolean);
+  const body={mode:v('st-dg-mode').value,hold_min:parseInt(v('st-dg-hold').value,10)||10,off_rules,patterns};
+  try{
+    const d=await (await fetch('/danger_guard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(!d.ok) throw new Error(d.error||'');
+    v('st-dg-hold').value=d.hold_min;
+    if(d.rejected&&d.rejected.length) showToast('warning','Pattern not saved','Not a valid regex: '+d.rejected.join(', '));
+    v('st-dg-patterns').value=(d.patterns||[]).join('\n');
+  }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
 }
 async function _raSave(){
   _raSyncIdle();
@@ -14524,6 +19228,90 @@ async function _pushSaveMode(){
   try{ await fetch('/push/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:document.getElementById('st-push-mode').value})}); }
   catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
 }
+/* ── Notification center (Settings -> Notify): every alert type x channel,
+   from GET /notify_center. Webhook toggles also mirror into _webhookEvents
+   and the hidden st-wh-* boxes, so a later saveSettings() keeps them. */
+let _ncData=null;
+const _NC_WH_IDS={done:'st-wh-done',error:'st-wh-error',stuck:'st-wh-stuck',burn_spike:'st-wh-burn',weekly_digest:'st-wh-digest',
+  waiting_nudge:'st-wh-waiting',cost_spike:'st-wh-cost',budget_alert:'st-wh-budget',rate_limit:'st-wh-ratelimit'};
+const _NC_ICONS={toast:'🖥',push:'📱',webhook:'🔗'};
+/* Pure: the toggle table. d = /notify_center payload. */
+function _ncHtml(d){
+  const types=(d&&d.types)||[];
+  if(!types.length) return '<div class="nc-l" style="grid-column:1/-1">No notification types.</div>';
+  let h='<div class="nc-h" style="text-align:left">ALERT</div><div class="nc-h">PC</div><div class="nc-h">PHONE</div><div class="nc-h">WEBHOOK</div><div class="nc-h"></div>';
+  let group='';
+  for(const t of types){
+    if(t.group!==group){ group=t.group; h+=`<div class="nc-g">${escHtml(String(group).toUpperCase())}</div>`; }
+    h+=`<div class="nc-l">${escHtml(t.label)}${t.quiet===false?'<small title="Sent even in quiet hours and for muted projects">· always</small>':''}</div>`;
+    for(const ch of ['toast','push','webhook']){
+      const on=(t.channels||{})[ch];
+      if(on===null||on===undefined){ h+='<div class="nc-c nc-na" title="Not sent this way">–</div>'; continue; }
+      const off=ch==='webhook'&&!d.webhook_url;
+      h+=`<div class="nc-c"><input type="checkbox" aria-label="${escHtml(t.label)}: ${ch}"${on?' checked':''}${off?' disabled title="Set a webhook URL below first"':''}`
+        +` onchange="_ncSet(${jsq(t.key)},${jsq(ch)},this.checked,this)"></div>`;
+    }
+    h+=`<div class="nc-c"><button class="adp-btn" style="font-size:9px;padding:2px 6px" title="Send a sample through the channels that are on" onclick="_ncTest(${jsq(t.key)})">Test</button></div>`;
+  }
+  return h;
+}
+/* Pure: the one-line status above the table. */
+function _ncStatusHtml(d){
+  if(!d) return '';
+  const q=d.quiet_start&&d.quiet_end
+    ?`Quiet hours ${escHtml(d.quiet_start)}–${escHtml(d.quiet_end)}`+(d.quiet_now?' — <b style="color:var(--o)">on now</b>, alerts held except the “always” ones':'')
+    :'No quiet hours (set them under Notifications below)';
+  const m=(d.muted_projects||[]).length?` · ${d.muted_projects.length} muted project${d.muted_projects.length===1?'':'s'}`:'';
+  const p=` · ${d.push_devices||0} phone${d.push_devices===1?'':'s'} for push`;
+  const w=d.webhook_url?' · webhook set':' · no webhook URL';
+  return q+m+p+w+'.';
+}
+/* Pure: recent log, newest first (the server already orders it). */
+function _ncLogHtml(log, nowS){
+  const rows=(log||[]).slice(0,40);
+  if(!rows.length) return '<div style="color:var(--t3);font-size:10px;padding:4px 0">Nothing sent yet.</div>';
+  const ago=t=>{ const s=Math.max(0,Math.floor(nowS-t)); return s<60?'just now':s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago'; };
+  return rows.map(e=>`<div class="nc-e"><span class="nc-t">${ago(e.t||0)}</span><span title="${escHtml(String(e.channel||''))}">${_NC_ICONS[e.channel]||'•'}</span>`
+    +`<span class="nc-m">${e.test?'<span>[test]</span> ':''}${escHtml(String(e.title||'').replace(/^\[test\] /,''))}${e.body?' <span>— '+escHtml(String(e.body))+'</span>':''}</span></div>`).join('');
+}
+function _ncRender(){
+  const t=document.getElementById('nc-table'); if(!t||!_ncData) return;
+  t.innerHTML=_ncHtml(_ncData);
+  document.getElementById('nc-status').innerHTML=_ncStatusHtml(_ncData);
+  document.getElementById('nc-log').innerHTML=_ncLogHtml(_ncData.log, Date.now()/1000);
+}
+async function _ncLoad(){
+  if(!document.getElementById('nc-table')) return;
+  try{ _ncData=await (await fetch('/notify_center')).json(); }
+  catch(e){ document.getElementById('nc-status').textContent='Could not reach AOC.'; return; }
+  _ncRender();
+}
+async function _ncSet(kind, channel, on, box){
+  try{
+    const d=await (await fetch('/notify_center/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,channel,on})})).json();
+    if(!d.ok){ if(box) box.checked=!on; showToast('warning','Not changed',d.error||''); return; }
+    _ncData=d;
+    if(channel==='webhook'){
+      _webhookEvents[kind]=!!on;
+      const el=_NC_WH_IDS[kind]&&document.getElementById(_NC_WH_IDS[kind]); if(el) el.checked=!!on;
+    }
+    _ncRender();
+  }catch(e){ if(box) box.checked=!on; showToast('warning','Not saved','Could not reach AOC.'); }
+}
+async function _ncTest(kind){
+  try{
+    const d=await (await fetch('/notify_center/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind})})).json();
+    if(!d.ok){ showToast('warning','Not sent',d.error||''); return; }
+    const sk=Object.entries(d.skipped||{}).map(([c,w])=>`${c}: ${w}`).join(', ');
+    showToast(d.sent.length?'done':'warning', d.sent.length?'Test sent':'Nothing sent',
+      (d.sent.length?'Via '+d.sent.join(', ')+'.':'')+(sk?' Skipped — '+sk+'.':''));
+    _ncLoad();
+  }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
+}
+async function _ncClear(){
+  try{ await fetch('/notify_center/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
+  _ncLoad();
+}
 async function _capsLoad(){
   try{
     const d=await (await fetch('/budget_caps')).json();
@@ -14556,10 +19344,13 @@ function _ctxMeterHtml(s, nowSec){
   let cache='';
   if(s.session_active!==false&&s.waiting_on_you&&c.cache_expires_at){
     const left=c.cache_expires_at-nowSec;
-    const re=c.recache_tokens?` (~${fmtTok(c.recache_tokens)} tok re-cached)`:'';
+    const usd=n=>typeof n==='number'?'$'+n.toFixed(2):'';
+    const re=c.recache_tokens?` (~${fmtTok(c.recache_tokens)} tok re-cached${c.recache_usd!=null?', '+usd(c.recache_usd):''})`:'';
+    const warmTip=c.warm_usd!=null?` Replying while warm costs ~${usd(c.warm_usd)} to read it.`:'';
+    const soon=left>0&&left<=(c.cache_ttl==='5m'?120:600);
     cache=left>0
-      ?`<span class="ctx-cache" title="Prompt cache (${escHtml(c.cache_ttl||'')}) expires ${new Date(c.cache_expires_at*1000).toLocaleTimeString()}. Reply before then to keep it warm${escHtml(re)}.">cache warm · ${escHtml(_fmtDurationDHM(Math.ceil(left/60)*60))} left</span>`
-      :`<span class="ctx-cache cold" title="The prompt cache expired: the next message writes the whole context to cache again${escHtml(re)}.">cache cold</span>`;
+      ?`<span class="ctx-cache${soon?' soon':''}" title="Prompt cache (${escHtml(c.cache_ttl||'')}) expires ${new Date(c.cache_expires_at*1000).toLocaleTimeString()}. Reply before then to keep it warm${escHtml(re)}.${escHtml(warmTip)}">cache warm · ${escHtml(_fmtDurationDHM(Math.ceil(left/60)*60))} left${soon&&c.recache_usd!=null?' · '+escHtml(usd(c.recache_usd))+' if cold':''}</span>`
+      :`<span class="ctx-cache cold" title="The prompt cache expired: the next message writes the whole context to cache again${escHtml(re)}.">cache cold${c.recache_usd!=null?' · next msg ~'+escHtml(usd(c.recache_usd)):''}</span>`;
   }
   const title=`Context window: ${(c.tokens||0).toLocaleString()} of ${c.window.toLocaleString()} tokens (${pct.toFixed(1)} %). Claude Code auto-compacts close to the limit.`;
   return `<div class="ctx-meter ctx-${lvl}" title="${escHtml(title)}"><span class="ctx-lbl">CTX</span><span class="ctx-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="ctx-val">${Math.round(pct)}% · ${fmtTok(c.tokens||0)}/${fmtTok(c.window)}${hint}</span>${cache}</div>`;
@@ -14925,7 +19716,8 @@ function renderAgents(data){
        .prog-fill (FLIP ease), lt-/lp- (logs), .card-cmp-btn. */
     const _band={running:['▶','Running'],waiting:['■','Waiting'],done:['✓','Done'],error:['✕','Failed']}[dispStatus]||['•',String(dispStatus||'')];
     const _cur=(a.tasks||[]).find(t=>!t.done);
-    const _curTxt=a.status==='error'?(a.error_message||'Failed'):(tt===0?'No task list':_cur?(_cur.label||''):'All tasks done');
+    /* a running agent whose list is all ticked has not finished -- don't say "done" */
+    const _curTxt=a.status==='error'?(a.error_message||'Failed'):(tt===0?'No task list':_cur?(_cur.label||''):a.status==='running'?'Still working…':'All tasks done');
     const _ticks=(a.tasks||[]).slice(0,14).map(t=>`<b class="${t.done?'on':''}"></b>`).join('')+(tt>14?`<i>+${tt-14}</i>`:'');
     /* No "// project" here: the session bay around the strip already names it. */
     const _sub=[_deriveUnit(a), a.subagent_type, a.model?String(a.model).replace(/^claude-/,'').replace(/-(\d+)-(\d+)$/,'-$1.$2'):null].filter(Boolean).map(escHtml).join(' · ');
@@ -15181,16 +19973,14 @@ function renderAgents(data){
   const errEl=document.getElementById('s-errors');
   if(errEl){ const et=errors>0?pad(errors):'—'; if(errEl.textContent!==et){ errEl.classList.remove('stat-flip'); void errEl.offsetWidth; errEl.classList.add('stat-flip'); errEl.textContent=et; } errEl.style.color=errors>0?'var(--r)':'var(--t3)'; if(errEl.parentNode) errEl.parentNode.style.opacity=errors>0?'1':'.5'; }
   document.title=running>0?`(${running} running) A.O.C`:done>0?`(${done} done) A.O.C`:'A.O.C · idle';
-  const _agentsBtn=document.getElementById('vt-agents');
-  if(_agentsBtn) _agentsBtn.textContent=running>0?`AGENTS (${running})`:'AGENTS';
+  /* counts live in the sidebar badges now (_sbUpdate) */
   document.getElementById('s-tasks').textContent=`${doneT}/${totalT}`;
   const _fcSet=new Set(); agents.forEach(a=>(a.files_changed||[]).forEach(f=>_fcSet.add(f.path))); fcCount=_fcSet.size;
   document.getElementById('s-files').textContent=pad(fcCount);
   const cliCount=data.sessions_count||0;
   const cliEl=document.getElementById('s-clis');
   if(cliEl) _statSet('s-clis', String(cliCount).padStart(2,'0'));
-  const _cliBtn=document.getElementById('vt-cli');
-  if(_cliBtn) _cliBtn.textContent=cliCount>0?`CLI (${cliCount})`:'CLI';
+
   if(currentView==='timeline') renderTimeline(data);
 }
 
@@ -15498,7 +20288,51 @@ function _formatHookReliability(hmc){
 }
 
 /* ── history view ── */
-let _histTab='sessions'; // 'sessions' | 'analytics' | 'search' | 'cache' | 'commits'
+let _histTab='sessions'; // a key of _HIST_TABS
+/* History's tabs, grouped by what you came for. A new tab = one row in
+   _HIST_TABS + its key in one group of _HIST_GROUPS. Keys are what
+   _histTab holds (other views link straight to them), so they never change. */
+const _HIST_TABS={
+  sessions:   ['SESSIONS', 'Every session: when, what it cost, its agents and files'],
+  search:     ['CONVERSATIONS', 'Search what you and Claude wrote in past conversations'],
+  analytics:  ['ANALYTICS', 'Spend and activity by day, project, model and agent type'],
+  cache:      ['CACHE', 'Where the token spend goes and how well the prompt cache works'],
+  commits:    ['COMMITS', 'What each git commit Claude made cost'],
+  clients:    ['CLIENTS', 'Monthly Claude Code spend per client, for invoicing'],
+  worklog:    ['WORK LOG', 'What got done per project or client -- a standup or a client report in one click'],
+  models:     ['MODELS', "Which work each model's spend went to, and what a cheaper model would save"],
+  context:    ['CONTEXT', 'What every session loads before your first message (skills, MCP tools, CLAUDE.md) and what re-reading it costs'],
+  failures:   ['FAILURES', 'Which tool calls fail most, why, and what that costs'],
+  permissions:['PERMISSIONS', 'Which permission prompts hold you up, and safe allow rules that would stop them'],
+  memory:     ['MEMORY', "Your CLAUDE.md and memory files: what they cost at every start, what's broken in them, and an editor"],
+};
+const _HIST_GROUPS=[
+  ['past',  'PAST WORK', 'What happened: sessions, conversations, activity, work log', ['sessions','search','analytics','worklog']],
+  ['spend', 'SPEND',     'Where the money goes: cache, commits, clients, models',     ['cache','commits','clients','models']],
+  ['tune',  'TUNE UP',   'What slows you down or costs extra, and how to fix it',     ['context','failures','permissions','memory']],
+];
+const _histGroupLast={};   // group -> the tab you last had open in it
+/* Pure: the group a tab belongs to (the first group for an unknown tab). */
+function _histGroupOf(tab){
+  return (_HIST_GROUPS.find(g=>g[3].includes(tab))||_HIST_GROUPS[0]);
+}
+/* Pure: two rows -- the groups, then the open group's tabs. */
+function _histTabsHtml(tab){
+  const cur=_histGroupOf(tab);
+  const groups=_HIST_GROUPS.map(([k,l,t,tabs])=>`<button class="hg-tab${k===cur[0]?' active':''}" onclick="_histPickGroup(${jsq(k)})" title="${escHtml(t)}">${l}</button>`).join('');
+  const tabs=cur[3].filter(k=>_HIST_TABS[k]).map(k=>`<div class="adp-tab ${k===tab?'active':''}" onclick="_histPick(${jsq(k)})" title="${escHtml(_HIST_TABS[k][1])}">${_HIST_TABS[k][0]}</div>`).join('');
+  return `<div class="hist-nav"><div class="hg-tabs" role="tablist">${groups}</div><div class="adp-tabs hist-tabs" style="border:none">${tabs}</div></div>`;
+}
+function _histPick(tab){
+  _histTab=tab;
+  _histGroupLast[_histGroupOf(tab)[0]]=tab;
+  renderHistory();
+}
+function _histPickGroup(k){
+  const g=_HIST_GROUPS.find(x=>x[0]===k);
+  if(!g) return;
+  _histPick(_histGroupLast[k]&&g[3].includes(_histGroupLast[k])?_histGroupLast[k]:g[3][0]);
+}
 let _commitSort='new';    // History -> COMMITS ledger: 'new' | 'cost'
 let _commitShowAll=false;
 let _cacheDays=30;
@@ -15538,18 +20372,8 @@ async function renderHistory(){
   el.innerHTML=`<div style="max-width:900px;width:100%;margin:0 auto;display:flex;flex-direction:column;height:100%;min-height:0">
     <div class="hist-toolbar">
       <span class="hist-title">SESSION HISTORY</span>
-      <div class="adp-tabs" style="border:none;margin-left:8px">
-        <div class="adp-tab ${_histTab==='sessions'?'active':''}" onclick="_histTab='sessions';renderHistory()">SESSIONS</div>
-        <div class="adp-tab ${_histTab==='analytics'?'active':''}" onclick="_histTab='analytics';renderHistory()">ANALYTICS</div>
-        <div class="adp-tab ${_histTab==='search'?'active':''}" onclick="_histTab='search';renderHistory()" title="Search what you and Claude wrote in past conversations">CONVERSATIONS</div>
-        <div class="adp-tab ${_histTab==='cache'?'active':''}" onclick="_histTab='cache';renderHistory()" title="Where the token spend goes and how well the prompt cache works">CACHE</div>
-        <div class="adp-tab ${_histTab==='commits'?'active':''}" onclick="_histTab='commits';renderHistory()" title="What each git commit Claude made cost">COMMITS</div>
-        <div class="adp-tab ${_histTab==='clients'?'active':''}" onclick="_histTab='clients';renderHistory()" title="Monthly Claude Code spend per client, for invoicing">CLIENTS</div>
-        <div class="adp-tab ${_histTab==='models'?'active':''}" onclick="_histTab='models';renderHistory()" title="Which work each model's spend went to, and what a cheaper model would save">MODELS</div>
-        <div class="adp-tab ${_histTab==='context'?'active':''}" onclick="_histTab='context';renderHistory()" title="What every session loads before your first message (skills, MCP tools, CLAUDE.md) and what re-reading it costs">CONTEXT</div>
-        <div class="adp-tab ${_histTab==='failures'?'active':''}" onclick="_histTab='failures';renderHistory()" title="Which tool calls fail most, why, and what that costs">FAILURES</div>
-        <div class="adp-tab ${_histTab==='permissions'?'active':''}" onclick="_histTab='permissions';renderHistory()" title="Which permission prompts hold you up, and safe allow rules that would stop them">PERMISSIONS</div>
-      </div>
+      ${_histTabsHtml(_histTab)}
+      ${_histTab==='worklog'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[['yesterday','YESTERDAY'],['today','TODAY'],['week','THIS WEEK'],['custom','CUSTOM']].map(([k,l])=>`<div class="adp-tab ${_wlRange===k?'active':''}" onclick="_wlSetRange(${jsq(k)})">${l}</div>`).join('')}</div><div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[['project','BY PROJECT'],['client','BY CLIENT']].map(([k,l])=>`<div class="adp-tab ${_wlGroup===k?'active':''}" onclick="_wlGroup=${jsq(k)};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='models'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_adviceDays===d?'active':''}" onclick="_adviceDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='failures'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_failDays===d?'active':''}" onclick="_failDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
       ${_histTab==='context'?`<div class="adp-tabs cache-range" style="border:none;margin-left:10px">${[[7,'7 DAYS'],[30,'30 DAYS'],[90,'90 DAYS']].map(([d,l])=>`<div class="adp-tab ${_ctxDays===d?'active':''}" onclick="_ctxDays=${d};renderHistory()">${l}</div>`).join('')}</div>`:''}
@@ -15605,6 +20429,16 @@ async function renderHistory(){
     }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the permission advisor.</div>'; }
     return;
   }
+  if(_histTab==='memory'){
+    if(!_memData) body.innerHTML='<div class="conv-empty">Reading your CLAUDE.md and memory files…</div>';
+    else _memPaint();   // keep an open draft on screen while the list refreshes
+    try{
+      if(!_memDirty()) await _memLoad();
+      else _memData=await fetch('/memory_lint').then(r=>r.json());
+      if(gen===_histRenderGen) _memPaint();
+    }catch(e){ if(gen===_histRenderGen) body.innerHTML='<div class="conv-empty">Could not read the memory files.</div>'; }
+    return;
+  }
   if(_histTab==='context'){
     body.innerHTML='<div class="conv-empty">Reading your Claude Code transcripts…</div>';
     try{
@@ -15619,6 +20453,16 @@ async function renderHistory(){
       const d=await fetch('/model_advice?days='+_adviceDays).then(r=>r.json());
       if(gen===_histRenderGen) body.innerHTML=_modelAdviceHtml(d);
     }catch(e){ body.innerHTML='<div class="conv-empty">Could not load the model report.</div>'; }
+    return;
+  }
+  if(_histTab==='worklog'){
+    if(!_wlData) body.innerHTML='<div class="conv-empty">Reading your Claude Code sessions…</div>';
+    else _wlPaint();
+    try{
+      const [f,t]=_worklogRange(_wlRange, _localDateStr(), _wlFrom, _wlTo);
+      const d=await fetch(`/worklog?from=${f}&to=${t}&group=${_wlGroup}`).then(r=>r.json());
+      if(gen===_histRenderGen){ _wlData=d; _wlPaint(); }
+    }catch(e){ if(gen===_histRenderGen) body.innerHTML='<div class="conv-empty">Could not load the work log.</div>'; }
     return;
   }
   if(_histTab==='clients'){
@@ -16191,9 +21035,15 @@ function _launchFormHtml(dirs, machines, machine, prompts){
         <option value="now">Now</option><option value="limits">When plan limits allow</option><option value="at">At a time…</option></select>
       <input id="ln-at" type="datetime-local" class="settings-input" style="display:none;width:auto">
       <label id="ln-at-lim" class="ln-chk" style="display:none"><input type="checkbox" id="ln-at-limits" checked> and limits allow</label></div>
+    ${machine?'':`<div class="ln-row"><label class="ln-lbl" for="ln-wt">Where</label>
+      <select id="ln-wt" class="settings-input" onchange="_launchWhen(this.form)" title="A git worktree is a separate copy of the repo on its own branch: sessions in worktrees never edit the same files, and you merge or discard each one afterwards">
+        <option value="0">In this folder</option><option value="1">In a new git worktree</option>
+        <option value="2">2 sessions in parallel worktrees</option><option value="3">3 sessions in parallel worktrees</option><option value="4">4 sessions in parallel worktrees</option></select>
+      <span class="ln-wt-note" id="ln-wt-note" style="display:none">Branches off the repo's last commit (uncommitted changes are not copied). Merge or discard them under Today → Parallel worktrees.</span></div>`}
     <div class="ln-row"><span style="flex:1"></span><span class="ln-err" id="ln-err"></span>
       <button type="submit" class="adp-btn ln-go">Start session</button></div>
-    <div class="ln-note">Opens a new terminal window on that PC. With Remote approve on, its permission prompts reach you here while you're away.</div>
+    <div class="ln-note">Opens a new terminal window on that PC. With Remote approve on, its permission prompts reach you here while you're away.
+      <button type="button" class="adp-btn ln-mini ab-link" onclick="_abFromLaunch(this.form)" title="Run this message with two models side by side, each in its own copy of the repo, and compare cost, time and changes">A/B: compare two models…</button></div>
   </form>`;
 }
 function _launchMachines(){
@@ -16206,7 +21056,7 @@ async function _launchLoadDirs(o, machine){
   try{ dirs=(await fetch(_apiUrl(_machineFor(machine),'/launch/dirs')).then(r=>r.json())).dirs||[]; }catch(e){}
   try{ prompts=(await fetch(_apiUrl(_machineFor(machine),'/prompts')).then(r=>r.json())).prompts||[]; }catch(e){}
   // keep what's typed across the re-render (machine switch, template saved/deleted)
-  const ids=['#ln-prompt','#ln-cwd','#ln-model','#ln-when','#ln-at'];
+  const ids=['#ln-prompt','#ln-cwd','#ln-model','#ln-when','#ln-at','#ln-wt'];
   const keep=ids.map(id=>(o.querySelector(id)||{}).value);
   const keepChk=(o.querySelector('#ln-at-limits')||{checked:true}).checked;
   o._prompts=prompts;
@@ -16215,7 +21065,7 @@ async function _launchLoadDirs(o, machine){
   o.querySelector('#ln-at-limits').checked=keepChk;
   o.dataset.machine=machine||'';
   const f=o.querySelector('form');
-  if(keep[3]&&keep[3]!=='now') _launchWhen(f);
+  if((keep[3]&&keep[3]!=='now')||(keep[5]&&keep[5]!=='0')) _launchWhen(f);
   _launchVarsRender(f);
 }
 function _launchVarsRender(form){
@@ -16261,6 +21111,157 @@ function openLaunch(){
   const o=_overlay('New Claude Code session', _launchFormHtml([], _launchMachines(), ''), 'chg-box ln-box');
   _launchLoadDirs(o, '');
 }
+/* ── A/B model compare (/ab, /ab/get, /ab/estimate, /ab/start|keep|discard) ── */
+const _AB_MODEL_NAMES={opus:'Opus',sonnet:'Sonnet',haiku:'Haiku'};
+/* Pure: the A/B form. dirs = /launch/dirs. */
+function _abFormHtml(dirs, cwd, prompt){
+  const chips=(dirs||[]).slice(0,8).map(d=>`<button type="button" class="ln-chip" onclick="_launchPick(this)" data-path="${escHtml(d.path)}" title="${escHtml(d.path)}">${escHtml(d.name)}</button>`).join('');
+  const sel=(id,v)=>`<select id="${id}" class="settings-input" onchange="_abEstimate(this.form)">${Object.entries(_AB_MODEL_NAMES).map(([k,n])=>`<option value="${k}"${k===v?' selected':''}>${n}</option>`).join('')}</select>`;
+  return `<form class="ln-form ab-form" onsubmit="event.preventDefault();_abSubmit(this)">
+    <label class="ln-lbl" for="ln-cwd">Folder (a git repository)</label>
+    <input id="ln-cwd" class="settings-input" list="ab-dirs" placeholder="C:\\path\\to\\repo" autocomplete="off" required value="${escHtml(cwd||'')}">
+    <datalist id="ab-dirs">${(dirs||[]).map(d=>`<option value="${escHtml(d.path)}"></option>`).join('')}</datalist>
+    <div class="ln-chips">${chips}</div>
+    <label class="ln-lbl" for="ln-prompt">Task both models get</label>
+    <textarea id="ln-prompt" class="settings-input" rows="5" required placeholder="e.g. Add input validation to the signup form and a test for it" oninput="_abEstimate(this.form)">${escHtml(prompt||'')}</textarea>
+    <div class="ln-row"><label class="ln-lbl" for="ab-m-a">A</label>${sel('ab-m-a','opus')}
+      <label class="ln-lbl" for="ab-m-b">B</label>${sel('ab-m-b','sonnet')}
+      <label class="ln-lbl" for="ab-budget">Cap per run $</label>
+      <input id="ab-budget" class="settings-input ab-budget" type="number" min="0.1" max="20" step="0.5" value="2" oninput="_abEstimate(this.form)"></div>
+    <div id="ab-est" class="ab-est"></div>
+    <label class="ln-chk"><input type="checkbox" id="ab-ok"> I understand both runs are billed to my Claude account</label>
+    <div class="ln-row"><span style="flex:1"></span><span class="ln-err" id="ln-err"></span>
+      <button type="submit" class="adp-btn ln-go">Run both</button></div>
+    <div class="ln-note">Each model works headless in its own throwaway copy of the repo (git worktree off HEAD) — your working copy isn't touched.
+      They can read and edit files there; shell commands, MCP servers and hooks are off. Afterwards keep one (merged into your current branch) or discard both.</div>
+  </form>`;
+}
+/* Pure: /ab/estimate reply -> the cost line. */
+function _abEstHtml(q){
+  const runs=(q&&q.runs)||[];
+  if(runs.length<2) return '<span class="ab-warn">Pick two different models.</span>';
+  const m=v=>'$'+(Number(v)||0).toFixed(2);
+  return `Estimate: ${runs.map(r=>`<b>${escHtml(r.label)}</b> ${escHtml(_AB_MODEL_NAMES[r.model]||r.model)} ${m(r.low)}–${m(r.high)}${r.capped?' (capped)':''}`).join(' · ')}
+    · at most <b>${m(q.max_total)}</b> together`;
+}
+/* Pure: seconds -> "1m 05s". */
+function _abDur(s){
+  if(s==null) return '—';
+  s=Math.round(Number(s)||0);
+  return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s';
+}
+const _AB_STATE={queued:'Queued',running:'Running',done:'Done',error:'Failed',stopped:'Stopped'};
+/* Pure: one comparison (GET /ab/get) -> results HTML. nowS = epoch seconds. */
+function _abResultHtml(c, nowS){
+  if(!c||!c.runs) return '<div class="chg-empty">Comparison not found.</div>';
+  const m=v=>v==null?'—':'$'+(Number(v)||0).toFixed(2);
+  const runs=c.runs, open=c.state==='running'||c.state==='done';
+  const fin=runs.filter(r=>r.state==='done'&&r.cost!=null);
+  const cheap=fin.length===2&&fin[0].cost!==fin[1].cost?(fin[0].cost<fin[1].cost?fin[0].label:fin[1].label):'';
+  const fast=fin.length===2&&fin[0].wall_s!==fin[1].wall_s?(fin[0].wall_s<fin[1].wall_s?fin[0].label:fin[1].label):'';
+  const row=(name,f)=>`<tr><th>${name}</th>${runs.map(r=>`<td>${f(r)}</td>`).join('')}</tr>`;
+  const live=r=>r.live||r;
+  const tbl=`<table class="ab-tbl"><thead><tr><th></th>${runs.map(r=>`<th><span class="ab-lbl">${escHtml(r.label)}</span> ${escHtml(_AB_MODEL_NAMES[r.model]||r.model)}${c.kept===r.label?' <span class="ab-kept">kept</span>':''}</th>`).join('')}</tr></thead><tbody>
+    ${row('State',r=>`<span class="ab-st ab-${escHtml(r.state||'')}">${escHtml(_AB_STATE[r.state]||r.state||'')}</span>${r.error?`<div class="ab-err">${escHtml(r.error)}</div>`:''}`)}
+    ${row('Time',r=>escHtml(r.wall_s!=null?_abDur(r.wall_s):r.started?_abDur(nowS-r.started)+'…':'—')+(fast===r.label?' <span class="ab-win">faster</span>':''))}
+    ${row('Cost',r=>escHtml(m(live(r).cost))+(r.stop==='error_max_budget_usd'?' <span class="ab-warn">hit cap</span>':'')+(cheap===r.label?' <span class="ab-win">cheaper</span>':''))}
+    ${row('Tool calls',r=>escHtml(String(live(r).tool_calls??'—')))}
+    ${row('Failed calls',r=>{ const x=live(r); return x.errors==null?'—':`${x.errors}${x.denials?` <span class="ab-sub">+${x.denials} blocked</span>`:''}`; })}
+    ${row('Changes',r=>{ const d=r.diffstat; return !d?'—':d.files?`${d.files} file${d.files>1?'s':''} <span class="diff-add">+${d.ins}</span> <span class="diff-del">−${d.dels}</span>`:'none'; })}
+    ${row('',r=>r.state==='queued'||r.state==='running'?'':`${r.final?`<button class="adp-btn ln-mini" onclick="_abAnswer(${jsq(c.id)},${jsq(r.label)})">Answer</button>`:''}
+      ${r.diffstat&&r.diffstat.files&&r.diff!=null?`<button class="adp-btn ln-mini" onclick="_abDiff(${jsq(c.id)},${jsq(r.label)})">Diff</button>`:''}
+      ${c.state==='done'&&r.diffstat&&r.diffstat.files?`<button class="adp-btn ln-mini ab-keep" onclick="_abKeep(${jsq(c.id)},${jsq(r.label)})">Keep ${escHtml(r.label)}</button>`:''}`)}
+  </tbody></table>`;
+  const foot=open?`<div class="ln-row"><span class="ln-note" style="flex:1">${c.state==='running'?'Running — this updates by itself.':'Keep merges that copy into your current branch and removes the other one.'}</span>
+    <button class="adp-btn ln-mini" onclick="_abDiscard(${jsq(c.id)})">${c.state==='running'?'Stop & discard':'Discard both'}</button></div>`
+    :`<div class="ln-note">${c.state==='kept'?(c.merge_error?`Merge conflict — the changes are on branch ${escHtml((runs.find(r=>r.label===c.kept)||{}).branch||'')}.`:`Run ${escHtml(c.kept||'')} merged${c.merged?' as '+escHtml(String(c.merged).slice(0,7)):''}.`):'Discarded.'}</div>`;
+  return `<div class="ab-res"><div class="ab-prompt">${escHtml(c.prompt||'')}</div><div class="ab-meta">${escHtml(c.repo||'')} · off ${escHtml(String(c.head||'').slice(0,7))} · cap ${m(c.budget)} per run</div>${tbl}${foot}</div>`;
+}
+/* Pure: GET /ab items -> list of past comparisons. */
+function _abListHtml(items){
+  if(!(items||[]).length) return '';
+  return `<div class="ln-lbl">Earlier comparisons</div><div class="ab-list">${items.slice(0,8).map(c=>{
+    const cost=(c.runs||[]).reduce((s,r)=>s+(Number(r.cost)||0),0);
+    const st=c.state==='kept'?'kept '+(c.kept||''):c.state;
+    return `<button type="button" class="ab-item" onclick="_abShow(${jsq(c.id)}, this.closest('.diff-overlay'))"><span class="ab-it-p">${escHtml((c.prompt||'').slice(0,80))}</span>
+      <span class="ab-it-m">${(c.runs||[]).map(r=>escHtml(_AB_MODEL_NAMES[r.model]||r.model)).join(' vs ')} · $${cost.toFixed(2)} · ${escHtml(st||'')}</span></button>`;
+  }).join('')}</div>`;
+}
+async function openAB(cwd, prompt){
+  const o=_overlay('A/B: compare two models', _abFormHtml([], cwd, prompt), 'chg-box ln-box ab-box');
+  let dirs=[], items=[];
+  try{ dirs=(await fetch('/launch/dirs').then(r=>r.json())).dirs||[]; }catch(e){}
+  try{ items=(await fetch('/ab').then(r=>r.json())).items||[]; }catch(e){}
+  const running=items.find(c=>c.state==='running');
+  if(running){ _abShow(running.id, o); return; }
+  const f=o.querySelector('form'), keep=[f.querySelector('#ln-cwd').value, f.querySelector('#ln-prompt').value];
+  o.querySelector('.chg-body').innerHTML=_abFormHtml(dirs, keep[0], keep[1])+_abListHtml(items);
+  _abEstimate(o.querySelector('form'));
+}
+function _abFromLaunch(form){
+  const cwd=form.querySelector('#ln-cwd').value, p=form.querySelector('#ln-prompt').value;
+  const o=form.closest('.diff-overlay'); if(o) o.remove();
+  openAB(cwd, p);
+}
+async function _abEstimate(form){
+  if(!form) return;
+  const box=form.querySelector('#ab-est');
+  const body={prompt:form.querySelector('#ln-prompt').value, models:[form.querySelector('#ab-m-a').value, form.querySelector('#ab-m-b').value], budget:form.querySelector('#ab-budget').value};
+  if(body.models[0]===body.models[1]){ box.innerHTML=_abEstHtml(null); return; }
+  try{
+    const q=await fetch('/ab/estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+    box.innerHTML=_abEstHtml(q);
+  }catch(e){ box.textContent=''; }
+}
+async function _abSubmit(form){
+  const err=form.querySelector('#ln-err');
+  if(!form.querySelector('#ab-ok').checked){ err.textContent='Tick the cost box first.'; return; }
+  const btn=form.querySelector('.ln-go'); btn.disabled=true; err.textContent='Making two copies of the repo…';
+  const d=await fetch('/ab/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    cwd:form.querySelector('#ln-cwd').value, prompt:form.querySelector('#ln-prompt').value,
+    models:[form.querySelector('#ab-m-a').value, form.querySelector('#ab-m-b').value],
+    budget:form.querySelector('#ab-budget').value, confirm:true})}).then(r=>r.json()).catch(()=>({ok:false,error:'AOC did not answer'}));
+  btn.disabled=false;
+  if(!d.ok){ err.textContent=d.error||'Could not start.'; return; }
+  _abShow(d.id, form.closest('.diff-overlay'));
+}
+async function _abShow(id, o){
+  if(!o||!document.body.contains(o)) return;
+  clearTimeout(o._abTimer);
+  let c=null;
+  try{ c=await fetch('/ab/get?id='+encodeURIComponent(id)).then(r=>r.json()); }catch(e){}
+  if(!document.body.contains(o)) return;
+  if(c&&c.error) c=null;
+  o._ab=c;
+  o.querySelector('.chg-body').innerHTML=_abResultHtml(c, Date.now()/1000);
+  if(c&&c.state==='running') o._abTimer=setTimeout(()=>_abShow(id, o), 2000);
+}
+function _abRun(id, label){
+  const o=[...document.querySelectorAll('.ab-box')].map(b=>b.closest('.diff-overlay')).find(x=>x&&x._ab&&x._ab.id===id);
+  return o?{o, r:(o._ab.runs||[]).find(r=>r.label===label)}:{};
+}
+function _abDiff(id, label){
+  const {r}=_abRun(id, label); if(!r) return;
+  _overlay(`Run ${label} · ${_AB_MODEL_NAMES[r.model]||r.model}`, _diffLinesHtml(r.diff||'')+(r.diff_truncated?'\n\n'+escHtml('… diff cut — see the rest in '+(r.wt||'the worktree')):''));
+}
+function _abAnswer(id, label){
+  const {r}=_abRun(id, label); if(!r) return;
+  _overlay(`Run ${label} · ${_AB_MODEL_NAMES[r.model]||r.model} — final answer`, `<div class="ab-final">${escHtml(r.final||'')}</div>`, 'chg-box');
+}
+async function _abKeep(id, label){
+  const {o, r}=_abRun(id, label); if(!r) return;
+  if(!confirm(`Keep run ${label} (${_AB_MODEL_NAMES[r.model]||r.model})? Its changes get committed and merged into your current branch; the other copy is deleted.`)) return;
+  const d=await fetch('/ab/keep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,label})}).then(r=>r.json()).catch(()=>({ok:false,error:'AOC did not answer'}));
+  if(d.ok) showToast('done','A/B: run '+label+' merged',String(d.merged||'').slice(0,7));
+  else showToast('error','A/B: not merged',d.error||'');
+  _abShow(id, o);
+}
+async function _abDiscard(id){
+  const o=[...document.querySelectorAll('.ab-box')].map(b=>b.closest('.diff-overlay')).find(x=>x&&x._ab&&x._ab.id===id);
+  if(!confirm('Discard both runs? Their copies and branches are deleted.')) return;
+  await fetch('/ab/discard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).catch(()=>{});
+  if(o) _abShow(id, o);
+}
 function _launchPick(btn){
   const f=btn.closest('form');
   f.querySelector('#ln-cwd').value=btn.dataset.path;
@@ -16275,7 +21276,9 @@ function _launchWhen(form){
     const d=new Date(Date.now()+3600e3); d.setMinutes(0,0,0);
     at.value=new Date(d.getTime()-d.getTimezoneOffset()*60e3).toISOString().slice(0,16);
   }
-  form.querySelector('.ln-go').textContent=w==='now'?'Start session':'Add to queue';
+  const wt=+((form.querySelector('#ln-wt')||{}).value||0);
+  const note=form.querySelector('#ln-wt-note'); if(note) note.style.display=wt?'':'none';
+  form.querySelector('.ln-go').textContent=_launchGoLabel(w, wt);
 }
 /* Pure: the POST /queue body for the form's "Start" choice, or {error}. */
 function _queueBody(cwd, prompt, model, when, atValue, atLimits){
@@ -16296,6 +21299,21 @@ async function _launchSubmit(form){
   if(filled.missing.length){ err.textContent='Fill in: '+filled.missing.join(', '); return; }
   const tplId=form.querySelector('#ln-tpl').value;
   const countUse=()=>{ if(tplId) fetch(_apiUrl(_machineFor(machine),'/prompts/used'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:tplId})}).catch(()=>{}); };
+  const wt=machine?0:+((form.querySelector('#ln-wt')||{}).value||0);
+  if(wt){
+    if(when!=='now'){ err.textContent='Worktree sessions start right away — pick Start: Now.'; return; }
+    go.disabled=true; err.textContent='';
+    try{
+      const d=await fetch('/worktrees/launch',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({cwd:form.querySelector('#ln-cwd').value, prompt:filled.text, model:form.querySelector('#ln-model').value, count:wt})}).then(r=>r.json());
+      if(d.ok){ countUse(); o.remove(); _wtAt=0;
+        showToast('done', d.items.length>1?d.items.length+' sessions started':'Session started',
+          (d.items.length>1?'Each in its own worktree: ':'Branch ')+d.items.map(w=>w.branch).join(', ')+(d.trusted===false?' · accept "trust this folder" in each new window first.':''), d.trusted===false?12000:6000); }
+      else err.textContent=d.error||'Could not start them.';
+    }catch(e){ err.textContent='Could not reach AOC.'; }
+    go.disabled=false;
+    return;
+  }
   if(when!=='now'){
     const body=_queueBody(form.querySelector('#ln-cwd').value, filled.text, form.querySelector('#ln-model').value,
       when, form.querySelector('#ln-at').value, form.querySelector('#ln-at-limits').checked);
@@ -16451,6 +21469,147 @@ function _contextReportHtml(d, applied, local){
     ${files?section('CLAUDE.md & memory files')+table('<th>File</th><th class="num">Tokens</th><th class="num cache-opt">Sessions</th><th class="num">Cost</th>',files):''}
     ${section('By project')}${table('<th>Project</th><th class="num cache-opt">Sessions</th><th class="num">At start</th><th class="num cache-opt">Calls</th><th class="num">Cost</th>',projects)}
     <div class="cl-help" style="margin-top:8px">Sizes come from your transcripts (about 3.7 characters per token); the rest of the first prompt is Claude Code's own tool definitions. Cost = the startup context written to the cache once per session plus re-read on every later API call, at API prices.</div></div>`;
+}
+/* ── History -> MEMORY: CLAUDE.md & memory files, lint + editor ── */
+let _memSel='', _memData=null, _memDoc=null, _memMsg='';   // _memDoc: {path, kind, text, mtime, draft}
+const _memKindLabel={user:'Your CLAUDE.md', project:'Project CLAUDE.md', local:'CLAUDE.local.md', index:'MEMORY.md index', memory:'Memory'};
+/* Pure: which group a file is listed under. Memory folders are named after
+   the encoded project path ('C--Users-me-Projekty-AOC-Agent-Monitoring');
+   the user prefix goes and the last three parts stay. */
+function _memGroupLabel(f){
+  const parts=String(f.path||'').split(/[\\/]/).filter(Boolean);
+  if(f.kind==='user') return 'Every session';
+  if(f.kind==='project'||f.kind==='local'){
+    const i=parts.length-(parts[parts.length-2]==='.claude'?3:2);
+    return 'Project · '+(parts[i]||'?');
+  }
+  const enc=(parts[parts.length-3]||'').replace(/^[A-Za-z]--Users-[^-]+-?/,'');
+  return 'Memory · '+(enc?enc.split('-').filter(Boolean).slice(-3).join('-'):'home folder');
+}
+/* Pure: the file to open first -- the one with the most errors, then
+   warnings, preferring files that load into every session. */
+function _memPickFile(files){
+  const score=f=>{ const n=s=>(f.issues||[]).filter(x=>x.sev===s).length; return n('error')*1000+n('warn')*10+(f.kind==='memory'?0:5); };
+  return (files||[]).slice().sort((a,b)=>score(b)-score(a))[0];
+}
+const _memTok=n=>'~'+Math.round(n).toLocaleString();
+/* Pure: the file list, grouped. */
+function _memListHtml(files, sel){
+  const groups=new Map();
+  (files||[]).forEach(f=>{ const g=_memGroupLabel(f); if(!groups.has(g)) groups.set(g,[]); groups.get(g).push(f); });
+  return [...groups].map(([g,list])=>`<div class="mem-grp">${escHtml(g)}</div>`+list.map(f=>{
+    const n=s=>(f.issues||[]).filter(x=>x.sev===s).length, e=n('error'), w=n('warn');
+    const name=String(f.path).split(/[\\/]/).pop();
+    return `<div class="mem-file${f.path===sel?' active':''}" onclick="_memOpen(${jsq(f.path)})" title="${escHtml(f.path)}">
+      <span class="mem-fname">${escHtml(name)}</span><span class="mem-ftok">${_memTok(f.tokens)}</span>
+      ${e?`<span class="mem-badge err">${e}</span>`:''}${w?`<span class="mem-badge warn">${w}</span>`:''}</div>`;
+  }).join('')).join('');
+}
+/* Pure: the editor pane for the open file. */
+function _memEditorHtml(doc, file, local, msg){
+  if(!doc) return `<div class="conv-empty">Pick a file on the left.</div>`;
+  const text=doc.draft!=null?doc.draft:doc.text, dirty=doc.draft!=null&&doc.draft!==doc.text;
+  const issues=(file&&file.issues)||[];
+  const loaded=['user','project','local','index'].includes(doc.kind);
+  const sevIcon={error:'✕',warn:'!',info:'i'};
+  const list=issues.length?issues.map(x=>`<div class="mem-issue ${x.sev}"${x.line?` onclick="_memJump(${x.line})"`:''}><span class="mem-sev">${sevIcon[x.sev]||'·'}</span>${x.line?`<span class="mem-ln">L${x.line}</span>`:''}<span>${escHtml(x.msg)}</span></div>`).join('')
+    :`<div class="mem-issue ok"><span class="mem-sev">✓</span><span>Nothing to fix in the saved version.</span></div>`;
+  const backups=(file&&file.backups)||0;
+  return `<div class="mem-head"><div><b>${escHtml(String(doc.path).split(/[\\/]/).pop())}</b><span class="mem-kind">${escHtml(_memKindLabel[doc.kind]||doc.kind)}${loaded?' · loaded at session start':' · read when Claude needs it'}</span>
+      <small class="mem-path">${escHtml(doc.path)}</small></div>
+    <div class="mem-actions"><span class="mem-live" id="mem-live">${_memTok(text.length/3.7)} tokens${dirty?' · unsaved':''}</span>
+      ${local?`<button class="adp-btn" onclick="_memSave()" ${dirty?'':'disabled'}>SAVE</button>
+      <button class="adp-btn" onclick="_memRevert()" title="Throw away unsaved changes and re-read the file from disk">REVERT</button>
+      <button class="adp-btn" onclick="_memUndo()" ${backups?'':'disabled'} title="Put back the version before AOC's last save (${backups} kept)">UNDO SAVE</button>`
+      :`<span class="mem-ro">Read-only here: editing works on the PC running AOC.</span>`}</div></div>
+    ${msg?`<div class="mem-msg">${escHtml(msg)}</div>`:''}
+    <div class="mem-issues">${list}</div>
+    <textarea id="mem-text" class="mem-text" spellcheck="false" ${local?'':'readonly'} oninput="_memInput(this)">${escHtml(text)}</textarea>`;
+}
+/* Pure: the whole tab. */
+function _memHtml(d, sel, doc, local, msg){
+  d=d||{};
+  if(d.error) return `<div class="conv-empty">Reading the memory files failed — see Health → background errors.</div>`;
+  if(!(d.files||[]).length) return `<div class="conv-empty">No CLAUDE.md or memory files found yet.</div>`;
+  const c=d.counts||{};
+  const kpi=(v,l,tip,cls)=>`<div class="hist-kpi${cls?' '+cls:''}" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const file=(d.files||[]).find(f=>f.path===sel);
+  return `<div class="mem-wrap"><div class="hist-analytics">
+      ${kpi(d.files.length,'Files','CLAUDE.md files of the folders Claude Code worked in, plus every auto-memory folder')}
+      ${kpi(_memTok(d.start_tokens||0),'Tokens in every start','Your CLAUDE.md plus the MEMORY.md indexes, read before your first message (a project\'s own CLAUDE.md adds to it there)')}
+      ${kpi(c.error||0,'Errors','Links to files that don\'t exist',c.error?'bad':'')}
+      ${kpi(c.warn||0,'Warnings','Oversized files, long index lines, dead paths, unlinked memories, repeated lines',c.warn?'warn':'')}
+    </div>
+    <div class="mem-split"><div class="mem-list">${_memListHtml(d.files,sel)}</div><div class="mem-ed">${_memEditorHtml(doc,file,local,msg)}</div></div></div>`;
+}
+function _memDirty(){ return !!(_memDoc&&_memDoc.draft!=null&&_memDoc.draft!==_memDoc.text); }
+function _memPaint(){
+  const body=document.getElementById('hist-body');
+  if(!body||_histTab!=='memory') return;
+  const ta=document.getElementById('mem-text'), pos=ta?[ta.selectionStart,ta.selectionEnd,ta.scrollTop]:null;
+  body.innerHTML=_memHtml(_memData,_memSel,_memDoc,_fixLocal(),_memMsg);
+  const nt=document.getElementById('mem-text');
+  if(nt&&pos&&_memDoc&&_memDoc.path===_memSel){ nt.setSelectionRange(pos[0],pos[1]); nt.scrollTop=pos[2]; }
+}
+async function _memFetchDoc(path){
+  const r=await fetch('/memory_file?path='+encodeURIComponent(path));
+  if(!r.ok) throw new Error('not found');
+  const d=await r.json();
+  _memDoc={path:d.path, kind:d.kind, text:d.text, mtime:d.mtime, draft:null};
+}
+async function _memLoad(){
+  _memData=await fetch('/memory_lint').then(r=>r.json());
+  const files=_memData.files||[];
+  if(!files.some(f=>f.path===_memSel)){ const f=_memPickFile(files); _memSel=f?f.path:''; }
+  if(_memSel&&(!_memDoc||_memDoc.path!==_memSel)) await _memFetchDoc(_memSel);
+}
+async function _memOpen(path){
+  if(path===_memSel) return;
+  if(_memDirty()&&!confirm('Discard your unsaved changes to '+String(_memDoc.path).split(/[\\/]/).pop()+'?')) return;
+  _memSel=path; _memMsg='';
+  try{ await _memFetchDoc(path); }catch(e){ _memMsg='Could not open that file.'; }
+  _memPaint();
+}
+function _memInput(el){
+  if(!_memDoc) return;
+  _memDoc.draft=el.value;
+  const live=document.getElementById('mem-live');
+  if(live) live.textContent=_memTok(el.value.length/3.7)+' tokens'+(_memDirty()?' · unsaved':'');
+  const save=document.querySelector('.mem-actions .adp-btn'); if(save) save.disabled=!_memDirty();
+}
+/* Drop the draft and re-read the file from disk (also how you pick up a
+   change Claude made while you were editing). */
+async function _memRevert(){
+  if(!_memDoc) return;
+  try{ await _memLoad(); await _memFetchDoc(_memSel); _memMsg=''; }catch(e){ _memMsg='Could not re-read the file.'; }
+  _memPaint();
+}
+/* Select line n (1-based) of the editor and scroll it into view. */
+function _memJump(n){
+  const ta=document.getElementById('mem-text');
+  if(!ta) return;
+  const lines=ta.value.split('\n'); let a=0;
+  for(let i=0;i<Math.min(n-1,lines.length);i++) a+=lines[i].length+1;
+  const b=a+((lines[n-1]||'').length);
+  ta.focus(); ta.setSelectionRange(a,b);
+  ta.scrollTop=Math.max(0,(n-3)*parseFloat(getComputedStyle(ta).lineHeight||'16'));
+}
+async function _memSave(){
+  if(!_memDirty()) return;
+  let r; try{ r=await fetch('/memory_file',{method:'POST',body:JSON.stringify({path:_memDoc.path,text:_memDoc.draft,mtime:_memDoc.mtime})}).then(x=>x.json()); }catch(e){ r={ok:false,error:'Could not reach AOC.'}; }
+  if(!r.ok){ _memMsg=r.error==='changed'?r.detail:(r.error||'Saving failed.'); _memPaint(); return; }
+  const draft=_memDoc.draft;
+  _memMsg='Saved. The next session that starts picks it up.';
+  await _memLoad(); await _memFetchDoc(_memSel);
+  if(_memDoc.text!==draft.replace(/\r\n/g,'\n')) _memMsg='Saved, but the file has changed again since.';
+  _memPaint();
+}
+async function _memUndo(){
+  if(!_memDoc||!confirm('Put back the version from before the last save made in AOC?')) return;
+  let r; try{ r=await fetch('/memory_file/undo',{method:'POST',body:JSON.stringify({path:_memDoc.path})}).then(x=>x.json()); }catch(e){ r={ok:false,error:'Could not reach AOC.'}; }
+  _memMsg=r.ok?'Previous version restored.':(r.error||'Undo failed.');
+  if(r.ok){ await _memLoad(); await _memFetchDoc(_memSel); }
+  _memPaint();
 }
 /* ── History -> FAILURES ── */
 let _failDays=30;
@@ -16640,6 +21799,110 @@ async function _clientAssign(sid, value){
   const cfg=JSON.parse(JSON.stringify((_clientsData&&_clientsData.config)||{clients:[],overrides:{}}));
   if(value) cfg.overrides[sid]=value; else delete cfg.overrides[sid];
   if(await _clientsPost(cfg)) renderHistory();
+}
+/* ── History -> WORK LOG ── */
+let _wlRange='today', _wlGroup='project', _wlFrom='', _wlTo='', _wlMode='standup', _wlData=null, _wlBusy=false;
+/* Pure: [from, to] (YYYY-MM-DD) for a range button; week = Monday..today. */
+function _worklogRange(range, todayStr, from, to){
+  const [y,m,d]=todayStr.split('-').map(Number);
+  const day=off=>_localDateStr(new Date(y,m-1,d+off));
+  if(range==='yesterday') return [day(-1),day(-1)];
+  if(range==='week') return [day(-((new Date(y,m-1,d).getDay()+6)%7)),todayStr];
+  if(range==='custom'){
+    const ok=s=>/^\d{4}-\d{2}-\d{2}$/.test(s||'');
+    const f=ok(from)?from:todayStr, t=ok(to)?to:f;
+    return f<=t?[f,t]:[t,f];
+  }
+  return [todayStr,todayStr];
+}
+function _wlHrs(s){ s=Number(s)||0; return s>=3600?(s/3600).toFixed(1)+' h':Math.max(s?1:0,Math.round(s/60))+' min'; }
+/* Pure: the period as Markdown (summary first if there is one). */
+function _worklogMarkdown(rep, sum){
+  if(!rep) return '';
+  const period=rep.from+(rep.to===rep.from?'':' – '+rep.to);
+  const out=[`# Work log ${period}`,''];
+  if(sum&&sum.text) out.push(sum.text,'');
+  for(const g of rep.groups||[]){
+    out.push(`## ${g.name||'Unassigned'}`,'',`${_wlHrs(g.active_s)} active · ${g.sessions.length} session${g.sessions.length===1?'':'s'} · ${g.commits.length} commit${g.commits.length===1?'':'s'}`,'');
+    if(g.commits.length){ out.push('Commits:'); g.commits.forEach(c=>out.push(`- \`${String(c.sha||'').slice(0,7)}\` ${c.subject||'(no message)'}${c.repo?' ('+c.repo+')':''}`)); out.push(''); }
+    out.push('Sessions:'); g.sessions.forEach(s=>out.push(`- ${s.title} (${_wlHrs(s.active_s)})`)); out.push('');
+  }
+  return out.join('\n').trim()+'\n';
+}
+/* Pure: the WORK LOG tab. d = GET /worklog, mode = standup|client, busy =
+   a summary is being written, local = Summarize allowed (it runs claude -p
+   on this PC), tok = auth token for the print link, range/from/to = picker,
+   isPro = CSV export unlocked. */
+function _worklogHtml(d, mode, busy, local, tok, range, from, to, isPro){
+  d=d||{};
+  const money=v=>'$'+(Number(v)||0).toFixed(2);
+  const custom=range==='custom'?`<div class="wl-custom"><label>From <input type="date" class="settings-input" value="${escHtml(from||'')}" onchange="_wlFrom=this.value;renderHistory()"></label>
+      <label>To <input type="date" class="settings-input" value="${escHtml(to||'')}" onchange="_wlTo=this.value;renderHistory()"></label></div>`:'';
+  if(d.error) return custom+`<div class="conv-empty">The work log failed — see Health → background errors.</div>`;
+  const rep=d.report;
+  if(!rep) return custom+`<div class="conv-empty">Still reading your Claude Code transcripts — the work log appears once the index is built.</div>`;
+  const period=rep.from===rep.to?rep.from:rep.from+' – '+rep.to;
+  if(!(rep.groups||[]).length) return custom+`<div class="conv-empty">No Claude Code work recorded ${escHtml(period)}.</div>`;
+  const t=rep.total||{};
+  const kpi=(v,l,tip)=>`<div class="hist-kpi" title="${escHtml(tip)}"><div class="hk-val">${v}</div><div class="hk-lbl">${l}</div></div>`;
+  const kpis=[kpi(_wlHrs(t.active_s),'Active','Time between your messages, Claude\'s answers and commits; silences over 10 min count as breaks'),
+    kpi(String(t.sessions),'Sessions','Sessions with activity in this period'),
+    kpi(String(t.commits),'Commits','Commits Claude Code made in this period'),
+    kpi(money(t.cost),'Cost','At API list prices, from the transcripts')].join('');
+  const sum=(d.summaries||{})[mode];
+  const qs=`from=${encodeURIComponent(rep.from)}&to=${encodeURIComponent(rep.to)}&group=${encodeURIComponent(rep.group)}&mode=${encodeURIComponent(mode)}`;
+  const printUrl='/worklog/print?'+qs+(tok?'&token='+encodeURIComponent(tok):'');
+  const csvUrl='/worklog/export.csv?'+qs+(tok?'&token='+encodeURIComponent(tok):'');
+  const csv=isPro?`<a class="adp-btn" href="${escHtml(csvUrl)}" title="One line per session with active time and cost">⬇ CSV</a>`
+    :`<span class="cl-lock" title="CSV export is a Pro feature -- Settings -> LICENSE to upgrade">🔒 CSV (PRO)</span>`;
+  const sumBtn=!local?`<span class="fx-dim" title="Summaries run Claude Code on the AOC computer -- open AOC there">Summarize on the AOC PC</span>`
+    :busy?`<button class="adp-btn" disabled>Writing…</button>`
+    :`<button class="adp-btn wl-go" onclick="_wlSummarize(${sum?'true':'false'})" title="${sum?'Write it again (Haiku, about a cent)':'Haiku writes it from your asks, Claude\'s answers and the commits (about a cent)'}">${sum?'↻ Rewrite':'✦ Summarize'}</button>`;
+  const summary=`<section class="cl-card wl-sum"><div class="cl-head"><div class="cl-name">${mode==='client'?'Client report':'Standup'}</div>
+      <span class="adp-tabs wl-modes">${[['standup','STANDUP'],['client','CLIENT REPORT']].map(([k,l])=>`<span class="adp-tab ${mode===k?'active':''}" onclick="_wlMode=${jsq(k)};_wlPaint()">${l}</span>`).join('')}</span>
+      <div class="cl-actions">${sumBtn}<button class="adp-btn" onclick="_wlCopy(this)" title="Copy the summary and the log as Markdown">⧉ Markdown</button>
+        <a class="adp-btn" href="${escHtml(printUrl)}" target="_blank" rel="noopener" title="Printable page without costs -- Save as PDF from the print dialog">⎙ Print</a>${csv}</div></div>
+      ${sum&&sum.text?`<div class="wl-text">${escHtml(sum.text)}</div><div class="conv-status">Written by Haiku${sum.cost?' · $'+Number(sum.cost).toFixed(3):''}${sum.generated_at?' · '+new Date(sum.generated_at*1000).toLocaleString():''}</div>`
+        :`<div class="cl-help">${mode==='client'?'A short report for your client: results per project in plain business language, no costs or AI talk.':'Done / Next / Blockers from this period\'s work, in the language you write to Claude in.'}</div>`}</section>`;
+  const card=g=>{
+    const cms=g.commits.map(c=>`<li><span class="cc-sha" title="${escHtml(c.sha)}">${escHtml(String(c.sha||'').slice(0,7))}</span> ${escHtml(c.subject||'(no message)')}${c.repo?`<span class="cc-repo">${escHtml(c.repo)}</span>`:''}</li>`).join('');
+    const ss=g.sessions.map(s=>`<tr><td class="cache-name"><span title="${escHtml((s.asks||[])[0]||s.id)}">${escHtml(s.title)}</span></td>
+        <td class="num cc-when">${escHtml(s.first_day===s.last_day?s.first_day.slice(5):s.first_day.slice(5)+' – '+s.last_day.slice(5))}</td>
+        <td class="num">${_wlHrs(s.active_s)}</td><td class="num cache-opt">${s.commits||''}</td><td class="num">${money(s.cost)}</td>
+        <td><button class="adp-btn conv-btn" onclick="showHistoryDetail(${jsq(s.id)})">OPEN</button></td></tr>`).join('');
+    return `<section class="cl-card"><div class="cl-head"><div class="cl-name">${escHtml(g.name||'Unassigned')}</div>
+        <div class="cl-nums"><span><b>${_wlHrs(g.active_s)}</b> active</span><span>${g.sessions.length} session${g.sessions.length===1?'':'s'}</span>${g.commits.length?`<span>${g.commits.length} commit${g.commits.length===1?'':'s'}</span>`:''}<span><b>${money(g.cost)}</b></span></div></div>
+      ${cms?`<ul class="wl-commits">${cms}</ul>`:''}
+      <div class="cache-table-wrap"><table class="cache-table cl-table"><thead><tr><th>Session</th><th class="num cc-when">Dates</th><th class="num">Active</th><th class="num cache-opt">Commits</th><th class="num">Cost</th><th></th></tr></thead><tbody>${ss}</tbody></table></div></section>`;
+  };
+  return `<div class="cl-wrap">${custom}<div class="hist-analytics">${kpis}</div>${summary}${rep.groups.map(card).join('')}</div>`;
+}
+function _wlSetRange(k){
+  if(k==='custom'&&!_wlFrom){ const [f,t]=_worklogRange(_wlRange, _localDateStr()); _wlFrom=f; _wlTo=t; }
+  _wlRange=k; renderHistory();
+}
+function _wlPaint(){
+  const body=document.getElementById('hist-body');
+  if(body&&_histTab==='worklog') body.innerHTML=_worklogHtml(_wlData, _wlMode, _wlBusy, _fixLocal(), window._AOC_TOKEN||'', _wlRange, _wlFrom, _wlTo, !!window._AOC_IS_PRO);
+}
+async function _wlSummarize(force){
+  const rep=_wlData&&_wlData.report;
+  if(!rep||_wlBusy) return;
+  const mode=_wlMode;
+  _wlBusy=true; _wlPaint();
+  try{
+    const r=await fetch('/worklog/summary',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({from:rep.from,to:rep.to,group:rep.group,mode,force:!!force})}).then(r=>r.json());
+    if(r.ok){ if(_wlData&&_wlData.report===rep){ _wlData.summaries=_wlData.summaries||{}; _wlData.summaries[mode]=r; } }
+    else showToast('warning','No summary', r.error||'Could not write it.');
+  }catch(e){ showToast('warning','No summary','Could not reach AOC.'); }
+  _wlBusy=false; _wlPaint();
+}
+function _wlCopy(btn){
+  const md=_worklogMarkdown(_wlData&&_wlData.report, ((_wlData&&_wlData.summaries)||{})[_wlMode]);
+  if(!md) return;
+  navigator.clipboard.writeText(md).then(()=>{ const o=btn.textContent; btn.textContent='✓ Copied'; setTimeout(()=>btn.textContent=o,1500); })
+    .catch(()=>showToast('warning','Not copied','The browser blocked the clipboard.'));
 }
 function _commitReportHtml(d, sort, showAll){
   d=d||{};
@@ -17058,6 +22321,27 @@ function _localDateStr(d){
   d=d||new Date();
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
+/* The centred clock and the right-hand group grow independently (badges come
+   and go), so at ~1300-1650 px the clock sat on top of Search and buttons fell
+   off the right edge. Step down until nothing collides: icon-only search,
+   no clock, then drop the least-used buttons and badge labels. */
+function _fitTopbar(){
+  const tb=document.querySelector('.topbar');
+  if(!tb) return;
+  const steps=['tb-lbl','tb-tight','tb-noclock','tb-squeeze'];
+  tb.classList.remove(...steps);
+  const ck=tb.querySelector('.clock');
+  const tbR=()=>tb.getBoundingClientRect().right;
+  const bad=()=>{
+    const kids=[...tb.querySelectorAll('.cc-pill,#rl-stat,.topbar-right > *')].filter(e=>e!==ck&&e.offsetParent&&e.getBoundingClientRect().width);
+    if(kids.some(e=>e.getBoundingClientRect().right>tbR()+1)) return true;
+    if(!ck||!ck.offsetParent||getComputedStyle(ck).display==='none') return false;
+    const c=ck.getBoundingClientRect();
+    return kids.some(e=>{const r=e.getBoundingClientRect(); return r.right>c.left-12&&r.left<c.right+12;});
+  };
+  for(const s of steps){ if(!bad()) return; tb.classList.add(s); }
+}
+window.addEventListener('resize',()=>{ clearTimeout(window._fitTbT); window._fitTbT=setTimeout(_fitTopbar,80); });
 function _renderTopProjects(analytics){
   const bar=document.getElementById('top-projects-bar');
   if(!bar) return;
@@ -17090,22 +22374,26 @@ function _applyStatus(sr){
   if(!sr.session_active) document.getElementById('s-elapsed').textContent='—';
   renderAgents(sr);
   renderKpi(sr);
+  _fitTopbar();
   _tunnelUpdateUI(sr.tunnel);
   _selfUpdateUpdateUI(sr.self_update);
   _infraUpdateUI(sr.infra_health);
   _rateLimitUpdateUI(sr.rate_limits);
   _waitingStripUpdate(sr);
   _updateSweepButton(sr);
+  _ccStatusAt=Date.now(); _sbUpdate(sr); _ccPillUpdate();
   if(_adpAgentId) _renderAdp();
+  if(currentView==='command')  renderCommand(sr);
   if(currentView==='today')    renderToday(sr);
+  if(currentView==='inbox')    renderInbox(sr);
   if(currentView==='summary')  renderSummary(sr);
   if(currentView==='graph')    renderGraph(sr);
   if(currentView==='heat')     renderHeatmap(sr);
   if(currentView==='tree')     renderTree(sr);
   if(currentView==='timeline') renderTimeline(sr);
-  if(currentView==='history'&&_histTab!=='search'&&_histTab!=='cache'&&_histTab!=='commits'&&Date.now()-_histLastRender>10000){ _histLastRender=Date.now(); renderHistory(); }
+  if(currentView==='history'&&_histTab!=='search'&&_histTab!=='cache'&&_histTab!=='commits'&&_histTab!=='memory'&&_histTab!=='worklog'&&Date.now()-_histLastRender>10000){ _histLastRender=Date.now(); renderHistory(); }
   if(currentView==='diag'&&Date.now()-_diagLastRender>10000){ _diagLastRender=Date.now(); renderDiag(); }
-  if(_rightTab==='files') _renderRpFiles(sr);
+  _renderRpFiles(sr); // always: keeps the FILES count badge current; paints only when that tab is open
   if(_rightTab==='audit') _renderRpAudit();
   if(_rightTab==='errors') _renderRpErrors();
   if(_cmpOpen) _renderCompare();
@@ -18325,10 +23613,8 @@ function renderHeatmap(data){
   const el=document.getElementById('heat-area');
   if(!el) return;
   const agents=(data.agents||[]).filter(a=>!String(a.id||'').startsWith('hook_')&&a.started_at);
-  if(!agents.length){
-    el.innerHTML='<div style="color:var(--t3);text-align:center;padding:60px;font-family:var(--font2);font-size:10px;letter-spacing:.12em">NO AGENT DATA</div>';
-    return;
-  }
+  if(!agents.length){ _sessFallback('heat', el, data); return; }
+  _svPainted.delete(el);
   const now=Date.now();
   let minT=Infinity, maxT=-Infinity;
   agents.forEach(a=>{
@@ -18502,10 +23788,8 @@ function renderTree(data){
   if(!el) return;
   const tc=_graphThemeColors();
   const agents = (data&&data.agents||[]).filter(a => !String(a.id||'').startsWith('hook_'));
-  if(!agents.length){
-    el.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-family:var(--font2);font-size:13px;color:${tc.emptyText};letter-spacing:.08em">NO AGENTS</div>`;
-    return;
-  }
+  if(!agents.length){ _sessFallback('tree', el, data||{}); return; }
+  _svPainted.delete(el);
   const {childMap, agentById, roots, depth} = _buildTree(agents);
   const pos = _layoutTree(agents, childMap, roots, depth);
   const allPos = Object.values(pos);
@@ -18644,7 +23928,7 @@ function clearNotes(){
 
 /* ── settings ── */
 const _ACCENT_VARS = {
-  signal: { c:'91,155,224', c2:'47,111,179' },
+  signal: { c:'63,208,255', c2:'30,136,200' },
   cyan:   { c:'0,196,232', c2:'0,150,200' },
   purple: { c:'140,80,255', c2:'100,60,220' },
   green:  { c:'0,220,120', c2:'0,170,90' },
@@ -18880,6 +24164,7 @@ function _copyErrorContext(id){
 function setSettingsTab(name){
   document.querySelectorAll('.settings-pane').forEach(el=>el.style.display=el.dataset.pane===name?'':'none');
   document.querySelectorAll('.settings-tab').forEach(el=>{ el.classList.toggle('active',el.dataset.pane===name); el.setAttribute('aria-selected',el.dataset.pane===name); });
+  if(name==='notify') _ncLoad();
 }
 function openSettings(){
   _settingsOpen=true;
@@ -18888,8 +24173,10 @@ function openSettings(){
   _authRefresh();
   _renderLicenseUI();
   _raLoad();
+  _dgLoad();
   _capsLoad();
   _pushLoad();
+  _ncLoad();
   /* populate inputs */
   const v=n=>document.getElementById(n);
   if(v('st-cost-rate')) v('st-cost-rate').value=_costRate;
@@ -19508,7 +24795,7 @@ async function _fireCostSpikeWebhook(sess,cost,projectAvgCost){
 /* ── keyboard shortcuts ── */
 const _KB_GROUPS = [
   { title:'VIEWS', items:[
-    ['Y','Today'],['C','Agents'],['B','CLI'],['T','Timeline'],['S','Summary'],['G','Graph'],
+    ['Y','Today'],['J','Inbox'],['C','Agents'],['B','CLI'],['T','Timeline'],['S','Summary'],['G','Graph'],
     ['X','Heatmap'],['W','Tree'],['V','History'],['K','Health'],['M','Term'],
   ]},
   { title:'RIGHT PANEL', items:[
@@ -19558,34 +24845,172 @@ function _toggleKbHelp(){
 let _paletteOpen=false;
 let _paletteSelIdx=0;
 let _paletteResults=[];
-function _paletteFilter(candidates,query){
-  const q=(query||'').trim().toLowerCase();
-  if(!q) return candidates.slice(0,8);
-  return candidates.filter(c=>
-    c.label.toLowerCase().includes(q)||(c.sub||'').toLowerCase().includes(q)
-  ).slice(0,8);
+// item ids, newest first (aoc_prefs 'pal'). `var` without an initializer:
+// _loadPrefs() runs further up the page and has already filled it by now.
+var _paletteRecent;
+if(!Array.isArray(_paletteRecent)) _paletteRecent=[];
+const _PALETTE_RECENT_MAX=8;
+const _PALETTE_LIMIT=12;
+let _paletteCtx={resume:null, resumeAt:0, fixes:null, fixesAt:0};
+/* Other features add palette items here: functions (sr, ctx) -> items. */
+const _PALETTE_SOURCES=[];
+/* Pure: every palette item for this status + context. An item is
+   {id, label, sub, kind, words, run:[action, ...args], urgent?}; `run` names an
+   entry of _PALETTE_ACTIONS, so items stay plain data (testable, no closures).
+   ctx = {local, resume:[cards from /resume_projects]|null, fixes:[{title,fix}]|null, applied:{}} */
+function _paletteItems(sr, ctx){
+  sr=sr||{}; ctx=ctx||{};
+  const out=[];
+  const add=(id,label,sub,kind,run,extra)=>out.push(Object.assign({id,label,sub,kind,run,words:''},extra||{}));
+  add('act:new','New session…','Action','action',['newSession'],{words:'launch start claude prompt'});
+  add('act:theme','Toggle light / dark','Action','action',['theme'],{words:'theme day night mode'});
+  add('act:focus','Focus mode (hide side panel)','Action','action',['focus'],{words:'panel log'});
+  add('act:ask','Ask AOC…','Action · question about your history','action',['ask'],{words:'question kolko spend cost history haiku'});
+  const sessions=(sr.sessions_list||[]);
+  sessions.forEach(s=>{
+    const name=s.display_name||s.project||'CLI session';
+    const m=s.machine||'';
+    const where=m?' · '+m:'';
+    const k=(m||'')+'|'+s.id;
+    (s.perm_requests||[]).forEach(q=>{
+      const what=q.summary||q.tool_name||'permission';
+      add('perm:allow:'+k+':'+q.id,'Allow: '+what,'Needs your OK · '+name+where,'permission',['perm',m,q.id,'allow'],{urgent:true,words:'approve yes permission '+name});
+      add('perm:deny:'+k+':'+q.id,'Deny: '+what,'Needs your OK · '+name+where,'permission',['perm',m,q.id,'deny'],{urgent:true,words:'reject no permission '+name});
+    });
+    if(!m&&s.session_active!==false) add('sess:focus:'+k,'Switch to terminal · '+name,'Session','session',['focusSession',s.id],{words:'focus window go '+(s.project||'')});
+    add('sess:agents:'+k,'Show agents · '+name,'Session'+where,'session',['sessionAgents',s.id],{words:'filter '+(s.project||'')});
+    add('sess:replay:'+k,'Replay · '+name,'Session'+where,'session',['replay',s.id,m,name],{words:'timeline steps '+(s.project||'')});
+    if(s.edited_count) add('sess:changes:'+k,`Changes (${s.edited_count} file${s.edited_count===1?'':'s'}) · `+name,'Session'+where,'session',['changes',s.id,m,name],{words:'diff edits uncommitted '+(s.project||'')});
+    if(s.session_active===false) add('sess:dismiss:'+k,'Dismiss · '+name,'Closed session'+where,'session',['dismiss',s.id,m,name],{words:'remove close '+(s.project||'')});
+    else if(s.host_pid||m) add('sess:stop:'+k,'Force stop · '+name,'Session'+where,'danger',['forceStop',s.id,m,name],{words:'kill stop '+(s.project||'')});
+  });
+  (sr.agents||[]).filter(a=>!String(a.id||'').startsWith('hook_')).forEach(a=>{
+    add('agent:'+a.id,a.name||a.id,'Agent · '+(a.status||''),'agent',['agent',a.id]);
+  });
+  (ctx.resume||[]).forEach(c=>{
+    if(!c||!c.name||!c.cwd) return;
+    if((c.open||[]).length&&ctx.local!==false) add('resume:switch:'+c.name,'Switch to '+c.name,'Project · open','project',['focusSession',c.open[0]],{words:'continue resume pokracuj project'});
+    else add('resume:go:'+c.name,'Continue '+c.name,'Project · “'+(c.prompt||'')+'”','project',['launch',c.cwd,c.prompt||''],{words:'continue resume pokracuj project start'});
+    if(c.resume_id) add('resume:last:'+c.name,'Reopen last conversation · '+c.name,'Project','project',['launchResume',c.cwd,c.resume_id],{words:'resume history conversation'});
+  });
+  if(ctx.local!==false) (ctx.fixes||[]).forEach(t=>{
+    const f=t&&t.fix;
+    if(!f||!f.kind||f.kind==='manual'||(ctx.applied||{})[f.kind+':'+f.target]) return;
+    add('fix:'+f.kind+':'+f.target,'Fix: '+(t.title||f.target),'One-click fix · preview first','fix',['fix',f.kind,f.target],{words:'tip apply settings'});
+  });
+  [['command','Command Center'],['today','Today'],['inbox','Inbox'],['agents','Agents'],['cli','Sessions'],['timeline','Timeline'],['summary','Summary'],
+   ['graph','Graph'],['heat','Heatmap'],['tree','Tree'],['history','History'],['diag','Health'],['term','Terminal']].forEach(([v,label])=>{
+    add('view:'+v,'View → '+label,'View','view',['view',v]);
+  });
+  [['sessions','Sessions'],['analytics','Analytics'],['search','Conversations'],['cache','Cache'],['commits','Commits'],['clients','Clients'],
+   ['models','Models'],['context','Context'],['failures','Failures'],['permissions','Permissions'],['memory','Memory']].forEach(([t,label])=>{
+    add('hist:'+t,'History → '+label,'History','history',['hist',t]);
+  });
+  [['cost','Cost'],['notify','Notify'],['look','Look'],['access','Access'],['tunnel','Tunnel'],['remote','Remote'],['infra','Infra']].forEach(([pane,label])=>{
+    add('settings:'+pane,'Settings → '+label,'Settings','settings',['settings',pane]);
+  });
+  _PALETTE_SOURCES.forEach(fn=>{ try{ (fn(sr,ctx)||[]).forEach(i=>{ if(i&&i.id&&i.label&&i.run) out.push(Object.assign({sub:'',kind:'action',words:''},i)); }); }catch(e){} });
+  return out;
+}
+/* Pure: fold diacritics + case ("pokračuj" matches "pokracuj"). */
+function _paletteNorm(s){
+  return String(s||'').normalize('NFKD').replace(/[̀-ͯ]/g,'').toLowerCase();
+}
+/* Pure: score of one item for query words (0 = no match). Every word must
+   be found: a word start in the label scores most, then anywhere in the
+   label, then sub/extra words, then letters in order (fuzzy). */
+function _paletteScore(item, words){
+  const label=_paletteNorm(item.label), rest=_paletteNorm((item.sub||'')+' '+(item.words||''));
+  let total=0;
+  for(const w of words){
+    const i=label.indexOf(w);
+    if(i===0||(i>0&&/[^a-z0-9]/.test(label[i-1]))) total+=10;
+    else if(i>0) total+=6;
+    else if(rest.includes(w)) total+=3;
+    else{
+      let p=0;
+      for(const ch of label){ if(ch===w[p]) p++; if(p===w.length) break; }
+      if(p<w.length) return 0;
+      total+=1;
+    }
+  }
+  return total;
+}
+/* Pure: what the palette lists for query q. Empty query: recent actions,
+   then waiting permission prompts, then everything else in order. Recent
+   items also get a boost while typing. */
+function _paletteFilter(items, q, recent, limit){
+  recent=recent||[]; limit=limit||_PALETTE_LIMIT;
+  const rank=id=>{ const i=recent.indexOf(id); return i<0?0:(recent.length-i); };
+  const words=_paletteNorm(q).trim().split(/\s+/).filter(Boolean);
+  if(!words.length){
+    const rec=recent.map(id=>items.find(x=>x.id===id)).filter(Boolean);
+    const urgent=items.filter(x=>x.urgent&&!recent.includes(x.id));
+    const restI=items.filter(x=>!x.urgent&&!recent.includes(x.id));
+    return rec.concat(urgent,restI).slice(0,limit);
+  }
+  return items.map((x,i)=>({x,i,s:_paletteScore(x,words)})).filter(r=>r.s>0)
+    .sort((a,b)=>(b.s+(rank(b.x.id)?2+rank(b.x.id)/10:0)+(b.x.urgent?1:0))-(a.s+(rank(a.x.id)?2+rank(a.x.id)/10:0)+(a.x.urgent?1:0))||a.i-b.i)
+    .slice(0,limit).map(r=>r.x);
+}
+/* Pure: recent list after using item id (newest first, capped). */
+function _paletteRemember(recent, id){
+  return [id].concat((recent||[]).filter(x=>x!==id&&typeof x==='string')).slice(0,_PALETTE_RECENT_MAX);
+}
+async function _paletteLaunch(body, label){
+  try{
+    const d=await fetch('/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+    if(d.ok) showToast('done',body.resume?'Conversation reopened':'Session started',label+(d.trusted===false?' · accept "trust this folder" in the new window first.':' shows up here in a few seconds.'),d.trusted===false?12000:5000);
+    else showToast('warning','Not started',d.error||'Could not start it.');
+  }catch(e){ showToast('warning','Not started','Could not reach AOC.'); }
+}
+const _PALETTE_ACTIONS={
+  newSession:()=>openLaunch(),
+  theme:()=>toggleTheme(),
+  focus:()=>toggleRightPanel(),
+  view:v=>setView(v),
+  hist:t=>{ _histTab=t; setView('history'); },
+  settings:p=>{ openSettings(); setSettingsTab(p); },
+  agent:id=>{ setView('agents'); openAgentDetail(id); },
+  sessionAgents:id=>{ setView('agents'); setSessionFilter(id); },
+  focusSession:id=>_focusSession(id),
+  replay:(id,m,name)=>openReplay(id,m,name),
+  changes:(id,m,name)=>openSessionChanges(id,m,name),
+  dismiss:(id,m,name)=>{ if(confirm(`Dismiss "${name}" from the dashboard?`)) _dismissSession(id,m); },
+  forceStop:(id,m,name)=>_forceStopSession(id,name,m),   // asks itself
+  perm:(m,id,d)=>_permDecide(m,id,d),
+  launch:(cwd,prompt)=>_paletteLaunch({cwd,prompt},prompt||cwd),
+  launchResume:(cwd,id)=>_paletteLaunch({cwd,resume:id},cwd),
+  fix:(kind,target)=>_fixOpen(JSON.stringify({kind,target})),
+  ask:()=>openAsk(),
+};
+function _paletteRun(item){
+  const fn=item&&item.run&&_PALETTE_ACTIONS[item.run[0]];
+  if(fn) fn(...item.run.slice(1));
+}
+/* Background: project cards and fix tips for the palette (each at most every
+   5 min; the palette re-renders when they arrive). */
+async function _paletteLoadCtx(){
+  const now=Date.now(), local=_fixLocal();
+  const jobs=[];
+  if(now-_paletteCtx.resumeAt>300000){
+    _paletteCtx.resumeAt=now;
+    jobs.push(fetch('/resume_projects').then(r=>r.ok?r.json():null).then(d=>{ _paletteCtx.resume=d&&Array.isArray(d.cards)?d.cards:null; }).catch(()=>{}));
+  }
+  if(local&&now-_paletteCtx.fixesAt>300000){
+    _paletteCtx.fixesAt=now;
+    jobs.push(Promise.all([fetch('/context_report?days=30').then(r=>r.json()).catch(()=>null),
+                           fetch('/failure_map?days=30').then(r=>r.json()).catch(()=>null), _fixesLoad()]).then(([c,f])=>{
+      _paletteCtx.fixes=[].concat((c&&c.tips)||[], (f&&f.tips)||[]).filter(t=>t&&t.fix)
+        .map(t=>({title:t.title||`${t.reason||'Failing'}${t.target?' · '+t.target:''}`, fix:t.fix}));
+    }));
+  }
+  if(!jobs.length) return;
+  await Promise.all(jobs);
+  if(_paletteOpen){ const inp=document.getElementById('palette-input'); _paletteRender(inp?inp.value:''); }
 }
 function _paletteCandidates(){
-  const out=[];
-  (lastStatus&&lastStatus.sessions_list||[]).forEach(s=>{
-    out.push({ label:s.display_name||s.project||'CLI Session', sub:'Session',
-      action:()=>{ setView('agents'); setSessionFilter(s.id); } });
-  });
-  (lastStatus&&lastStatus.agents||[]).filter(a=>!String(a.id||'').startsWith('hook_')).forEach(a=>{
-    out.push({ label:a.name||a.id, sub:'Agent · '+(a.status||''),
-      action:()=>{ setView('agents'); openAgentDetail(a.id); } });
-  });
-  [['cost','Settings → Cost'],['notify','Settings → Notify'],['look','Settings → Look'],
-   ['access','Settings → Access'],['tunnel','Settings → Tunnel'],['remote','Settings → Remote'],
-   ['infra','Settings → Infra']].forEach(([pane,label])=>{
-    out.push({ label, sub:'Settings', action:()=>{ openSettings(); setSettingsTab(pane); } });
-  });
-  [['today','View → Today'],['agents','View → Agents'],['cli','View → CLI'],['timeline','View → Timeline'],['summary','View → Summary'],
-   ['graph','View → Graph'],['heat','View → Heatmap'],['tree','View → Tree'],
-   ['history','View → History'],['diag','View → Health'],['term','View → Terminal']].forEach(([v,label])=>{
-    out.push({ label, sub:'View', action:()=>{ setView(v); } });
-  });
-  return out;
+  return _paletteItems(lastStatus, {local:_fixLocal(), resume:_paletteCtx.resume, fixes:_paletteCtx.fixes, applied:_fixesApplied});
 }
 function openPalette(){
   _paletteOpen=true;
@@ -19594,35 +25019,56 @@ function openPalette(){
   if(ov) ov.classList.add('open');
   if(input){ input.value=''; setTimeout(()=>input.focus(),50); }
   _paletteRender('');
+  _paletteLoadCtx();
 }
 function closePalette(){
   _paletteOpen=false;
   const ov=document.getElementById('palette-overlay');
   if(ov) ov.classList.remove('open');
 }
-function _paletteRender(query){
-  _paletteResults=_paletteFilter(_paletteCandidates(),query);
-  _paletteSelIdx=0;
-  const el=document.getElementById('palette-results');
-  if(!el) return;
-  if(!_paletteResults.length){ el.innerHTML='<div class="palette-empty">No matches</div>'; return; }
-  el.innerHTML=_paletteResults.map((c,i)=>
-    `<div class="palette-item${i===0?' active':''}" onclick="_paletteActivate(${i})">
+const _PALETTE_ICON={action:'⚡',permission:'🔐',session:'›',danger:'⛔',agent:'◆',project:'▶',fix:'🛠',view:'▦',history:'⟲',settings:'⚙'};
+/* Pure: the result list. */
+function _paletteListHtml(items, sel, recent){
+  if(!items.length) return '<div class="palette-empty">No matches</div>';
+  return items.map((c,i)=>
+    `<div class="palette-item k-${escHtml(c.kind||'action')}${i===sel?' active':''}" onclick="_paletteActivate(${i})" onmousemove="_paletteHover(${i})">
+      <span class="pi-ico">${_PALETTE_ICON[c.kind]||'›'}</span>
       <span class="pi-label">${escHtml(c.label)}</span>
-      <span class="pi-sub">${escHtml(c.sub||'')}</span>
+      <span class="pi-sub">${(recent||[]).includes(c.id)?'<span class="pi-recent">recent</span> ':''}${escHtml(c.sub||'')}</span>
     </div>`
   ).join('');
 }
+function _paletteRender(query){
+  const prev=_paletteResults[_paletteSelIdx];
+  _paletteResults=_paletteFilter(_paletteCandidates(),query,_paletteRecent);
+  // a background refresh keeps the highlighted item; typing starts at the top
+  const keep=prev&&query===_paletteLastQuery?_paletteResults.findIndex(x=>x.id===prev.id):-1;
+  _paletteSelIdx=keep>=0?keep:0;
+  _paletteLastQuery=query;
+  const el=document.getElementById('palette-results');
+  if(!el) return;
+  el.innerHTML=_paletteListHtml(_paletteResults,_paletteSelIdx,_paletteRecent);
+}
+let _paletteLastQuery='';
 function _paletteActivate(idx){
   const c=_paletteResults[idx];
   if(!c) return;
   closePalette();
-  try{ c.action(); }catch(e){}
+  _paletteRecent=_paletteRemember(_paletteRecent,c.id);
+  _savePrefs();
+  try{ _paletteRun(c); }catch(e){ console.error(e); }
+}
+function _paletteHover(i){
+  if(i===_paletteSelIdx) return;
+  _paletteSelIdx=i;
+  document.querySelectorAll('#palette-results .palette-item').forEach((el,j)=>el.classList.toggle('active',j===i));
 }
 function _paletteMove(delta){
   if(!_paletteResults.length) return;
   _paletteSelIdx=(_paletteSelIdx+delta+_paletteResults.length)%_paletteResults.length;
-  document.querySelectorAll('#palette-results .palette-item').forEach((el,i)=>el.classList.toggle('active',i===_paletteSelIdx));
+  const els=document.querySelectorAll('#palette-results .palette-item');
+  els.forEach((el,i)=>el.classList.toggle('active',i===_paletteSelIdx));
+  if(els[_paletteSelIdx]&&els[_paletteSelIdx].scrollIntoView) els[_paletteSelIdx].scrollIntoView({block:'nearest'});
 }
 function _paletteInputKeydown(e){
   if(e.key==='ArrowDown'){ e.preventDefault(); _paletteMove(1); }
@@ -19641,6 +25087,7 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){ if(_kbOpen){ _toggleKbHelp(); return; } }
   switch(e.key.toUpperCase()){
     case 'Y': setView('today');    log('View → TODAY','info');    break;
+    case 'J': setView('inbox');    log('View → INBOX','info');    break;
     case 'C': setView('agents');   log('View → AGENTS','info');   break;
     case 'B': setView('cli');      log('View → CLI','info');      break;
     case 'T': setView('timeline'); log('View → TIMELINE','info'); break;
@@ -19692,6 +25139,10 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){
     if(_paletteOpen){ closePalette(); e.preventDefault(); return; }
     if(_kbOpen){ _toggleKbHelp(); e.preventDefault(); return; }
+    /* _overlay() dialogs (Launch session, diffs, reply, ...): topmost first */
+    const ovs=document.querySelectorAll('.diff-overlay');
+    if(ovs.length){ ovs[ovs.length-1].remove(); e.preventDefault(); return; }
+    if(_soundPanelOpen){ closeSoundPanel(); e.preventDefault(); return; }
     if(_cmpOpen){ closeCompare(); e.preventDefault(); return; }
     if(_sessCmpOpen){ closeSessionCompare(); e.preventDefault(); return; }
     if(_notifOpen){ closeNotifPanel(); e.preventDefault(); return; }
@@ -19721,7 +25172,7 @@ document.addEventListener('keydown',e=>{
     next.click();
   }
 });
-log('Shortcuts: Y C B T S G X W I U = views · R = reset · F = search · Ctrl+K = palette · ? = help','info');
+log('Shortcuts: Y J C B T S G X W I U = views · R = reset · F = search · Ctrl+K = palette · ? = help','info');
 </script>
 </body>
 </html>"""
@@ -19809,7 +25260,20 @@ def _build_status_payload_uncached() -> dict:
         _budget_snap = {"sessions": dict(_budget_state["sessions"]), "day": _budget_state["day"]}
     for s in active_sessions:
         s["context"] = _ctx.get(s["id"])
+        if s["context"] and s["context"].get("cache_ttl"):
+            cold, warm = _recache_cost(s["context"].get("recache_tokens") or s["context"].get("tokens"),
+                                       s["context"]["cache_ttl"], s.get("model"))
+            # a copy: the view itself is cached in _context_state
+            s["context"] = {**s["context"], "recache_usd": round(cold, 2), "warm_usd": round(warm, 2)}
         s["perm_requests"] = _perms.get(s["id"], [])
+        _dg = [q for q in s["perm_requests"] if q.get("danger")]
+        if _dg:
+            # a held dangerous command blocks the turn mid-tool-call: the hook
+            # still reports the session as running, so mark it waiting here
+            s["waiting_on_you"] = True
+            s["waiting_kind"] = "permission"
+            s["waiting_message"] = "⚠ " + _dg[0]["summary"]
+            s["waiting_secs"] = max(s.get("waiting_secs") or 0, _dg[0]["age_s"])
         s["reply_request"] = _replies.get(s["id"])
         s["budget"] = _budget_snap["sessions"].get(s["id"]) or _budget_snap["day"]
     # sessions_count: floor at the real claude.exe process count (background
@@ -19967,6 +25431,46 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._serve(200, "text/html; charset=utf-8", _client_report_print_html(report, client or "").encode("utf-8"),
                         no_cache=True)
+
+    def _worklog_from_query(self, qs):
+        """(report, error) for ?from&to&group from transcript_index.db."""
+        d0, d1 = _worklog_range((qs.get("from") or [""])[0], (qs.get("to") or [""])[0], time.strftime("%Y-%m-%d"))
+        group = "client" if (qs.get("group") or [""])[0] == "client" else "project"
+        if not os.path.exists(TRANSCRIPT_INDEX_DB):
+            return None, None
+        conn = None
+        try:
+            conn = _transcript_index_connect()
+            return _worklog_report(conn, d0, d1, group, _load_clients(), os.path.expanduser("~")), None
+        except Exception as e:
+            _log_bg_error("worklog", e)
+            return None, "work log failed"
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _get_worklog(self, path):
+        """History -> WORK LOG. /worklog?from&to&group=project|client ->
+        {report, summaries: {standup, client}} (cached summaries only);
+        /worklog/print?...&mode=standup|client -> printable page;
+        /worklog/export.csv?... (Pro, like every CSV export)."""
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        report, error = self._worklog_from_query(qs)
+        if path == "/worklog":
+            out = {"report": report, "index": dict(_transcript_index_progress),
+                   "summaries": _worklog_cached_summaries(report) if report else {}}
+            if error:
+                out["error"] = error
+            self._serve(200, "application/json", json.dumps(out, ensure_ascii=False).encode(), no_cache=True)
+        elif report is None:
+            self._serve(503, "text/plain", b"The transcript index is not ready yet.")
+        elif path == "/worklog/export.csv":
+            self._serve_csv_download(_worklog_csv(report), f"aoc-worklog-{report['from']}-{report['to']}.csv")
+        else:
+            mode = (qs.get("mode") or [""])[0]
+            summary = _worklog_cached_summaries(report).get(mode) if mode in _WORKLOG_MODES else None
+            self._serve(200, "text/html; charset=utf-8", _worklog_print_html(report, summary).encode("utf-8"), no_cache=True)
 
     def _get_commit_costs(self):
         """Cost per commit (History -> COMMITS) from transcript_index.db.
@@ -20182,6 +25686,9 @@ class Handler(BaseHTTPRequestHandler):
                 st = {"today_spend": _budget_state["today_spend"], "day": _budget_state["day"]}
             cfg = _load_budget_caps()
             self._serve(200, "application/json", json.dumps({"session_usd": cfg["session_usd"], "day_usd": cfg["day_usd"], **st}).encode(), no_cache=True)
+        elif path_no_qs == "/danger_guard":
+            view = _danger_view(_load_danger_guard(), _fix_read_json(_fix_paths()["settings"], {}))
+            self._serve(200, "application/json", json.dumps(view).encode(), no_cache=True)
         elif path_no_qs == "/reply/poll":
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -20205,13 +25712,28 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/recap/settings":
             self._serve(200, "application/json", json.dumps(_load_recap_settings()).encode(), no_cache=True)
+        elif path_no_qs == "/ask/history":
+            self._serve(200, "application/json", json.dumps(_ask_history(), ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs in ("/session_changes", "/session_changes/diff"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
-            edited = _session_edited((qs.get("session_id") or [""])[0])
+            sid = (qs.get("session_id") or [""])[0]
+            edited = _session_edited(sid)
             try:
                 if path_no_qs == "/session_changes":
                     reply = {"ok": True, "edited": len(edited), **_session_changes(edited)}
+                    seen = _change_seen_marks(sid, [f["path"] for r in reply["repos"] for f in r["files"]])
+                    for r in reply["repos"]:
+                        for f in r["files"]:
+                            f["seen"] = bool(seen.get(f["path"]))
+                            f["sig"] = _file_sig(f["path"])
+                    reply["discards"] = [{k: m.get(k) for k in ("id", "path", "rel", "kind", "at")}
+                                         for m in _change_backups(sid)]
+                    # review actions write to the repo: only offered on this PC itself
+                    reply["local"] = self._is_direct_loopback() and _tunnel_status[0] not in ("starting", "ready")
+                    st = _own_status_payload() or {}
+                    me = next((s for s in st.get("sessions_list") or [] if s.get("id") == sid), None)
+                    reply["working"] = bool(me and me.get("session_active") is not False and not me.get("waiting_on_you"))
                 else:
                     want = os.path.normcase(os.path.normpath((qs.get("file") or [""])[0]))
                     own = next((f for f in edited if os.path.normcase(os.path.normpath(f)) == want), None)
@@ -20221,6 +25743,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 _log_bg_error("session_changes", e)
                 reply = {"ok": False, "error": "failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/session_activity":
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                hours = max(1, min(24, int((qs.get("hours") or ["24"])[0])))
+            except ValueError:
+                hours = 24
+            reply = _sessions_activity(time.time() - hours * 3600)
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/status":
             try:
@@ -20288,6 +25819,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(_webhook_settings, ensure_ascii=False).encode())
         elif path_no_qs == "/notify_settings":
             self._serve(200, "application/json", json.dumps(_notify_settings, ensure_ascii=False).encode())
+        elif path_no_qs == "/notify_center":
+            self._serve(200, "application/json", json.dumps(_notify_center_payload(), ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/errors":
             data = _db_get_errors(100)
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
@@ -20298,6 +25831,24 @@ class Handler(BaseHTTPRequestHandler):
         elif path_no_qs == "/launch/dirs":
             self._serve(200, "application/json", json.dumps({"dirs": _launch_known_dirs()}, ensure_ascii=False).encode(),
                         no_cache=True)
+        elif path_no_qs in ("/worktrees", "/worktrees/diff"):
+            from urllib.parse import urlparse, parse_qs
+            try:
+                if path_no_qs == "/worktrees":
+                    reply = _wt_list((_own_status_payload() or {}).get("sessions_list") or [])
+                else:
+                    reply = _wt_diff((parse_qs(urlparse(self.path).query).get("id") or [""])[0])
+            except Exception as e:
+                _log_bg_error("worktrees", e)
+                reply = {"ok": False, "error": "failed", "items": []}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs in ("/ab", "/ab/get"):
+            from urllib.parse import urlparse, parse_qs
+            if path_no_qs == "/ab":
+                reply = _ab_list()
+            else:
+                reply = _ab_get(str((parse_qs(urlparse(self.path).query).get("id") or [""])[0])) or {"error": "not found"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/model_advice":
             from urllib.parse import urlparse, parse_qs
             try:
@@ -20327,6 +25878,13 @@ class Handler(BaseHTTPRequestHandler):
                 _log_bg_error("failure_map", e)
                 reply = {"error": "failure map failed"}
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/sysinfo":
+            try:
+                reply = _sysinfo()
+            except Exception as e:
+                _log_bg_error("sysinfo", e)
+                reply = {"error": "sysinfo failed"}
+            self._serve(200, "application/json", json.dumps(reply).encode(), no_cache=True)
         elif path_no_qs == "/permission_advice":
             from urllib.parse import urlparse, parse_qs
             try:
@@ -20340,6 +25898,29 @@ class Handler(BaseHTTPRequestHandler):
                 _log_bg_error("permission_advice", e)
                 reply = {"error": "permission advice failed"}
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/resume_projects":
+            try:
+                st = _own_status_payload() or {}
+                open_ids = [s.get("id") for s in (st.get("sessions_list") or []) if s.get("session_active") is not False]
+                reply = _resume_report(open_ids)
+            except Exception as e:
+                _log_bg_error("resume_projects", e)
+                reply = {"error": "failed", "cards": []}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/memory_lint":
+            try:
+                reply = _memory_lint()
+            except Exception as e:
+                _log_bg_error("memory_lint", e)
+                reply = {"error": "memory lint failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/memory_file":
+            from urllib.parse import urlparse, parse_qs
+            f = _mem_known((parse_qs(urlparse(self.path).query).get("path") or [""])[0])
+            if not f:
+                self._serve(404, "application/json", b'{"error":"unknown file"}'); return
+            self._serve(200, "application/json", json.dumps({"path": f["path"], "kind": f["kind"], "text": f["text"],
+                                                             "mtime": f["mtime"]}, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/context_report":
             from urllib.parse import urlparse, parse_qs
             try:
@@ -20359,6 +25940,8 @@ class Handler(BaseHTTPRequestHandler):
             self._get_commit_costs()
         elif path_no_qs in ("/clients", "/clients/export.csv", "/clients/print"):
             self._get_clients(path_no_qs)
+        elif path_no_qs in ("/worklog", "/worklog/print", "/worklog/export.csv"):
+            self._get_worklog(path_no_qs)
         elif self.path.startswith("/diff"):
             self._get_diff()
         elif self.path.startswith("/git"):
@@ -20548,6 +26131,9 @@ class Handler(BaseHTTPRequestHandler):
                 "backup_retention_days": backup_retention_days,
                 "agent_retention_hours": agent_retention_hours,
                 "project_budgets": project_budgets,
+                # per-type toast/push toggles: the notification center owns them
+                "channels": _sanitize_notify_channels(data["channels"]) if "channels" in data
+                            else (_notify_settings.get("channels") or {}),
             })
             self._serve(200, "application/json", b'{"ok":true}')
         except Exception as e:
@@ -20669,6 +26255,26 @@ class Handler(BaseHTTPRequestHandler):
                 reply = _budget_hook_reply(_budget_state, hook)
             self._serve(200, "application/json", json.dumps(reply).encode())
             return
+        if self.path.split("?")[0] == "/hook/danger" and self._is_direct_loopback():
+            # The dangerous-command guard's PreToolUse hook (Bash/PowerShell).
+            # Same no-token loopback rule as /hook/pretool. A harmless command
+            # gets {} at once; a dangerous one holds this request until the
+            # dashboard answers (or Claude Code hangs up).
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                hook = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                hook = {}
+            try:
+                reply = _danger_hook(hook, gone_fn=lambda: _socket_hung_up(self.connection))
+            except Exception as e:
+                _log_bg_error("danger guard", e)
+                reply = {}
+            try:
+                self._serve(200, "application/json", json.dumps(reply).encode())
+            except Exception:
+                pass
+            return
         if not self._check_auth():
             self._serve(401, "text/plain", b"Unauthorized"); return
         length = int(self.headers.get("Content-Length", 0))
@@ -20700,6 +26306,95 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
             except Exception as e:
                 _log_bg_error("fixes", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs == "/worklog/summary":
+            # runs `claude -p` (costs money): only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"local only"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                report, error = self._worklog_from_query({k: [str(data.get(k) or "")] for k in ("from", "to", "group")})
+                if report is None:
+                    reply = {"ok": False, "error": error or "the transcript index is not ready yet"}
+                else:
+                    reply = _worklog_summary(report, str(data.get("mode") or "standup"), force=bool(data.get("force")))
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("worklog_summary", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs in ("/worktrees/launch", "/worktrees/merge", "/worktrees/discard"):
+            # creates/merges/deletes git branches and folders: only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"worktrees can only be managed on this PC itself"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                sessions = (_own_status_payload() or {}).get("sessions_list") or []
+                if path_no_qs == "/worktrees/launch":
+                    reply = _wt_launch(data)
+                elif path_no_qs == "/worktrees/merge":
+                    reply = _wt_merge(str(data.get("id") or ""), sessions)
+                else:
+                    reply = _wt_discard(str(data.get("id") or ""), sessions, force=data.get("force") is True)
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("worktrees", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs in ("/session_changes/discard", "/session_changes/undo",
+                            "/session_changes/stage", "/session_changes/seen"):
+            # writes to the user's repos: only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"local only"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                sid = str(data.get("session_id") or "")
+                with _CHANGE_LOCK:
+                    if path_no_qs == "/session_changes/undo":
+                        meta = next((m for m in _change_backups() if m.get("id") == data.get("id")), None)
+                        reply = _change_undo(str(data.get("id") or ""), force=bool(data.get("force"))) \
+                            if meta and meta.get("sid") == sid else {"ok": False, "error": "not a discard of this session"}
+                    else:
+                        edited = _session_edited(sid)
+                        if path_no_qs == "/session_changes/stage":
+                            own = [_change_own(edited, p) for p in (data.get("paths") or [])[:300]]
+                            reply = _change_stage([p for p in own if p]) if own and all(own) else \
+                                {"ok": False, "error": "not a file this session edited"}
+                        else:
+                            own = _change_own(edited, data.get("path"))
+                            if not own:
+                                reply = {"ok": False, "error": "not a file this session edited"}
+                            elif path_no_qs == "/session_changes/seen":
+                                reply = _change_seen_set(sid, own, bool(data.get("seen", True)))
+                            else:
+                                sig = data.get("sig")
+                                reply = _change_discard(own, sid, expect_sig=str(sig) if sig is not None else None)
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("session_changes", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
+        elif path_no_qs in ("/memory_file", "/memory_file/undo"):
+            # writes Claude Code's instructions and memory: only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"local only"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                with _FIX_LOCK:
+                    reply = (_memory_undo(data.get("path")) if path_no_qs == "/memory_file/undo"
+                             else _memory_save(data.get("path"), data.get("text"), data.get("mtime")))
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("memory_file", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
 
         elif path_no_qs == "/focus_session":
@@ -20734,6 +26429,17 @@ class Handler(BaseHTTPRequestHandler):
                     reply = {"ok": ok} if ok else {"ok": False, "error": "not over a cap"}
             except Exception as e:
                 _log_bg_error("budget_caps", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply).encode())
+
+        elif path_no_qs == "/danger_guard":
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                reply = {"ok": True, **_save_danger_guard(data)}
+            except Exception as e:
+                _log_bg_error("danger_guard", e)
                 reply = {"ok": False, "error": "bad request"}
             self._serve(200, "application/json", json.dumps(reply).encode())
 
@@ -20787,6 +26493,32 @@ class Handler(BaseHTTPRequestHandler):
                 reply = {"ok": False, "error": "bad request"}
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
 
+        elif path_no_qs == "/ab/estimate":
+            try:
+                reply = _ab_quote(json.loads(body or b"{}"))
+            except Exception:
+                reply = {"runs": []}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+
+        elif path_no_qs in ("/ab/start", "/ab/keep", "/ab/discard"):
+            # runs Claude Code headless and merges into your repo: only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"local only"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/ab/start":
+                    reply = _ab_start(data)
+                elif path_no_qs == "/ab/keep":
+                    reply = _ab_keep(str(data.get("id") or ""), str(data.get("label") or ""))
+                else:
+                    reply = _ab_discard(str(data.get("id") or ""))
+            except Exception as e:
+                _log_bg_error("ab", e)
+                reply = {"ok": False, "error": "failed"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+
         elif path_no_qs == "/launch":
             try:
                 reply = _launch_session(json.loads(body or b"{}"))
@@ -20809,6 +26541,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve(200, "application/json", json.dumps(reply).encode())
             except Exception:
                 self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
+
+        elif path_no_qs == "/ask":
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+            except Exception:
+                self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
+                return
+            reply = _ask(data.get("q"), force=bool(data.get("force")))
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
 
         elif path_no_qs in ("/permission/request", "/permission/decide", "/permission/settings"):
             try:
@@ -20944,6 +26687,9 @@ class Handler(BaseHTTPRequestHandler):
                                 json.dumps({"ok": False, "error": "Webhook delivery is a Pro feature. Settings -> LICENSE to upgrade."}).encode())
                     return
                 events = data.get("events") or {}
+                # the Settings form doesn't know the split toggles -- keep them
+                old_ev = _webhook_settings.get("events") or {}
+                events = {**{k: old_ev[k] for k in ("session_loop", "budget_cap") if k in old_ev}, **events}
                 _save_webhook_settings({
                     "url": url,
                     "events": _sanitize_webhook_events(events),
@@ -20954,6 +26700,34 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path_no_qs == "/notify_settings":
             self._post_notify_settings(body)
+
+        elif path_no_qs in ("/notify_center/set", "/notify_center/test", "/notify_center/clear"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/notify_center/set":
+                    kind, channel = str(data.get("kind") or ""), str(data.get("channel") or "")
+                    if channel == "webhook" and data.get("on") and not _is_pro():
+                        reply = {"ok": False, "error": "Webhook delivery is a Pro feature. Settings -> LICENSE to upgrade."}
+                    else:
+                        ncfg, wcfg = _notify_set(kind, channel, data.get("on"), _notify_settings, _webhook_settings)
+                        if channel == "webhook":
+                            _save_webhook_settings(wcfg)
+                        else:
+                            _save_notify_settings(ncfg)
+                        reply = {"ok": True, **_notify_center_payload()}
+                elif path_no_qs == "/notify_center/test":
+                    reply = _notify_test(str(data.get("kind") or ""), channel=data.get("channel") or None)
+                else:
+                    _notify_log_clear()
+                    reply = {"ok": True}
+            except ValueError as e:
+                reply = {"ok": False, "error": str(e)}
+            except Exception as e:
+                _log_bg_error("notify_center", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
 
         elif path_no_qs == "/snitch_ping_now":
             try:
@@ -21316,7 +27090,27 @@ if (-not (Test-Path $ShortcutPath)) {
         _log_bg_error("_register_aumid_shortcut", e)
 
 
-def _show_native_toast(title: str, message: str):
+def _show_native_toast(title: str, message: str, kind=None, project=""):
+    """Toast + phone push for one alert. With kind= (a _NOTIFY_TYPES key)
+    each channel goes through _notify_gate (the type's Settings -> Notify
+    toggles, muted projects, quiet hours) and lands in the notification
+    log; without it both channels fire as before."""
+    toast_ok = push_ok = True
+    if kind:
+        toast_ok = _notify_gate(kind, "toast", project)[0]
+        push_ok = _notify_gate(kind, "push", project)[0]
+    if push_ok:
+        try:
+            if _push_notify(title, message, tag=str(title)[:40]):
+                _notify_log_add(kind, "push", title, message)
+        except Exception as e:
+            _log_bg_error("push", e)
+    if toast_ok:
+        _win_toast(title, message)
+        _notify_log_add(kind, "toast", title, message)
+
+
+def _win_toast(title: str, message: str):
     """Fire a real Windows notification without any extra dependency (no
     pystray/pywebview needed -- those only run in --app/tray mode, but the
     watchdog actually runs monitor.py --headless, where _tray_monitor's own
@@ -21332,11 +27126,7 @@ def _show_native_toast(title: str, message: str):
     (_register_aumid_shortcut, called once at startup) for AOC's own
     name/icon on the notification instead of PowerShell's -- also
     live-tested and confirmed showing distinctly from the borrowed one.
-    Also goes to the phones with push enabled (_push_notify decides)."""
-    try:
-        _push_notify(title, message, tag=str(title)[:40])
-    except Exception as e:
-        _log_bg_error("push", e)
+    Toast only -- _show_native_toast adds the phone push."""
     try:
         def xml_esc(s: str) -> str:
             return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -21399,7 +27189,8 @@ def _headless_notify_worker():
                 old = _prev.get(aid, {})
                 if old.get("status") == "running" and not _notification_suppressed(a.get("session_project", "")):
                     if a.get("status") == "done":
-                        _show_native_toast(f"✓ {a.get('name','Agent')[:40]}", "Completed successfully")
+                        _show_native_toast(f"✓ {a.get('name','Agent')[:40]}", "Completed successfully",
+                                           kind="done", project=a.get("session_project", ""))
                     elif a.get("status") == "error":
                         # "Agent encountered an error" told you nothing an
                         # error toast couldn't already imply from its own ✗ --
@@ -21407,7 +27198,8 @@ def _headless_notify_worker():
                         # `a` unused, same gap the done/error webhook payload
                         # had (see _webhook_notify_worker).
                         _show_native_toast(f"✗ {a.get('name','Agent')[:40]}",
-                                            (a.get("error_message") or "Agent encountered an error")[:180])
+                                            (a.get("error_message") or "Agent encountered an error")[:180],
+                                            kind="error", project=a.get("session_project", ""))
             _prev = agents
         except Exception as e:
             _log_bg_error("_headless_notify_worker", e)
@@ -21476,7 +27268,9 @@ def _run_app_mode():
                 for aid, a in agents.items():
                     old = _prev.get(aid, {})
                     if old.get("status") == "running" and not _notification_suppressed(a.get("session_project", "")):
-                        if a.get("status") == "done":
+                        if not _notify_gate("done" if a.get("status") == "done" else "error", "toast", a.get("session_project", ""))[0]:
+                            pass
+                        elif a.get("status") == "done":
                             try: icon.notify(f"✓ {a.get('name','Agent')[:40]}", "Completed successfully")
                             except Exception: pass
                         elif a.get("status") == "error":

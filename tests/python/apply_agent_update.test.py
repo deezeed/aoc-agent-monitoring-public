@@ -169,4 +169,19 @@ c.check("agent still created despite agent_start raising", len(status["agents"])
 c.check("agent_start failure reported via _log_bg_error, not silently swallowed",
         len(bg_errors) == 1 and bg_errors[0][0] == "_apply_agent_update:agent_start" and "disk full" in bg_errors[0][1])
 
+# 13. a late transcript start for an agent the hook already has: no status
+# flip back to running, no false "hook miss", only empty fields filled
+ns, log, _bg = make_ns()
+status = {"agents": [{"id": "a10", "status": "done", "name": "Fix", "description": "",
+                      "tasks": [{"label": "Running...", "done": True}], "started_at": "10:00:00"}], "sessions": {}}
+ns["_apply_agent_update"](status, {"id": "a10", "status": "running", "name": "other", "description": "full text",
+                                    "started_at": "09:59:58", "detected_via": "transcript"}, "sess1", "AOC", "10:01:00")
+a10 = status["agents"][0]
+c.check("late transcript start keeps the hook's status", a10["status"] == "done" and log.calls == [])
+c.check("late transcript start does not mark a hook miss", "detected_via" not in a10)
+c.check("late transcript start only fills empty fields", a10["name"] == "Fix" and a10["description"] == "full text" and a10["started_at"] == "10:00:00")
+# ...but a transcript start for an agent nobody has seen still creates it, flagged
+ns["_apply_agent_update"](status, {"id": "a11", "status": "running", "started_at": "10:00:00", "detected_via": "transcript"}, "sess1", "AOC", "10:00:00")
+c.check("unknown agent from transcript still created with detected_via", status["agents"][1]["detected_via"] == "transcript")
+
 c.finish()

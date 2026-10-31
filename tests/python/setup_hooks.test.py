@@ -18,7 +18,7 @@ c = Checker()
 
 def ns_for(aoc_dir="C:\\nowhere"):
     return exec_functions(
-        ["_hook_command", "_is_aoc_hook", "_is_run_hook", "_is_held_hook", "_is_budget_hook", "_merge_budget_hook", "BUDGET_HOOK_URL", "BUDGET_HOOK_TIMEOUT_S", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes",
+        ["_hook_command", "_is_aoc_hook", "_is_run_hook", "_is_held_hook", "_is_budget_hook", "_merge_http_hook", "_merge_budget_hook", "BUDGET_HOOK_URL", "BUDGET_HOOK_TIMEOUT_S", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes",
          "PERMISSION_SCRIPT", "PERMISSION_EVENT", "PERMISSION_TIMEOUT_S", "_permission_command", "_merge_permission_hook"],
         {"os": os, "subprocess": subprocess, "HOOK_SPECS": HOOK_SPECS, "HOOKS_DST_DIR": HOOKS_DST_DIR,
          "AOC_DIR": aoc_dir, "TASK_NAME": r"\AOC-test-nonexistent\A",

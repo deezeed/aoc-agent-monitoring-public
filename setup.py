@@ -102,6 +102,13 @@ HELD_EVENTS = (PERMISSION_EVENT, "Stop")
 # answers allow or deny from memory -- an HTTP hook, no process per tool call.
 BUDGET_HOOK_URL = "http://127.0.0.1:5151/hook/pretool"
 BUDGET_HOOK_TIMEOUT_S = 3
+# Dangerous-command guard: a second HTTP PreToolUse entry for shell tools
+# only. monitor.py answers at once unless the command is dangerous; then it
+# holds the call until you allow or deny it on the dashboard or your phone
+# (it gives up and denies before this timeout).
+DANGER_HOOK_URL = "http://127.0.0.1:5151/hook/danger"
+DANGER_HOOK_MATCHER = "Bash|PowerShell"
+DANGER_HOOK_TIMEOUT_S = 3700
 
 TASK_NAME = r"\AOC\AOC Watchdog"
 SENTINEL_TASK_NAME = r"\AOC\AOC Sentinel"
@@ -266,22 +273,32 @@ def _is_budget_hook(h: dict) -> bool:
     return h.get("type") == "http" and str(h.get("url", "")).startswith("http://127.0.0.1:5151/hook/")
 
 
-def _merge_budget_hook(settings: dict) -> str:
-    """Pure core: AOC's HTTP PreToolUse entry (all tools). Returns "added",
-    "updated" or "unchanged"."""
-    want = {"type": "http", "url": BUDGET_HOOK_URL, "timeout": BUDGET_HOOK_TIMEOUT_S}
+def _merge_http_hook(settings: dict, url: str, matcher: str, timeout: int) -> str:
+    """Pure core: one AOC HTTP PreToolUse entry, found by its url. Returns
+    "added", "updated" or "unchanged"."""
+    want = {"type": "http", "url": url, "timeout": timeout}
     entries = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
     for entry in entries:
         for h in entry.get("hooks", []):
-            if _is_budget_hook(h):
-                if h == want and entry.get("matcher") == "*":
+            if _is_budget_hook(h) and h.get("url") == url:
+                if h == want and entry.get("matcher") == matcher:
                     return "unchanged"
                 h.clear()
                 h.update(want)
-                entry["matcher"] = "*"
+                entry["matcher"] = matcher
                 return "updated"
-    entries.append({"matcher": "*", "hooks": [want]})
+    entries.append({"matcher": matcher, "hooks": [want]})
     return "added"
+
+
+def _merge_budget_hook(settings: dict) -> str:
+    """Pure core: AOC's HTTP PreToolUse entry for budget caps (all tools)."""
+    return _merge_http_hook(settings, BUDGET_HOOK_URL, "*", BUDGET_HOOK_TIMEOUT_S)
+
+
+def _merge_danger_hook(settings: dict) -> str:
+    """Pure core: AOC's HTTP PreToolUse entry for the dangerous-command guard."""
+    return _merge_http_hook(settings, DANGER_HOOK_URL, DANGER_HOOK_MATCHER, DANGER_HOOK_TIMEOUT_S)
 
 
 def _is_run_hook(h: dict) -> bool:
@@ -403,6 +420,11 @@ def merge_hook_settings(pythonw: str) -> None:
         added.append(("PreToolUse", "*"))
     elif res == "updated":
         updated.append(("PreToolUse", "*"))
+    res = _merge_danger_hook(settings)
+    if res == "added":
+        added.append(("PreToolUse", DANGER_HOOK_MATCHER))
+    elif res == "updated":
+        updated.append(("PreToolUse", DANGER_HOOK_MATCHER))
 
     if DRY_RUN:
         if added:

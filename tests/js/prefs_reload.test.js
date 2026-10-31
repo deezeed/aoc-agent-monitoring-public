@@ -20,6 +20,8 @@ global.document = {
 };
 var currentView = 'agents', listMode = false, statusFilter = 'all', _soundMuted = false, _theme = 'dark';
 var _collapsedIds = new Set(), _pinnedIds = new Set(), _collapsedBays = new Set(), _panelCollapsed = false;
+var _vizView = 'timeline';
+function _isVizView(v) { return ['timeline', 'graph', 'heat', 'tree'].includes(v); }
 function _applyMuteUI() {}
 function _applyTheme() {}
 function setView(v) { currentView = v; _savePrefs(); }  // the real one saves too
@@ -29,7 +31,7 @@ eval(extractFunction(src, '_loadPrefs'));
 
 const saved = {
   view: 'history', list: false, sf: 'all', muted: false, theme: 'dark',
-  collapsed: ['agent-1'], pinned: ['agent-2'], bays: ['|sess-1', 'laptop|sess-2'], panelCollapsed: true, today: 1,
+  collapsed: ['agent-1'], pinned: ['agent-2'], bays: ['|sess-1', 'laptop|sess-2'], panelCollapsed: true, today: 1, cc: 1,
 };
 store.aoc_prefs = JSON.stringify(saved);
 
@@ -45,23 +47,40 @@ c.check('loading does not wipe stored collapsed cards', JSON.stringify(after.col
 c.check('loading does not wipe stored bays', JSON.stringify(after.bays) === '["|sess-1","laptop|sess-2"]');
 c.check('loading does not wipe stored panel state', after.panelCollapsed === true);
 
-// TODAY is the home view: no prefs -> Today; prefs saved before Today
-// existed (no today flag) open on Today once, and from then on the saved
-// view is respected again.
-store.aoc_prefs = JSON.stringify({ view: 'cli' });
-_loadPrefs();
-c.check('old prefs -> Today once', currentView === 'today' && JSON.parse(store.aoc_prefs).today === 1);
+// COMMAND (Command Center) is the home view: no prefs -> Command; prefs
+// saved before it existed (no cc flag) open on Command once, and from then
+// on the saved view is respected again.
 store.aoc_prefs = JSON.stringify({ view: 'cli', today: 1 });
+_loadPrefs();
+c.check('old prefs -> Command Center once', currentView === 'command' && JSON.parse(store.aoc_prefs).cc === 1);
+store.aoc_prefs = JSON.stringify({ view: 'cli', today: 1, cc: 1 });
 _loadPrefs();
 c.check('...then the saved view again', currentView === 'cli');
 delete store.aoc_prefs;
 _loadPrefs();
-c.check('first run -> Today', currentView === 'today');
+c.check('first run -> Command Center', currentView === 'command');
+
+// Recent palette actions round-trip (junk dropped, capped at 8).
+var _paletteRecent = [];
+store.aoc_prefs = JSON.stringify({ view: 'cli', today: 1, cc: 1, pal: ['view:today', 3, null, ...Array.from({ length: 10 }, (_, i) => 'x' + i)] });
+_loadPrefs();
+c.check('palette recents restored, junk dropped, capped', _paletteRecent.length === 8 && _paletteRecent[0] === 'view:today');
+c.check('palette recents saved back', JSON.stringify(JSON.parse(store.aoc_prefs).pal) === JSON.stringify(_paletteRecent));
 
 // Garbage in the bays list is dropped, not turned into keys.
 store.aoc_prefs = JSON.stringify({ bays: ['ok|1', 7, null, { x: 1 }] });
 _collapsedBays = new Set();
 _loadPrefs();
 c.check('non-string bay keys ignored', [..._collapsedBays].join() === 'ok|1');
+
+// The sidebar's Views entry reopens the live view you used last (graph/heat/...)
+store.aoc_prefs = JSON.stringify({ view: 'history', viz: 'heat', today: 1, cc: 1 });
+_vizView = 'timeline';
+_loadPrefs();
+c.check('last live view restored', _vizView === 'heat' && JSON.parse(store.aoc_prefs).viz === 'heat');
+store.aoc_prefs = JSON.stringify({ view: 'history', viz: 'nope', today: 1, cc: 1 });
+_vizView = 'timeline';
+_loadPrefs();
+c.check('unknown saved live view ignored', _vizView === 'timeline');
 
 c.finish();

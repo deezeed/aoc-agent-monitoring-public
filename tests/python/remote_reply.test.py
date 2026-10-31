@@ -26,6 +26,8 @@ ns = exec_functions(
      "_reply_open", "_reply_poll", "_reply_send", "_reply_pending_by_session"],
     {"os": os, "json": json, "threading": threading, "_secrets": secrets, "AOC_DATA_DIR": os.path.join(data_dir, "AOC"),
      "_push_notify": lambda title, body, tag="aoc", urgent=False, **k: pushes.append((title, body, urgent)) or 1,
+     "_notify_gate": lambda kind, channel, project="": (True, ""),
+     "_notify_log_add": lambda *a, **k: None,
      "_push_session_name": lambda sid: f"Session {sid}", "_log_bg_error": lambda *a: None})
 
 # ── settings ──

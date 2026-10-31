@@ -44,4 +44,20 @@ c.check('no expiry known -> no cache note', !h.includes('ctx-cache'));
 h = _ctxMeterHtml(S({ waiting_on_you: true, session_active: false }), NOW);
 c.check('closed session -> no cache note', !h.includes('ctx-cache'));
 
+// dollar figures (server adds recache_usd / warm_usd)
+const priced = extra => S({ waiting_on_you: true, context: ctx({ recache_usd: 3.24, warm_usd: 0.08, ...extra }) });
+h = _ctxMeterHtml(priced({}), NOW);
+c.check('25 min left: calm, prices only in the tooltip', !h.includes(' soon') && !h.includes('if cold')
+  && h.includes('405k tok re-cached, $3.24') && h.includes('~$0.08 to read'));
+h = _ctxMeterHtml(priced({ cache_expires_at: NOW + 540 }), NOW);
+c.check('1h cache, 9 min left: amber + cold price', h.includes('ctx-cache soon') && h.includes('$3.24 if cold'));
+h = _ctxMeterHtml(priced({ cache_ttl: '5m', cache_expires_at: NOW + 180 }), NOW);
+c.check('5m cache, 3 min left: not yet', !h.includes(' soon'));
+h = _ctxMeterHtml(priced({ cache_ttl: '5m', cache_expires_at: NOW + 90 }), NOW);
+c.check('5m cache, 90 s left: amber', h.includes('ctx-cache soon'));
+h = _ctxMeterHtml(priced({ cache_expires_at: NOW - 5 }), NOW);
+c.check('cold: next message price', h.includes('cache cold · next msg ~$3.24'));
+h = _ctxMeterHtml(S({ waiting_on_you: true, context: ctx({ cache_expires_at: NOW + 60 }) }), NOW);
+c.check('no prices from server -> no $ text', !h.includes('$') && h.includes('ctx-cache soon'));
+
 c.finish();

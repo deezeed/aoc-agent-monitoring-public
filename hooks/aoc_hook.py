@@ -781,6 +781,20 @@ def main():
         tool_error = hook.get("tool_error")
         success = not tool_error
 
+        # A background Agent call (run_in_background) returns at once with
+        # {isAsync: true, status: "async_launched", agentId} -- it has only
+        # started. Marking it done here showed "All tasks done" on a running
+        # card; its real end comes later as a task-notification line, which
+        # monitor.py's transcript scanner applies to this same id.
+        if success and isinstance(tool_output, dict) and (
+                tool_output.get("status") == "async_launched" or tool_output.get("isAsync") is True):
+            launched = {"id": agent_id, "name": description[:50], "icon": "AI", "description": description,
+                        "status": "running", "log": [f"Running in background ({ts})"]}
+            if subagent_type:
+                launched["subagent_type"] = subagent_type
+            post_aoc("/update", {"session_id": session_id, "cwd": cwd, "agents": [launched]})
+            return
+
         # A completed Agent tool's real response shape is
         # {status, content:[{type:"text", text:...}], usage:{...}, totalTokens,
         # resolvedModel, ...} — there's no "result" key (confirmed against a
