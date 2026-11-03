@@ -17,6 +17,13 @@ Usage:
                               calls to report whether a task already exists)
   python setup.py --stop     stop every running AOC process from this directory
                               (used by the installer before an upgrade)
+  python setup.py --check    print the install's health as JSON (hook entries,
+                              statusLine, deployed hook scripts, scheduled
+                              tasks vs what this version expects); touches nothing
+  python setup.py --repair   fix only what --check reports (hooks, statusLine,
+                              scripts; a scheduled task only if it is missing),
+                              then print --check's JSON -- the dashboard's
+                              Health -> Repair button runs this
   python setup.py --uninstall remove AOC's hook entries, deployed hook scripts
                               and scheduled tasks, and stop its processes;
                               keeps the user's data in %LOCALAPPDATA%\\AOC
@@ -47,7 +54,7 @@ def _get_arg_value(flag: str):
     return None
 
 
-_BOOL_FLAGS = {"--dry-run", "--stop", "--uninstall"}
+_BOOL_FLAGS = {"--dry-run", "--stop", "--uninstall", "--check", "--repair"}
 _VALUE_FLAGS = {"--cloud-url", "--cloud-key"}
 
 
@@ -134,15 +141,23 @@ def _find_pythonw() -> str:
     return candidate if os.path.exists(candidate) else sys.executable
 
 
+HOOK_SCRIPTS = ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, PERMISSION_SCRIPT)
+
+
+def _expected_script(src_name: str, pythonw: str) -> str:
+    """A hook script as deployed: the repo copy with this install's paths."""
+    with open(os.path.join(HOOKS_SRC_DIR, src_name), encoding="utf-8") as f:
+        content = f.read()
+    content = content.replace("__MONITOR_SCRIPT__", MONITOR_SCRIPT.replace("\\", "/"))
+    return content.replace("__PYTHONW__", pythonw.replace("\\", "/"))
+
+
 def deploy_hook_scripts(pythonw: str) -> None:
     if not DRY_RUN:
         os.makedirs(HOOKS_DST_DIR, exist_ok=True)
 
-    for src_name in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, PERMISSION_SCRIPT):
-        with open(os.path.join(HOOKS_SRC_DIR, src_name), encoding="utf-8") as f:
-            content = f.read()
-        content = content.replace("__MONITOR_SCRIPT__", MONITOR_SCRIPT.replace("\\", "/"))
-        content = content.replace("__PYTHONW__", pythonw.replace("\\", "/"))
+    for src_name in HOOK_SCRIPTS:
+        content = _expected_script(src_name, pythonw)
         dst_path = os.path.join(HOOKS_DST_DIR, src_name)
 
         if DRY_RUN:
@@ -397,6 +412,82 @@ def _save_settings(settings: dict) -> None:
         json.dump(settings, f, indent=2)
 
 
+def health_checks(settings: dict, pythonw: str, scripts: dict, deployed: dict, tasks: dict) -> list:
+    """Pure: what this version of setup.py would still change. Runs the
+    same merge functions as a real install on a COPY of settings.json, so
+    a check can't drift from what setup.py actually writes. scripts /
+    deployed = {name: expected / on-disk content (None = missing)}, tasks =
+    {task name: exists}. Each check: {id, label, ok, detail}."""
+    import copy
+    out = []
+
+    def add(cid, label, ok, detail=""):
+        out.append({"id": cid, "label": label, "ok": bool(ok), "detail": "" if ok else detail})
+
+    s = copy.deepcopy(settings if isinstance(settings, dict) else {})
+    added, updated = _merge_hook_entries(s, _hook_command(pythonw))
+    add("activity", "Activity hooks (sessions, agents, prompts)", not added and not updated,
+        "; ".join(x for x in (added and "missing: " + _fmt_specs(added),
+                              updated and "outdated: " + _fmt_specs(updated)) if x))
+    held_cmd = _permission_command(_find_python_console(pythonw))
+    for event in HELD_EVENTS:
+        res = _merge_permission_hook(s, held_cmd, event)
+        label = "Remote approve (permission prompts)" if event == PERMISSION_EVENT else "Reply from phone (held turns)"
+        add("held_" + event.lower(), label, res == "unchanged", f"{event} hook {'missing' if res == 'added' else 'outdated'}")
+    res = _merge_budget_hook(s)
+    add("budget", "Budget caps", res == "unchanged", f"PreToolUse budget hook {'missing' if res == 'added' else 'outdated'}")
+    res = _merge_danger_hook(s)
+    add("danger", "Dangerous-command guard", res == "unchanged",
+        f"PreToolUse {DANGER_HOOK_MATCHER} hook {'missing' if res == 'added' else 'outdated'}")
+    action, _ = _merge_statusline(s, _statusline_command(_find_python_console(pythonw)))
+    add("statusline", "Plan-limit meter (statusLine)", action == "unchanged",
+        "statusLine is not AOC's" if action in ("added", "wrapped") else "statusLine command outdated")
+    stale = [n for n in scripts if deployed.get(n) != scripts[n]]
+    add("scripts", "Hook scripts in ~/.claude/hooks", not stale,
+        ", ".join(f"{n} {'missing' if deployed.get(n) is None else 'outdated'}" for n in stale))
+    for name, exists in tasks.items():
+        short = name.rsplit("\\", 1)[-1]                      # "AOC Watchdog"
+        add("task_" + short.split()[-1].lower(), f"Scheduled task {short}", exists, "not registered")
+    return out
+
+
+def _task_exists(name: str) -> bool:
+    return subprocess.run(["schtasks", "/Query", "/TN", name], capture_output=True, text=True,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+
+
+def _read_deployed(name: str):
+    try:
+        with open(os.path.join(HOOKS_DST_DIR, name), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def current_health(pythonw: str) -> list:
+    try:
+        settings = _load_settings()
+    except Exception:
+        settings = {}  # unreadable settings.json: every hook check reports missing
+    return health_checks(settings, pythonw,
+                         {n: _expected_script(n, pythonw) for n in HOOK_SCRIPTS},
+                         {n: _read_deployed(n) for n in HOOK_SCRIPTS},
+                         {t: _task_exists(t) for t in (TASK_NAME, SENTINEL_TASK_NAME)})
+
+
+def repair(pythonw: str) -> None:
+    """--repair: re-apply the idempotent steps; a scheduled task only if it
+    is missing (re-registering an existing one fails with 'Access is
+    denied' from a non-interactive process and gains nothing)."""
+    deploy_hook_scripts(pythonw)
+    merge_hook_settings(pythonw)
+    merge_statusline_settings(pythonw)
+    if not _task_exists(TASK_NAME):
+        register_watchdog_task(pythonw)
+    if not _task_exists(SENTINEL_TASK_NAME):
+        register_sentinel_task(pythonw)
+
+
 def _fmt_specs(specs) -> str:
     return ", ".join(f"{e}/{m or '(no matcher)'}" for e, m in specs)
 
@@ -510,24 +601,13 @@ def register_sentinel_task(pythonw: str) -> None:
 def validate() -> None:
     print()
     print("--- validation ---")
+    # the same checks as --check / the dashboard's Health view (it used to
+    # count events only, and missed a missing danger-guard entry)
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            settings = json.load(f)
-        events = settings.get("hooks", {})
-        missing = [e for e, _ in HOOK_SPECS if e not in events] + \
-                  [e for e in HELD_EVENTS
-                   if not any(_is_held_hook(h) for entry in events.get(e, []) for h in entry.get("hooks", []))] + \
-                  ([] if any(_is_budget_hook(h) for entry in events.get("PreToolUse", []) for h in entry.get("hooks", []))
-                   else ["PreToolUse (budget caps)"])
-        if missing:
-            print(f"[WARN] settings.json missing hook events: {missing}")
-        else:
-            print(f"[ok] settings.json has all {len(HOOK_SPECS) + len(HELD_EVENTS) + 1} AOC hook entries")
-        sl = settings.get("statusLine")
-        print(f"[{'ok' if _is_aoc_statusline(sl) else 'WARN'}] statusLine "
-              + ("runs the AOC plan-limit recorder" if _is_aoc_statusline(sl) else "is not AOC's -- the plan-limit meter stays empty"))
+        for chk in current_health(_find_pythonw()):
+            print(f"[{'ok' if chk['ok'] else 'WARN'}] {chk['label']}" + (f" -- {chk['detail']}" if chk["detail"] else ""))
     except Exception as e:
-        print(f"[FAIL] could not read back settings.json: {e}")
+        print(f"[FAIL] could not check the install: {e}")
 
     for fname in ("aoc_hook.py", "run_hook.pyw", STATUSLINE_SCRIPT, PERMISSION_SCRIPT):
         p = os.path.join(HOOKS_DST_DIR, fname)
@@ -640,6 +720,13 @@ def main():
         return
     if "--uninstall" in sys.argv:
         uninstall()
+        return
+    if "--check" in sys.argv or "--repair" in sys.argv:
+        pythonw = _find_pythonw()
+        if "--repair" in sys.argv:
+            repair(pythonw)
+        # last line, so a caller can read it after --repair's [ok] lines
+        print("AOC_HEALTH " + json.dumps({"checks": current_health(pythonw)}))
         return
 
     pythonw = _find_pythonw()

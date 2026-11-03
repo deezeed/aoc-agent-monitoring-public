@@ -22,8 +22,9 @@ def slow_build():
     return {"watchdog": {"pid_alive": True}, "monitor_uptime_s": -1}
 
 ns = exec_functions(
-    ["_infra_health_refresh_bg", "_infra_health_snapshot"],
+    ["_infra_health_refresh_bg", "_infra_health_snapshot", "_hooks_health_bad"],
     {"time": time, "threading": threading,
+     "_hooks_health": {"checks": [{"id": "danger", "label": "Dangerous-command guard", "ok": False}]},
      "_infra_health_cache": cache,
      "_infra_health_refresh_lock": threading.Lock(),
      "_PROCESS_START": time.time() - 100,
@@ -50,6 +51,7 @@ time.sleep(0.2)
 r = snapshot()
 c.check("refreshed payload served", r is not None and r["watchdog"]["pid_alive"] is True)
 c.check("uptime computed at read time, not build time", 99 < r["monitor_uptime_s"] < 110)
+c.check("carries the failing install checks for the status pill", r["hooks_bad"] == ["Dangerous-command guard"])
 c.check("cached dict not mutated by the uptime overlay", cache[0]["monitor_uptime_s"] == -1)
 time.sleep(0.1)
 c.check("fresh cache starts no new build", len(calls) == 1)

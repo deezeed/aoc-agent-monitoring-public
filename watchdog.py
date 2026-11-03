@@ -1,10 +1,13 @@
 """
 AOC Watchdog — keeps monitor.py alive on port 5151.
-Polls /status every 30s; restarts after 2 consecutive failures.
+Polls /status every 30s; restarts after 3 consecutive failures.
+Also restarts it once monitor.py changed on disk (code reload, see
+_reload_step), so a pull / merge / update doesn't keep old code running.
 Run via Task Scheduler at login (pythonw.exe for no console window).
 """
 from __future__ import annotations
 import datetime
+import json
 import os
 import subprocess
 import sys
@@ -27,6 +30,11 @@ STATUS_TIMEOUT = 10    # seconds a single /status probe may take (was 4)
 FAIL_THRESHOLD = 3     # consecutive failures before restart (was 2)
 LOG_MAX_BYTES  = 200_000
 MAX_BACKOFF    = 300   # max seconds between restart attempts
+# Code reload: monitor.py must stay unchanged this long before the restart,
+# so an editor save, a merge or a git checkout in progress isn't picked up
+# half-way. GET /restart_ok (loopback only) names what blocks a restart.
+CODE_SETTLE_S  = 60
+RESTART_OK_URL = "http://127.0.0.1:5151/restart_ok"
 
 PYTHONW = os.path.join(
     os.path.dirname(sys.executable),
@@ -155,6 +163,61 @@ def _kill(proc: subprocess.Popen | None) -> None:
         _log(f"Could not kill monitor (PID {pid}) after terminate/kill/taskkill — it may still be running")
 
 
+def _code_stamp(path: str = MONITOR):
+    """(mtime_ns, size) of monitor.py, None if unreadable."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _reload_step(running, pending, cur, now: float):
+    """Pure. running = stamp of the code the monitor was started with,
+    pending = (stamp, first seen) of a change waiting to settle, cur = the
+    stamp on disk now. -> (action, pending): "none" (nothing changed),
+    "wait" (changed, not settled yet) or "ready" (settled CODE_SETTLE_S)."""
+    if cur is None or cur == running:
+        return "none", None
+    if pending is None or pending[0] != cur:
+        return "wait", (cur, now)
+    if now - pending[1] < CODE_SETTLE_S:
+        return "wait", pending
+    return "ready", pending
+
+
+def _compiles(path: str = MONITOR) -> str:
+    """"" if monitor.py compiles, else the error -- never restart into a
+    syntax error (the watchdog would then just restart-loop a dead file)."""
+    try:
+        with open(path, "rb") as f:
+            compile(f.read(), path, "exec")
+        return ""
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _restart_ok():
+    """GET /restart_ok -> (pid, blockers), or (None, None) if unreachable."""
+    try:
+        with urllib.request.urlopen(RESTART_OK_URL, timeout=STATUS_TIMEOUT) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return int(d.get("pid") or 0) or None, list(d.get("blockers") or [])
+    except Exception:
+        return None, None
+
+
+def _kill_pid(pid: int) -> None:
+    """Stop a monitor this watchdog didn't start (no Popen handle)."""
+    if not pid or pid == os.getpid() or not _is_python_process(pid):
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as exc:
+        _log(f"taskkill raised for monitor (PID {pid}): {exc}")
+
+
 def _is_python_process(pid: int) -> bool:
     """Best-effort check that `pid` names an actual python/pythonw process.
     Windows recycles PIDs quickly, so merely finding *some* live process at
@@ -218,6 +281,9 @@ def main() -> None:
     proc: subprocess.Popen | None = None
     fails = 0
     backoff = 10
+    # code reload: what the running monitor / this watchdog were started from
+    running_stamp, pending, reload_note = _code_stamp(), None, None
+    self_stamp, self_pending = _code_stamp(os.path.abspath(__file__)), None
 
     if not _alive():
         _log("Monitor not running at startup — starting now")
@@ -237,6 +303,31 @@ def main() -> None:
                     _log("Monitor recovered — back online")
                     backoff = 10
                 fails = 0
+                action, pending = _reload_step(running_stamp, pending, _code_stamp(), time.time())
+                if action == "ready":
+                    err = _compiles()
+                    pid, blockers = (None, None) if err else _restart_ok()
+                    why = err or ("monitor did not answer /restart_ok" if blockers is None else "; ".join(blockers))
+                    if why:
+                        if reload_note != (pending[0], why):
+                            _log(f"monitor.py changed, not reloading yet: {why}")
+                            reload_note = (pending[0], why)
+                    else:
+                        _log(f"monitor.py changed — restarting monitor (PID {pid}) to load the new code")
+                        _kill_pid(pid)
+                        _kill(proc)
+                        time.sleep(2)
+                        running_stamp, pending, reload_note = pending[0], None, None
+                        proc = _start_monitor()
+                        _log(f"Monitor reloaded (PID {proc.pid})" if proc else "Monitor failed to start after reload")
+                # this watchdog's own code: hand over to a fresh copy of itself
+                action, self_pending = _reload_step(self_stamp, self_pending, _code_stamp(os.path.abspath(__file__)), time.time())
+                if action == "ready" and not _compiles(os.path.abspath(__file__)):
+                    _log("watchdog.py changed — starting the new watchdog and exiting")
+                    _release_lock()
+                    subprocess.Popen([PYTHONW, os.path.abspath(__file__)], cwd=AOC_DIR,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    return
             else:
                 fails += 1
                 _log(f"Monitor not responding (fail {fails}/{FAIL_THRESHOLD})")
@@ -246,6 +337,7 @@ def main() -> None:
                     _show_native_toast("AOC Watchdog", "monitor.py stopped responding — restarting it now")
                     _kill(proc)
                     time.sleep(backoff)
+                    running_stamp, pending = _code_stamp(), None
                     proc = _start_monitor()
                     fails = 0
                     if proc:

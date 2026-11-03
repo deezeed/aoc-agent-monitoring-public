@@ -40,8 +40,27 @@ h = _askBodyHtml({ error: 'Still answering <x>' });
 c.check('error escaped', h.includes('ask-note err">Still answering &lt;x&gt;'));
 h = _askBodyHtml({ last: { ...e, key: 'k1', cached: true }, history: [{ key: 'k1', q: 'Koľko?' }, { key: 'k2', q: 'What failed?' }] });
 c.check('answer shown with question', h.includes('Koľko?</div><div class="ask-answer">'));
-c.check('cached -> ask again fresh', h.includes('_askRun(&quot;Koľko?&quot;,true)'));
+c.check('cached -> ask again fresh (same prev + model)', h.includes('_askRun(&quot;Koľko?&quot;,true,&quot;&quot;,&quot;haiku&quot;)'));
+c.check('follow up + deeper chips', h.includes('onclick="_askFollow()">Follow up</button>')
+  && h.includes('_askRun(&quot;Koľko?&quot;,false,&quot;&quot;,\'sonnet\')" title="Ask the same question with Claude Sonnet'));
 c.check('earlier questions exclude current', h.includes('_askShow(&quot;k2&quot;)') && !h.includes('_askShow(&quot;k1&quot;)'));
+
+// follow-ups + Sonnet
+h = _askBodyHtml({ last: { ...e, key: 'k3', prev: 'k2', thread: ['Koľko dnes?', 'A <b>včera</b>?'], model: 'sonnet' } });
+c.check('thread shown, escaped', h.includes('↳ after: Koľko dnes? › A &lt;b&gt;včera&lt;/b&gt;?'));
+c.check('sonnet answer: no Deeper chip, meta says Sonnet', !h.includes('Deeper (Sonnet)') && h.includes('· Sonnet · $0.012'));
+h = _askBodyHtml({ last: { ...e, key: 'k3', prev: 'k2', model: 'sonnet', cached: true } });
+c.check('fresh re-ask keeps prev + model', h.includes('_askRun(&quot;Koľko?&quot;,true,&quot;k2&quot;,&quot;sonnet&quot;)'));
+h = _askBodyHtml({ last: { ...e, key: 'k3' }, follow: 'k3' });
+c.check('follow mode: banner + way back, no second Follow up chip', h.includes('Follow-up to “Koľko?”') && h.includes('_askNew()')
+  && !h.includes('_askFollow()'));
+c.check('follow banner hidden for another answer', !_askBodyHtml({ last: { ...e, key: 'k3' }, follow: 'k9' }).includes('Follow-up to'));
+c.check('busy note names the model', _askBodyHtml({ busy: true, busyModel: 'sonnet' }).includes('asking Claude Sonnet')
+  && _askBodyHtml({ busy: true }).includes('asking Claude Haiku'));
+c.check('haiku meta has no model label', !_askAnswerHtml(e).includes('Sonnet'));
+c.check('form submits as follow-up when in follow mode', src.includes("_askRun(this.q.value,false,_askState.follow||'')"));
+c.check('request carries prev + model', src.includes("JSON.stringify({q, force:!!force, prev:prev||'', model:model||'haiku'})")
+  && src.includes('prev=data.get("prev") or ""') && src.includes('model=data.get("model") or "haiku"'));
 
 c.check('Today header has Ask AOC', /onclick="openAsk\(\)"[^>]*>Ask AOC</.test(src));
 c.check('palette entry', src.includes("add('act:ask','Ask AOC…'") && src.includes('ask:()=>openAsk(),'));

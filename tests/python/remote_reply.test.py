@@ -28,7 +28,8 @@ ns = exec_functions(
      "_push_notify": lambda title, body, tag="aoc", urgent=False, **k: pushes.append((title, body, urgent)) or 1,
      "_notify_gate": lambda kind, channel, project="": (True, ""),
      "_notify_log_add": lambda *a, **k: None,
-     "_push_session_name": lambda sid: f"Session {sid}", "_log_bg_error": lambda *a: None})
+     "_push_session_name": lambda sid: f"Session {sid}", "_log_bg_error": lambda *a: None,
+     "_ctxsave_take": lambda sid, now: False})
 
 # ── settings ──
 san = ns["_sanitize_remote_approve"]

@@ -3,6 +3,13 @@ this project's own dependency-free choice. Each test file creates one
 Checker, calls .check(label, cond) for every assertion, then .finish()."""
 import sys
 
+# A non-ASCII label (e.g. "včera") must not crash a cp1252 console like the
+# GitHub Actions Windows runner's -- print it escaped instead.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except (AttributeError, ValueError):
+    pass
+
 
 class Checker:
     def __init__(self):

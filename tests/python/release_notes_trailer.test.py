@@ -50,4 +50,27 @@ c.check("two trailers = two lines, subject dropped", "Two features" not in lines
 c.check("trailer replaces the subject", "Refactor _foo internals" not in lines)
 c.check("'skip' drops the commit", "Test-only tweak" not in lines)
 c.check("other trailers (Co-Authored-By) don't leak in", not any("Co-Authored" in l for l in lines))
+
+# Get-InternalSoundingSubjects: untrailed subjects that read like dev notes
+git("commit", "-q", "--allow-empty", "-m", "A/B compare: git plumbing goes through the shared _wt_* worktree API")
+git("commit", "-q", "--allow-empty", "-m", "Tests: non-ASCII labels no longer crash")
+git("commit", "-q", "--allow-empty", "-m", "Fix crash in monitor.py on startup")
+git("commit", "-q", "--allow-empty", "-m", "Refactor _ask internals\n\nRelease-note: Ask AOC answers faster")
+git("commit", "-q", "--allow-empty", "-m", "Inbox: everything that needs you, with one-tap answers")
+git("commit", "-q", "--allow-empty", "-m", "Work log for any period in one click, per project or client")
+with open(raw_file, "w", encoding="utf-8") as f:
+    f.write(git("log", "--no-merges", f"--format={fmt}", f"{base}..HEAD"))
+ps = (f"$env:AOC_RELEASE_NOTES_SELFTEST='1'; . '{SCRIPT}'; "
+      f"[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+      f"Get-InternalSoundingSubjects ([IO.File]::ReadAllText('{raw_file}')) | ForEach-Object {{ \"LINE:$_\" }}")
+out = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                     capture_output=True, text=True, encoding="utf-8")
+flagged = [l[5:] for l in out.stdout.splitlines() if l.startswith("LINE:")]
+c.check("internal check ran cleanly", out.returncode == 0)
+c.check("code identifiers / plumbing flagged", "A/B compare: git plumbing goes through the shared _wt_* worktree API" in flagged)
+c.check("'Tests:' prefix flagged", "Tests: non-ASCII labels no longer crash" in flagged)
+c.check("file names flagged", "Fix crash in monitor.py on startup" in flagged)
+c.check("a trailer clears an internal-looking subject", "Refactor _ask internals" not in flagged)
+c.check("user-facing subjects pass", not any(s.startswith(("Inbox:", "Work log", "Plain subject")) for s in flagged))
+c.check("exactly the three internal ones", len(flagged) == 3)
 c.finish()

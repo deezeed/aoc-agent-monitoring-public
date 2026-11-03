@@ -6,7 +6,7 @@ const { readMonitorSource, extractFunction } = require('./lib/extract');
 const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
-for (const f of ['escHtml', '_fmtDurationDHM', '_ctxMeterHtml'])
+for (const f of ['escHtml', '_fmtDurationDHM', '_ctxSaveHtml', '_ctxMeterHtml'])
   eval(extractFunction(src, f));
 
 const c = new Checker();

@@ -1931,6 +1931,8 @@ _NOTIFY_TYPES = [
      "webhook": "waiting_nudge", "sample": ("⏳ Sample session", "Waiting on you for 2h 5m")},
     {"key": "cache_expiry", "group": "Sessions", "label": "Prompt cache about to go cold", "channels": ("toast", "push"),
      "sample": ("❄ Sample session · cache cold in 8 min", "Reply now, or the next message costs ~$1.20 more")},
+    {"key": "ctx_save", "group": "Sessions", "label": "Context almost full (save state)", "channels": ("toast", "push"),
+     "sample": ("🧠 Sample session: context 90 % full", "Save its state to memory before it compacts -- one click in AOC.")},
     {"key": "permission", "group": "Sessions", "label": "Held permission prompt (Remote approve)", "channels": ("push",),
      "quiet": False, "sample": ("🔐 Sample session needs your OK", "Bash: npm test")},
     {"key": "reply", "group": "Sessions", "label": "Turn held for your reply (Reply from phone)", "channels": ("push",),
@@ -2763,6 +2765,22 @@ def _webhook_notify_worker():
                         _show_native_toast(title, body, kind="cache_expiry", project=proj)
                     except Exception:
                         pass
+
+            # Context almost full: offer "Save state" (or send it, mode auto)
+            # once per crossing, before Claude Code compacts the session.
+            try:
+                _cs_cfg = _ctxsave_settings()
+                for sess, ev in _ctxsave_tick(d.get("sessions_list"), _cs_cfg, now):
+                    if ev != "crossed" or _cs_cfg["mode"] == "off":
+                        continue
+                    if _cs_cfg["mode"] == "auto":
+                        _ctxsave_request(sess["id"], now, _cs_cfg["prompt"])
+                    proj = sess.get("project", "")
+                    if not _notification_suppressed(proj):
+                        title, body = _ctxsave_alert(sess, _cs_cfg)
+                        _show_native_toast(title, body, kind="ctx_save", project=proj)
+            except Exception as e:
+                _log_bg_error("context save", e)
 
             # Token-burn anomaly: a session whose recent tokens/min rate is a
             # multiple of its own session-long average -- catches a runaway
@@ -3670,6 +3688,17 @@ def _reply_open(data, cfg, now) -> dict:
     with _reply_lock:
         if not data.get("stop_hook_active"):
             _reply_streak.pop(sid, None)
+        if sid and _reply_streak.get(sid, 0) < _REPLY_MAX_STREAK and _ctxsave_take(sid, now):
+            # an armed "Save state": answer this turn end with it right away
+            _reply_expire(now)
+            for rid in [r for r, q in _reply_requests.items() if q["session_id"] == sid]:
+                del _reply_requests[rid]
+            rid = _secrets.token_hex(8)
+            _reply_requests[rid] = {
+                "id": rid, "session_id": sid, "message": str(data.get("last_assistant_message") or "")[-6000:],
+                "created": now, "last_poll": now, "state": "reply", "reply": _ctxsave_settings()["prompt"],
+            }
+            return {"hold": True, "id": rid}
         if not sid or not _reply_should_hold(cfg, data.get("idle_s"), _reply_streak.get(sid, 0)):
             return {"hold": False}
         _reply_expire(now)
@@ -3740,6 +3769,188 @@ def _reply_pending_by_session(now) -> dict:
                 out[q["session_id"]] = {"id": q["id"], "message": q["message"],
                                         "age_s": int(now - q["created"])}
     return out
+
+
+# ── Save state when the context fills up ──────────────────────────────────
+# When a session's context window crosses the threshold (Settings -> Notify,
+# default 90 %), AOC offers "Save state": a prompt asking Claude to write
+# what's done / where to resume / next steps to memory before Claude Code
+# compacts the conversation. It goes in through the Stop hook (reply from the
+# dashboard): straight away if the turn is already held for a reply, else
+# at the end of the current turn. Mode "auto" sends it by itself, once per
+# crossing. A big drop in fill = the session compacted: it re-arms and stays
+# quiet for a while; a crossing already in auto-compact territory is skipped.
+CTXSAVE_FILE = os.path.join(AOC_DATA_DIR, "context_save.json")
+CTXSAVE_STATE_FILE = os.path.join(AOC_DATA_DIR, "context_save_state.json")
+_CTXSAVE_MODES = ("offer", "auto", "off")
+_CTXSAVE_DEFAULT_PROMPT = ("Ulož stav projektu do pamäte: čo je hotové, kde skončiť (RESUME HERE), next steps.")
+_CTXSAVE_MIN_PCT = 50
+_CTXSAVE_MAX_PCT = 95
+_CTXSAVE_REARM_BELOW = 10        # points under the threshold that re-arm a crossing
+_CTXSAVE_COMPACT_DROP = 20       # a fall this big between two readings = compacted
+_CTXSAVE_COMPACT_QUIET_S = 900   # no offer this soon after a compaction
+_CTXSAVE_COMPACTING_PCT = 97     # at/over this Claude Code is about to compact on its own
+_CTXSAVE_KEEP_S = 3 * 86400
+_ctxsave_lock = threading.Lock()
+_ctxsave_state = {}              # sid -> {pct, crossed, crossed_at, compacted_at, armed, sent_at, t}
+
+
+def _ctxsave_sanitize(raw) -> dict:
+    """Pure: settings file -> {mode, threshold, prompt} with defaults."""
+    raw = raw if isinstance(raw, dict) else {}
+    mode = raw.get("mode") if raw.get("mode") in _CTXSAVE_MODES else "offer"
+    try:
+        thr = int(raw.get("threshold", 90))
+    except (TypeError, ValueError):
+        thr = 90
+    prompt = str(raw.get("prompt") or "").strip()[:2000] or _CTXSAVE_DEFAULT_PROMPT
+    return {"mode": mode, "threshold": max(_CTXSAVE_MIN_PCT, min(_CTXSAVE_MAX_PCT, thr)), "prompt": prompt}
+
+
+def _ctxsave_settings() -> dict:
+    return _ctxsave_sanitize(_load_json_file(CTXSAVE_FILE))
+
+
+def _ctxsave_save_settings(data) -> dict:
+    cfg = _ctxsave_sanitize({**_ctxsave_settings(), **(data if isinstance(data, dict) else {})})
+    os.makedirs(AOC_DATA_DIR, exist_ok=True)
+    tmp = CTXSAVE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False)
+    os.replace(tmp, CTXSAVE_FILE)
+    return cfg
+
+
+def _ctxsave_step(prev, pct, threshold, now):
+    """Pure: (new state, event) for one context reading of one session.
+    event: "crossed" (offer / auto-send now), "compacted" or "". Once per
+    crossing; re-armed by compaction or falling well under the threshold."""
+    st = dict(prev or {})
+    last = st.get("pct")
+    st["pct"], st["t"] = pct, now
+    if isinstance(last, (int, float)) and last - pct >= _CTXSAVE_COMPACT_DROP:
+        st.update(crossed=False, armed=False, compacted_at=now)
+        return st, "compacted"
+    if st.get("crossed"):
+        if pct < threshold - _CTXSAVE_REARM_BELOW:
+            st.update(crossed=False, armed=False)
+        return st, ""
+    if pct < threshold:
+        return st, ""
+    if now - (st.get("compacted_at") or 0) < _CTXSAVE_COMPACT_QUIET_S:
+        return st, ""
+    st.update(crossed=True, crossed_at=now, armed=False, sent_at=None)
+    if pct >= _CTXSAVE_COMPACTING_PCT:
+        return st, ""        # too late to ask: it compacts any moment
+    return st, "crossed"
+
+
+def _ctxsave_view(st, cfg) -> dict:
+    """Pure: the /status 'ctx_save' block of a session, or None."""
+    if cfg["mode"] == "off" or not st or not st.get("crossed"):
+        return None
+    state = "sent" if st.get("sent_at") else "armed" if st.get("armed") else "offer"
+    return {"state": state, "mode": cfg["mode"], "threshold": cfg["threshold"], "sent_at": st.get("sent_at")}
+
+
+def _ctxsave_persist():
+    """Caller holds _ctxsave_lock."""
+    try:
+        os.makedirs(AOC_DATA_DIR, exist_ok=True)
+        tmp = CTXSAVE_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_ctxsave_state, f)
+        os.replace(tmp, CTXSAVE_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _ctxsave_load():
+    data = _load_json_file(CTXSAVE_STATE_FILE)
+    if isinstance(data, dict):
+        _ctxsave_state.update({k: v for k, v in data.items() if isinstance(v, dict)})
+
+
+def _ctxsave_tick(sessions, cfg, now):
+    """One worker pass over /status sessions_list: [(session, event)]."""
+    out, changed = [], False
+    with _ctxsave_lock:
+        for s in sessions or ():
+            sid, c = s.get("id"), s.get("context") or {}
+            if not sid or not s.get("session_active") or not isinstance(c.get("pct"), (int, float)):
+                continue
+            prev = _ctxsave_state.get(sid)
+            st, ev = _ctxsave_step(prev, float(c["pct"]), cfg["threshold"], now)
+            if ev or not prev or bool(st.get("crossed")) != bool(prev.get("crossed")):
+                changed = True
+            _ctxsave_state[sid] = st
+            if ev:
+                out.append((s, ev))
+        for sid in [k for k, v in _ctxsave_state.items() if now - (v.get("t") or 0) > _CTXSAVE_KEEP_S]:
+            del _ctxsave_state[sid]
+            changed = True
+        if changed:
+            _ctxsave_persist()
+    return out
+
+
+def _ctxsave_request(sid, now=None, prompt=None) -> dict:
+    """Send the save-state prompt to a session: into a turn already held for
+    a reply ("sent"), else armed for the end of its current turn ("armed")."""
+    now = now or time.time()
+    sid = str(sid or "")
+    if not sid:
+        return {"ok": False, "error": "no session"}
+    prompt = prompt or _ctxsave_settings()["prompt"]
+    held = _reply_pending_by_session(now).get(sid)
+    if held and _reply_send(held["id"], "reply", prompt)[0]:
+        with _ctxsave_lock:
+            st = _ctxsave_state.setdefault(sid, {"t": now})
+            st.update(armed=False, sent_at=now)
+            _ctxsave_persist()
+        return {"ok": True, "state": "sent"}
+    with _ctxsave_lock:
+        st = _ctxsave_state.setdefault(sid, {"t": now})
+        st.update(armed=True, armed_at=now, sent_at=None)
+        _ctxsave_persist()
+    return {"ok": True, "state": "armed"}
+
+
+def _ctxsave_cancel(sid) -> bool:
+    with _ctxsave_lock:
+        st = _ctxsave_state.get(str(sid or ""))
+        if not st or not st.get("armed"):
+            return False
+        st["armed"] = False
+        _ctxsave_persist()
+    return True
+
+
+def _ctxsave_take(sid, now) -> bool:
+    """The Stop hook for `sid` fired: hand over an armed save-state prompt
+    (once). Called with _reply_lock held; never takes it itself."""
+    with _ctxsave_lock:
+        st = _ctxsave_state.get(sid)
+        if not st or not st.get("armed"):
+            return False
+        st.update(armed=False, sent_at=now)
+        _ctxsave_persist()
+    return True
+
+
+def _ctxsave_alert(s, cfg):
+    """Pure: (title, body) for the notification of a crossing."""
+    name = (s.get("display_name") or s.get("project") or "Session")[:40]
+    pct = round((s.get("context") or {}).get("pct") or 0)
+    if cfg["mode"] == "auto":
+        return f"🧠 {name}: context {pct} % full", "Asking it to save its state to memory when this turn ends."
+    return f"🧠 {name}: context {pct} % full", "Save its state to memory before it compacts -- one click in AOC."
+
+
+try:
+    _ctxsave_load()
+except Exception:
+    pass
 
 
 # ── Phone push notifications (Web Push) ───────────────────────────────────
@@ -4206,7 +4417,72 @@ def _infra_health_snapshot():
     cached = _infra_health_cache[0]
     if cached is None:
         return None
-    return {**cached, "monitor_uptime_s": time.time() - _PROCESS_START}
+    return {**cached, "monitor_uptime_s": time.time() - _PROCESS_START,
+            "hooks_bad": _hooks_health_bad(_hooks_health.get("checks"))}
+
+
+# ── install health: Claude Code hooks, statusLine, scripts, tasks ─────────
+# setup.py is the one source of truth for what an install should look like:
+# `setup.py --check` prints it as JSON (the same merge functions a real
+# install runs, applied to a copy of settings.json), `--repair` re-applies
+# just those steps. The danger guard's hook sat missing for two days once
+# because nothing re-checked after an update; now a worker does, every
+# _HOOKS_HEALTH_EVERY_S, and the Health view offers a one-click repair.
+_HOOKS_HEALTH_EVERY_S = 600
+_hooks_health = {"checks": None, "at": 0.0, "error": ""}
+_hooks_health_lock = threading.Lock()  # one setup.py run at a time
+
+
+def _parse_setup_health(stdout: str):
+    """Pure: setup.py --check / --repair output -> the checks list (None if
+    the AOC_HEALTH line is missing or malformed)."""
+    for line in reversed((stdout or "").splitlines()):
+        if line.startswith("AOC_HEALTH "):
+            try:
+                checks = json.loads(line[len("AOC_HEALTH "):]).get("checks")
+            except Exception:
+                return None
+            return checks if isinstance(checks, list) else None
+    return None
+
+
+def _hooks_health_bad(checks) -> list:
+    """Pure: labels of the failing checks ([] when unknown or all fine)."""
+    return [str(c.get("label") or c.get("id")) for c in (checks or []) if isinstance(c, dict) and not c.get("ok")]
+
+
+def _run_setup(flag: str) -> None:
+    """Run setup.py --check / --repair with the python.exe next to this
+    interpreter (the one setup.py was installed with: it derives the hook
+    commands from its own interpreter) and store the result."""
+    py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    if not os.path.exists(py):
+        py = sys.executable
+    with _hooks_health_lock:
+        try:
+            r = subprocess.run([py, os.path.join(AOC_DIR, "setup.py"), flag], cwd=AOC_DIR,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            checks = _parse_setup_health(r.stdout)
+            err = "" if checks is not None else ((r.stderr or r.stdout).strip().splitlines() or ["setup.py gave no result"])[-1][:300]
+        except Exception as e:
+            checks, err = None, f"{type(e).__name__}: {e}"[:300]
+        _hooks_health.update({"checks": checks if checks is not None else _hooks_health["checks"],
+                              "at": time.time(), "error": err})
+
+
+def _hooks_health_view() -> dict:
+    return {"checks": _hooks_health["checks"], "at": _hooks_health["at"], "error": _hooks_health["error"],
+            "bad": _hooks_health_bad(_hooks_health["checks"])}
+
+
+def _hooks_health_worker():
+    time.sleep(_STARTUP_GRACE_S)
+    while True:
+        _run_setup("--check")
+        time.sleep(_HOOKS_HEALTH_EVERY_S)
+
+threading.Thread(target=_hooks_health_worker, daemon=True, name="hooks-health").start()
 
 def _session_really_active(sess: dict, now_epoch: float, heartbeat_cutoff_s: int = 300) -> bool:
     """A session counts as active if either its heartbeat is recent, OR its
@@ -4551,18 +4827,23 @@ def _release_update_status(installed: str, release: dict, now: float) -> dict:
     return {"stale": stale, "behind_by": 0, "checked_at": now, "mode": "release",
             "installed": installed, "latest": latest.lstrip("vV"), "url": url}
 
-def _check_release_once(installed: str) -> dict:
+def _check_release_once(installed: str, keep=None) -> dict:
+    """keep: optional one-item list that receives the raw release JSON (the
+    one-click updater needs its assets and notes, not just the status)."""
     import urllib.request as _ur
     req = _ur.Request(AOC_RELEASES_API, headers={
         "Accept": "application/vnd.github+json", "User-Agent": f"AOC/{installed}"})
     with _ur.urlopen(req, timeout=15) as r:
         release = json.loads(r.read().decode("utf-8"))
+    if keep is not None:
+        keep[0] = release
     return _release_update_status(installed, release, time.time())
 
 def _release_update_worker(installed: str):
+    _whats_new_startup(installed)
     while True:
         try:
-            status = _check_release_once(installed)
+            status = _check_release_once(installed, keep=_latest_release)
             with _self_update_lock:
                 _self_update_status.clear()
                 _self_update_status.update(status)
@@ -4576,6 +4857,278 @@ def _release_update_worker(installed: str):
             # offline, rate-limited, or no release published yet (404)
             _log_bg_error("_release_update_worker", e)
         time.sleep(_RELEASE_CHECK_INTERVAL_S)
+
+# ── one-click update (installer builds only) ───────────────────────────────
+# Clicking the UPDATE badge downloads the new AOC-Setup-x.y.z.exe, checks it
+# against the "SHA-256: `...`" line publish_release.ps1 puts in every
+# release's notes (no hash or a mismatch = refused), then runs it silently
+# with the same flags as CI's upgrade job. The installer's PrepareToInstall
+# stops this monitor (setup.py --stop) and its [Run] setup.py starts the new
+# one, so the installer is started detached and outside our job object --
+# it has to outlive us. The "What's new" list of that release is kept in
+# WHATS_NEW_FILE and shown once when the new version first starts.
+AOC_RELEASE_DL_PREFIX = "https://github.com/deezeed/aoc-agent-monitoring-public/releases/download/"
+AOC_RELEASE_TAG_API = "https://api.github.com/repos/deezeed/aoc-agent-monitoring-public/releases/tags/"
+UPDATE_DIR = os.path.join(AOC_DATA_DIR, "update")
+WHATS_NEW_FILE = os.path.join(AOC_DATA_DIR, "whats_new.json")
+_INSTALLER_SILENT_ARGS = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+_WHATS_NEW_MAX_ITEMS = 40
+_latest_release = [None]  # last releases/latest JSON, set by _release_update_worker
+_update_job = {"state": "idle", "pct": 0, "version": "", "error": ""}
+_update_job_lock = _threading.Lock()
+_whats_new_lock = _threading.Lock()
+
+# (state, event) -> next state. Anything not listed leaves the job as it is,
+# so a second click while downloading doesn't start a second download.
+_UPDATE_TRANSITIONS = {
+    ("idle", "start"): "downloading",
+    ("error", "start"): "downloading",
+    ("downloading", "progress"): "downloading",
+    ("downloading", "downloaded"): "verifying",
+    ("verifying", "verified"): "installing",
+    ("downloading", "fail"): "error",
+    ("verifying", "fail"): "error",
+    ("installing", "fail"): "error",
+}
+
+def _update_job_next(job: dict, event: str, **kw) -> dict:
+    """Pure: the update job after `event` (start / progress / downloaded /
+    verified / fail). An event that doesn't fit the current state is ignored."""
+    state = _UPDATE_TRANSITIONS.get((job.get("state", "idle"), event))
+    if state is None:
+        return dict(job)
+    new = dict(job, state=state)
+    if event == "start":
+        new.update(pct=0, version=str(kw.get("version") or ""), error="")
+    elif event == "progress":
+        new["pct"] = max(0, min(99, int(kw.get("pct") or 0)))
+    elif event in ("downloaded", "verified"):
+        new["pct"] = 100
+    elif event == "fail":
+        new["error"] = str(kw.get("error") or "update failed")[:200]
+    return new
+
+def _release_sha256(body) -> str:
+    """Pure: the installer hash from publish_release.ps1's notes line
+    "SHA-256: `<64 hex>`", lowercased; "" if there isn't exactly one."""
+    found = {m.lower() for m in re.findall(r"SHA-256:\s*`([0-9a-fA-F]{64})`", str(body or ""))}
+    return found.pop() if len(found) == 1 else ""
+
+def _release_whats_new(body) -> list:
+    """Pure: the bullet list under the notes' "## What's new ..." heading."""
+    items, inside = [], False
+    for line in str(body or "").splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            inside = s.lstrip("#").strip().lower().startswith("what's new")
+            continue
+        if inside and s[:2] in ("- ", "* "):
+            text = s[2:].strip()
+            if text:
+                items.append(text[:300])
+    return items[:_WHATS_NEW_MAX_ITEMS]
+
+def _update_plan(installed: str, release) -> dict:
+    """Pure: can this release be installed with one click? {"ok": True,
+    version, url, name, sha256, notes} or {"ok": False, "error"}. Only an
+    AOC-Setup-<version>.exe asset of the public repo's own release counts."""
+    if not installed:
+        return {"ok": False, "error": "one-click update is for installed copies only"}
+    if not isinstance(release, dict):
+        return {"ok": False, "error": "no release information yet -- try again in a minute"}
+    version = str(release.get("tag_name") or "").strip().lstrip("vV")
+    cur_v, new_v = _parse_version(installed), _parse_version(version)
+    if not (cur_v and new_v and new_v > cur_v):
+        return {"ok": False, "error": "already up to date"}
+    name = f"AOC-Setup-{version}.exe"
+    url = ""
+    for a in release.get("assets") or []:
+        if not isinstance(a, dict):
+            continue
+        u = str(a.get("browser_download_url") or "")
+        if a.get("name") == name and u == f"{AOC_RELEASE_DL_PREFIX}v{version}/{name}":
+            url = u
+            break
+    if not url:
+        return {"ok": False, "error": f"release v{version} has no {name}"}
+    sha = _release_sha256(release.get("body"))
+    if not sha:
+        return {"ok": False, "error": "release notes carry no SHA-256 -- download it manually"}
+    return {"ok": True, "version": version, "url": url, "name": name, "sha256": sha,
+            "notes": _release_whats_new(release.get("body"))}
+
+def _whats_new_next(state, installed: str):
+    """Pure: WHATS_NEW_FILE state at startup -> (new state, needs_fetch).
+    State: {"seen": version last started, "show": {"version", "items"} or
+    None}. A fresh install only records its version; a version change shows
+    the list once -- the updater's saved one ("pending") if it matches,
+    otherwise needs_fetch=True (installed by hand: fetch that release)."""
+    state = dict(state) if isinstance(state, dict) else {}
+    seen = str(state.get("seen") or "")
+    if not installed or seen == installed:
+        return state, bool(installed and isinstance(state.get("show"), dict)
+                           and state["show"].get("version") == installed
+                           and state["show"].get("items") is None)
+    pending = state.pop("pending", None)
+    state["seen"] = installed
+    if not seen:
+        state["show"] = None
+        return state, False
+    if isinstance(pending, dict) and pending.get("version") == installed and isinstance(pending.get("items"), list):
+        state["show"] = {"version": installed, "items": pending["items"]}
+        return state, False
+    state["show"] = {"version": installed, "items": None}
+    return state, True
+
+def _whats_new_load(path=None) -> dict:
+    try:
+        with open(path or WHATS_NEW_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _whats_new_save(state, path=None):
+    path = path or WHATS_NEW_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+def _whats_new_startup(installed: str, path=None, fetch_fn=None):
+    """Run once when an installed copy starts (from the release worker)."""
+    try:
+        with _whats_new_lock:
+            state, needs_fetch = _whats_new_next(_whats_new_load(path), installed)
+            _whats_new_save(state, path)
+        if not needs_fetch:
+            return
+        items = (fetch_fn or _fetch_release_notes)(installed)
+        with _whats_new_lock:
+            state = _whats_new_load(path)
+            show = state.get("show")
+            if isinstance(show, dict) and show.get("version") == installed:
+                show["items"] = items
+                _whats_new_save(state, path)
+    except Exception as e:
+        _log_bg_error("_whats_new_startup", e)
+
+def _fetch_release_notes(version: str) -> list:
+    import urllib.request as _ur
+    req = _ur.Request(AOC_RELEASE_TAG_API + "v" + version, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"AOC/{version}"})
+    with _ur.urlopen(req, timeout=15) as r:
+        return _release_whats_new(json.loads(r.read().decode("utf-8")).get("body"))
+
+def _whats_new_view(installed: str, path=None) -> dict:
+    """GET /whats_new: the list to show once, or {} (dev tree / nothing new
+    / not fetched yet)."""
+    if not installed:
+        return {}
+    show = _whats_new_load(path).get("show")
+    if isinstance(show, dict) and show.get("version") == installed and show.get("items"):
+        return {"version": installed, "items": show["items"]}
+    return {}
+
+def _whats_new_dismiss(path=None):
+    with _whats_new_lock:
+        state = _whats_new_load(path)
+        state["show"] = None
+        _whats_new_save(state, path)
+
+def _update_job_set(event: str, **kw):
+    with _update_job_lock:
+        new = _update_job_next(_update_job, event, **kw)
+        _update_job.clear()
+        _update_job.update(new)
+
+def _download_file(url, dest, progress_fn):
+    """url -> dest (via dest.part); progress_fn(pct) while it runs."""
+    import urllib.request as _ur
+    tmp = dest + ".part"
+    def _hook(count, block_size, total):
+        if total > 0:
+            progress_fn(count * block_size * 100 // total)
+    try:
+        _ur.urlretrieve(url, tmp, _hook)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+def _file_sha256(path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _launch_installer(exe, log_path):
+    """Start the installer so it survives this monitor being stopped by it:
+    detached, own process group, and broken away from the Task Scheduler job
+    the watchdog runs us in (when that job doesn't allow breakaway, plain
+    detached is the best we can do)."""
+    args = [exe] + _INSTALLER_SILENT_ARGS + ["/LOG=" + log_path]
+    base = (getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    try:
+        subprocess.Popen(args, creationflags=base | 0x01000000,  # CREATE_BREAKAWAY_FROM_JOB
+                         close_fds=True, cwd=os.path.dirname(exe))
+    except OSError:
+        subprocess.Popen(args, creationflags=base, close_fds=True, cwd=os.path.dirname(exe))
+
+_UPDATE_INSTALL_WAIT_S = 600  # a working installer stops this process well before
+
+def _update_install_worker(plan, installed, download_fn=None, launch_fn=None,
+                           update_dir=None, whats_new_path=None, wait_s=None):
+    """Download -> verify -> save the What's new list -> launch. Every
+    failure lands in _update_job as an error the badge shows. A successful
+    install stops this monitor; still being alive after wait_s means it
+    didn't happen."""
+    update_dir = update_dir or UPDATE_DIR
+    exe = os.path.join(update_dir, plan["name"])
+    try:
+        os.makedirs(update_dir, exist_ok=True)
+        (download_fn or _download_file)(plan["url"], exe, lambda pct: _update_job_set("progress", pct=pct))
+        _update_job_set("downloaded")
+        got = _file_sha256(exe)
+        if got != plan["sha256"]:
+            try:
+                os.remove(exe)
+            except OSError:
+                pass
+            _update_job_set("fail", error=f"checksum mismatch (got {got[:12]}..., expected {plan['sha256'][:12]}...) -- not installed")
+            return
+        with _whats_new_lock:
+            state = _whats_new_load(whats_new_path)
+            state.setdefault("seen", installed)
+            state["pending"] = {"version": plan["version"], "items": plan.get("notes") or []}
+            _whats_new_save(state, whats_new_path)
+        _update_job_set("verified")
+        log = os.path.join(update_dir, "install.log")
+        (launch_fn or _launch_installer)(exe, log)
+        time.sleep(_UPDATE_INSTALL_WAIT_S if wait_s is None else wait_s)
+        _update_job_set("fail", error=f"the installer did not restart AOC -- see {log}")
+    except Exception as e:
+        _log_bg_error("_update_install_worker", e)
+        _update_job_set("fail", error=str(e) or e.__class__.__name__)
+
+def _update_start(installed: str, release) -> dict:
+    """POST /selfupdate/install: validate, then run the worker in the
+    background. The badge follows progress through /status."""
+    plan = _update_plan(installed, release)
+    if not plan["ok"]:
+        return plan
+    with _update_job_lock:
+        if _update_job.get("state") in ("downloading", "verifying", "installing"):
+            return {"ok": False, "error": "an update is already running"}
+        new = _update_job_next(_update_job, "start", version=plan["version"])
+        _update_job.clear()
+        _update_job.update(new)
+    _threading.Thread(target=_update_install_worker, args=(plan, installed), daemon=True).start()
+    return {"ok": True, "version": plan["version"]}
 
 _SELFUPDATE_FETCH_TIMEOUT_S = 30
 _SELFUPDATE_QUIET_FETCH_TIMEOUTS = 2  # consecutive fetch timeouts not logged
@@ -4633,6 +5186,28 @@ def _selfupdate_worker():
         _t.sleep(900)
 
 _threading.Thread(target=_selfupdate_worker, daemon=True).start()
+
+
+# ── code reload (watchdog) ─────────────────────────────────────────────────
+# watchdog.py restarts this process once monitor.py changed on disk (edit,
+# git pull, merge) and the new file has settled + compiles. It asks
+# GET /restart_ok first: a held permission / danger prompt keeps a Claude
+# Code hook request open, and a restart would drop it -- the hook then fails
+# open and the command runs unapproved -- so those block the restart.
+
+def _restart_blockers(perm_requests, tunnel_state, update_state=None) -> list:
+    """Pure: reasons not to restart right now (empty = safe). An open remote
+    tunnel blocks too: the restart would cut the phone off mid-use, and so
+    does a one-click update on its way (the installer restarts AOC itself)."""
+    out = []
+    if update_state not in (None, "idle", "error"):
+        out.append(f"update {update_state}")
+    held = [r for r in (perm_requests or {}).values() if isinstance(r, dict) and r.get("state") == "pending"]
+    if held:
+        out.append(f"{len(held)} prompt(s) waiting for your OK")
+    if tunnel_state in ("starting", "ready"):
+        out.append("remote tunnel is open")
+    return out
 
 
 # ── PR/branch auto-link ────────────────────────────────────────────────────
@@ -5557,15 +6132,15 @@ def _find_claude_exe():
     return found
 
 
-def _run_haiku(prompt, stdin_text, timeout=120):
-    """-> (text, cost_usd). `claude -p` with Haiku, no tools, hooks off (our
-    own hooks would otherwise register it as a session), not saved."""
+def _run_haiku(prompt, stdin_text, timeout=120, model="haiku"):
+    """-> (text, cost_usd). `claude -p` with Haiku (or `model`), no tools,
+    hooks off (our own hooks would otherwise register it as a session), not saved."""
     exe = _find_claude_exe()
     if not exe:
         raise RuntimeError("Claude Code (claude) not found")
     with _recap_run_lock:
         p = subprocess.Popen(
-            [exe, "-p", "--model", "haiku", "--no-session-persistence", "--tools", "",
+            [exe, "-p", "--model", model, "--no-session-persistence", "--tools", "",
              "--settings", '{"disableAllHooks": true}', "--output-format", "json", prompt],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=AOC_DATA_DIR if os.path.isdir(AOC_DATA_DIR) else None,
@@ -5678,19 +6253,33 @@ def _recap_get(sid, force=False, run=None, now=None):
 # plain-text sheet (capped), and Haiku answers from that sheet only.
 # Sessions in the sheet carry 8-char ids ([#1a2b3c4d]) that the UI turns
 # into Replay links. Answers are cached per question and day.
+# A follow-up ("a včera?", "which of those failed?") names the answer it
+# continues (prev = its cache key): the last few Q/A pairs go along as
+# context, their words widen the fact search, and a follow-up without its
+# own period keeps the previous one. "Deeper" re-asks with Sonnet.
 ASK_CACHE_FILE = os.path.join(AOC_DATA_DIR, "ask_cache.json")
 _ASK_MAX_FACTS = 12000
 _ASK_MAX_Q = 500
 _ASK_KEEP = 60
+_ASK_FOLLOW = 3                    # earlier Q/A pairs sent with a follow-up
+_ASK_MODELS = {"haiku": "haiku", "sonnet": "claude-sonnet-5"}
 _ask_lock = threading.Lock()
 _ask_busy = [False]
 _ASK_INSTRUCTION = (
     "You answer a question about the user's own Claude Code usage. Use ONLY the FACTS given with "
     "the question; use their exact numbers (money in $ with 2 decimals) and add them up yourself only "
     "when no total is given. If the facts don't hold the answer, say so in one sentence and name what "
-    "is missing. When you mention a session, write its id exactly as in the facts, like [#1a2b3c4d]. "
-    "Be short: 1-5 sentences or a short list with '- '. Plain text: no markdown headings, no bold, "
-    "no backticks. Answer in the same language as the question.")
+    "is missing. When you mention a session, write its id exactly as in the facts, like [#1a2b3c4d]; "
+    "the app shows the session's title in its place, so the sentence must still read naturally with a "
+    "name there, and don't write the title next to it again. 'Agents' (agenti) in a question means the "
+    "user's Claude Code sessions and their subagents, so answer it from the session facts. "
+    "Be short: 1-5 sentences or a short list with '- '. Start with the answer itself: don't "
+    "repeat the question, no filler, no closing offers. Plain text: no markdown headings, no bold, "
+    "no backticks. Answer in the same language as the question, the way a native speaker would say it: "
+    "natural word order, correct grammatical case and agreement, and don't translate the English labels "
+    "in the facts word for word (PERIOD: today is just 'dnes' in Slovak). If EARLIER IN THIS CONVERSATION "
+    "is given, the question may build on it ('a včera?', 'which of those?'): use it to understand what is "
+    "asked, but take numbers only from the FACTS.")
 _ASK_STOP = set("""
 a aj ako ale alebo ani asi az bol bola bolo by bude co ci do este for from had has have how i in is it je
 ja jej ich k kde ked kedy kolko kto ma mam me mi my na nad nie o od on ona pod pre pri s sa si sme so som
@@ -5856,12 +6445,12 @@ def _ask_sessions(conn, d0, d1):
     return out
 
 
-def _ask_facts(conn, question, today, fail_fn=None, client_cfg=None):
+def _ask_facts(conn, question, today, fail_fn=None, client_cfg=None, period=None):
     """-> (facts text, {id8: {id, title}}, period). conn = transcript index;
     fail_fn(days) = the failure map (only called when the question is about
-    failures -- it scans transcripts)."""
+    failures -- it scans transcripts). period overrides the question's own."""
     from datetime import date as _date
-    period = _ask_period(question, today)
+    period = period or _ask_period(question, today)
     topics = _ask_topics(question)
     words = _ask_keywords(question)
     d0, d1 = period["from"], period["to"]
@@ -5977,9 +6566,47 @@ def _ask_facts(conn, question, today, fail_fn=None, client_cfg=None):
     return facts, used, period
 
 
-def _ask_cache_key(question, today):
+def _ask_cache_key(question, today, model="haiku", prev=""):
+    """Pure: per question + day; a non-default model or a follow-up gets its
+    own key (a plain Haiku question keeps the key it always had)."""
     import hashlib
-    return hashlib.sha1((_ask_norm(question) + "|" + today.isoformat()).encode("utf-8")).hexdigest()[:20]
+    s = _ask_norm(question) + "|" + today.isoformat()
+    if model != "haiku":
+        s += "|m:" + model
+    if prev:
+        s += "|p:" + prev
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:20]
+
+
+def _ask_thread(cache, prev, limit=_ASK_FOLLOW):
+    """Pure: the answers a follow-up continues, oldest first (at most `limit`,
+    following each entry's own `prev`; a broken or looping chain just ends)."""
+    out, seen = [], set()
+    while prev and prev not in seen and len(out) < limit:
+        seen.add(prev)
+        e = cache.get(prev)
+        if not isinstance(e, dict):
+            break
+        out.append(e)
+        prev = e.get("prev") or ""
+    return out[::-1]
+
+
+def _ask_period_explicit(question, today):
+    """Pure: does the question name its own period? (Otherwise a follow-up
+    keeps the previous answer's period.)"""
+    return (_ask_period(question, today)["label"] != "last 30 days"
+            or bool(re.search(r"\b30\b", _ask_norm(question))))
+
+
+def _ask_prompt(question, facts, thread=()):
+    """Pure: the text sent with _ASK_INSTRUCTION. Earlier Q/A pairs of a
+    follow-up go first; a plain question is just QUESTION + FACTS."""
+    head = ""
+    if thread:
+        head = "EARLIER IN THIS CONVERSATION:\n" + "".join(
+            f"Q: {e.get('q', '')}\nA: {str(e.get('answer', ''))[:1200]}\n" for e in thread) + "\n"
+    return f"{head}QUESTION: {question}\n\nFACTS:\n{facts}\n"
 
 
 def _ask_load():
@@ -6004,17 +6631,25 @@ def _ask_history(limit=12):
     return {"items": items}
 
 
-def _ask(question, force=False, run=None, now=None, conn_fn=None, fail_fn=None):
+def _ask(question, force=False, run=None, now=None, conn_fn=None, fail_fn=None, prev="", model="haiku"):
     """POST /ask: {"ok", "q", "answer", "cost", "at", "period", "sessions",
-    "cached"}. Blocking (a few seconds) unless cached for today."""
+    "model", "prev", "thread", "cached"}. prev = the cache key of the answer
+    this follows up; model = haiku | sonnet. Blocking (a few seconds) unless
+    cached for today."""
     from datetime import date as _date
     q = re.sub(r"\s+", " ", str(question or "")).strip()[:_ASK_MAX_Q]
     if len(q) < 3:
         return {"ok": False, "error": "Type a question first."}
+    model = model if model in _ASK_MODELS else "haiku"
+    prev = prev if isinstance(prev, str) and re.fullmatch(r"[0-9a-f]{20}", prev) else ""
     now = now or time.time()
     today = _date.fromtimestamp(now)
-    key = _ask_cache_key(q, today)
-    hit = _ask_load().get(key)
+    cache = _ask_load()
+    thread = _ask_thread(cache, prev)
+    if prev and not thread:
+        return {"ok": False, "error": "The earlier answer is gone -- ask it as a new question."}
+    key = _ask_cache_key(q, today, model, prev)
+    hit = cache.get(key)
     if hit and not force:
         return {"ok": True, **hit, "cached": True}
     if conn_fn is None and not os.path.exists(TRANSCRIPT_INDEX_DB):
@@ -6024,16 +6659,25 @@ def _ask(question, force=False, run=None, now=None, conn_fn=None, fail_fn=None):
             return {"ok": False, "busy": True, "error": "Still answering the previous question."}
         _ask_busy[0] = True
     try:
+        # a follow-up searches with the earlier questions' words too ("a včera?"
+        # alone names no topic) and keeps their period unless it names one
+        scope = " ".join([e.get("q", "") for e in thread] + [q])
+        period = None
+        if thread and not _ask_period_explicit(q, today) and isinstance(thread[-1].get("period"), dict):
+            period = thread[-1]["period"]
         conn = (conn_fn or _transcript_index_connect)()
         try:
-            facts, sessions, period = _ask_facts(conn, q, today, fail_fn=fail_fn if fail_fn is not None else _failure_map,
-                                                 client_cfg=_load_clients())
+            facts, sessions, period = _ask_facts(conn, scope, today, fail_fn=fail_fn if fail_fn is not None else _failure_map,
+                                                 client_cfg=_load_clients(), period=period)
         finally:
             conn.close()
-        text, cost = (run or _run_haiku)(_ASK_INSTRUCTION, f"QUESTION: {q}\n\nFACTS:\n{facts}\n")
+        text, cost = (run or _run_haiku)(_ASK_INSTRUCTION, _ask_prompt(q, facts, thread), model=_ASK_MODELS[model])
         text = text.strip()[:4000]
-        entry = {"key": key, "q": q, "answer": text, "cost": round(cost, 4), "at": now,
+        entry = {"key": key, "q": q, "answer": text, "cost": round(cost, 4), "at": now, "model": model,
                  "period": period, "sessions": {k: v for k, v in sessions.items() if f"#{k}" in text}}
+        if prev:
+            entry["prev"] = prev
+            entry["thread"] = [e.get("q", "") for e in thread]
         _ask_store(key, entry)
         return {"ok": True, **entry, "cached": False}
     except Exception as e:
@@ -6833,6 +7477,265 @@ def _wt_diff(wid, git=None, path=None):
         if rc == 0 and wip.strip():
             text += ("\n" if text else "") + "# --- not committed yet ---\n" + wip
     return {"ok": True, "diff": text[:1_000_000], "branch": w["branch"], "base": w["base"]}
+
+
+# ── Stranded worktrees: a git worktree under <repo>\.claude\worktrees\ (an
+# agent's from Claude Code, or one of AOC's parallel sessions) that still
+# holds work -- uncommitted files or commits its repo's branch doesn't have
+# -- while nothing works in it any more: no open session in the folder and
+# no file or commit touched for _WT_STRANDED_IDLE_S. That's what a crashed or
+# killed agent leaves behind. Inbox and Today list them with Commit WIP
+# (everything committed on its branch), Relaunch (a new session in the
+# folder, told to pick the work up) and Discard (worktree + branch removed,
+# after you've seen the diff stat). Repos come from the folders Claude Code
+# worked in lately, the open sessions and worktrees.json.
+_WT_STRANDED_IDLE_S = 30 * 60
+_WT_STRANDED_CACHE_S = 60
+_WT_STRANDED_MAX_DIRS = 40
+_WT_WIP_MESSAGE = "WIP: rescued by AOC"
+_wt_stranded_cache = [0.0, None]
+_wt_repo_root_cache = {}          # normcase(cwd) -> (when, main worktree path or "")
+
+
+def _wt_porcelain(text):
+    """Pure: `git worktree list --porcelain` -> [{path, head, branch, detached,
+    locked, prunable}] (main worktree first, as git prints it)."""
+    out = []
+    for block in re.split(r"\n\s*\n", str(text or "").replace("\r\n", "\n")):
+        w = {}
+        for line in block.split("\n"):
+            key, _, val = line.partition(" ")
+            if key == "worktree":
+                w["path"] = os.path.normpath(val.strip())
+            elif key == "HEAD":
+                w["head"] = val.strip()
+            elif key == "branch":
+                w["branch"] = val.strip().replace("refs/heads/", "", 1)
+            elif key in ("detached", "locked", "prunable", "bare"):
+                w[key] = True
+        if w.get("path"):
+            out.append(w)
+    return out
+
+
+def _wt_stranded_id(path):
+    """Pure: a stable short id for a worktree folder."""
+    import hashlib
+    return hashlib.sha1(os.path.normcase(os.path.normpath(path)).encode("utf-8")).hexdigest()[:12]
+
+
+def _wt_in_claude_dir(main, path):
+    """Pure: is `path` a worktree folder under <main>\\.claude\\worktrees\\?"""
+    root = os.path.normcase(os.path.normpath(os.path.join(main, ".claude", "worktrees")))
+    p = os.path.normcase(os.path.normpath(path))
+    return p.startswith(root + os.sep) and os.sep not in p[len(root) + 1:]
+
+
+def _wt_stranded_reason(st, active_sessions, now, idle_s=_WT_STRANDED_IDLE_S):
+    """Pure: why this worktree counts as stranded ('' = it doesn't).
+    st: {exists, dirty, ahead, last_activity}."""
+    if not st.get("exists") or active_sessions:
+        return ""
+    if not (st.get("dirty") or st.get("ahead")):
+        return ""
+    idle = now - (st.get("last_activity") or 0)
+    if idle < idle_s:
+        return ""
+    bits = []
+    if st.get("dirty"):
+        bits.append(f"{st['dirty']} uncommitted file{'' if st['dirty'] == 1 else 's'}")
+    if st.get("ahead"):
+        bits.append(f"{st['ahead']} unmerged commit{'' if st['ahead'] == 1 else 's'}")
+    return " + ".join(bits) + ", untouched for " + _fmt_idle(idle)
+
+
+def _fmt_idle(secs):
+    """Pure: 95 min -> '1 h 35 min', 3 days -> '3 d'."""
+    m = int(secs // 60)
+    if m < 60:
+        return f"{m} min"
+    if m < 24 * 60:
+        return f"{m // 60} h" + (f" {m % 60} min" if m % 60 else "")
+    return f"{m // (24 * 60)} d"
+
+
+def _wt_main_of(cwd, git=None, now=None):
+    """The main worktree folder of the repo `cwd` is in ('' if none), cached 10 min."""
+    git = git or _wt_git
+    now = now or time.time()
+    key = os.path.normcase(os.path.normpath(cwd))
+    hit = _wt_repo_root_cache.get(key)
+    if hit and now - hit[0] < 600:
+        return hit[1]
+    main = ""
+    if os.path.isdir(cwd):
+        rc, out, _ = git(["worktree", "list", "--porcelain"], cwd, timeout=15)
+        items = _wt_porcelain(out) if rc == 0 else []
+        if items and not items[0].get("bare"):
+            main = items[0]["path"]
+    _wt_repo_root_cache[key] = (now, main)
+    return main
+
+
+def _wt_stranded_facts(main, w, base_ref, git=None):
+    """Git facts for one candidate worktree: dirty, ahead (commits its HEAD
+    has that `base_ref` doesn't), diff stat, last activity (newest of the
+    uncommitted files' mtimes and the last commit time)."""
+    git = git or _wt_git
+    path = w["path"]
+    out = {"exists": os.path.isdir(path), "dirty": 0, "ahead": 0, "files": 0, "add": 0, "del": 0, "last_activity": 0}
+    if not out["exists"]:
+        return out
+    rc, st, _ = git(["status", "--porcelain=v1", "-z"], path)
+    changed = _parse_porcelain_z(st) if rc == 0 else {}
+    out["dirty"] = len(changed)
+    last = 0.0
+    for rel in list(changed)[:300]:
+        try:
+            last = max(last, os.path.getmtime(os.path.join(path, rel.rstrip("/"))))
+        except OSError:
+            pass
+    rc, ct, _ = git(["log", "-1", "--format=%ct", "HEAD"], path)
+    if rc == 0 and ct.strip().isdigit():
+        last = max(last, float(ct.strip()))
+    head = w.get("head") or "HEAD"
+    if base_ref:
+        rc, n, _ = git(["rev-list", "--count", f"{base_ref}..{head}"], main)
+        out["ahead"] = int(n.strip()) if rc == 0 and n.strip().isdigit() else 0
+        if out["ahead"]:
+            rc, ss, _ = git(["diff", "--shortstat", f"{base_ref}...{head}"], main)
+            out.update(_wt_shortstat(ss if rc == 0 else ""))
+            rc, subj, _ = git(["log", "-1", "--format=%s", head], main)
+            out["last_subject"] = subj.strip()[:200] if rc == 0 else ""
+    if out["dirty"]:
+        rc, ss, _ = git(["diff", "--shortstat", "HEAD"], path)
+        wip = _wt_shortstat(ss if rc == 0 else "")
+        out["wip_add"], out["wip_del"] = wip["add"], wip["del"]
+    out["last_activity"] = last
+    return out
+
+
+def _wt_stranded_scan(dirs, sessions=(), managed=(), git=None, now=None, idle_s=_WT_STRANDED_IDLE_S):
+    """[{id, repo, repo_name, path, branch, kind, base, reason, ...}] for the
+    stranded worktrees of the repos the `dirs` are in."""
+    git = git or _wt_git
+    now = now or time.time()
+    by_path = {os.path.normcase(os.path.normpath(m.get("path") or "")): m for m in managed or []}
+    mains, out = [], []
+    for d in dirs:
+        main = _wt_main_of(d, git, now)
+        if main and os.path.normcase(main) not in {os.path.normcase(m) for m in mains}:
+            mains.append(main)
+    for main in mains:
+        rc, txt, _ = git(["worktree", "list", "--porcelain"], main, timeout=15)
+        items = _wt_porcelain(txt) if rc == 0 else []
+        if not items:
+            continue
+        base_ref = items[0].get("branch") or items[0].get("head") or ""
+        for w in items[1:]:
+            if not _wt_in_claude_dir(main, w["path"]) or w.get("prunable"):
+                continue
+            m = by_path.get(os.path.normcase(w["path"]))
+            base = (m or {}).get("base") or base_ref
+            st = _wt_stranded_facts(main, w, base, git)
+            active = [s for s in _wt_sessions_in(w, sessions) if s["active"]]
+            reason = _wt_stranded_reason(st, active, now, idle_s)
+            if not reason:
+                continue
+            name = os.path.basename(w["path"])
+            out.append({**st, "id": _wt_stranded_id(w["path"]), "repo": main,
+                        "repo_name": os.path.basename(main.rstrip("\\/")), "path": w["path"], "name": name,
+                        "branch": w.get("branch") or "", "head": (w.get("head") or "")[:40],
+                        "detached": bool(w.get("detached")), "locked": bool(w.get("locked")),
+                        "kind": "aoc" if m else ("agent" if name.startswith("agent-") else "other"),
+                        "aoc_id": (m or {}).get("id") or "", "base": base, "reason": reason})
+    out.sort(key=lambda x: -(x.get("last_activity") or 0))
+    return out
+
+
+def _wt_stranded_dirs(sessions=()):
+    """The folders to look for repos in: open/recent sessions, worktrees.json, recent project dirs."""
+    dirs, seen = [], set()
+    cands = [s.get("cwd") for s in sessions or []] + [w.get("repo") for w in _wt_load()]
+    try:
+        cands += [d["path"] for d in _launch_known_dirs()]
+    except Exception as e:
+        _log_bg_error("stranded worktrees", e)
+    for d in cands:
+        if not d or not os.path.isdir(d):
+            continue
+        k = os.path.normcase(os.path.normpath(d))
+        if k in seen:
+            continue
+        seen.add(k)
+        dirs.append(d)
+        if len(dirs) >= _WT_STRANDED_MAX_DIRS:
+            break
+    return dirs
+
+
+def _wt_stranded_list(sessions=(), now=None, fresh=False):
+    """GET /worktrees/stranded -> {"items": [...]} (cached 60 s)."""
+    now = now or time.time()
+    if not fresh and _wt_stranded_cache[1] is not None and now - _wt_stranded_cache[0] < _WT_STRANDED_CACHE_S:
+        return {"items": _wt_stranded_cache[1]}
+    items = _wt_stranded_scan(_wt_stranded_dirs(sessions), sessions, _wt_load(), now=now)
+    _wt_stranded_cache[0], _wt_stranded_cache[1] = now, items
+    return {"items": items}
+
+
+def _wt_stranded_find(wid, sessions=(), now=None):
+    """The stranded worktree with this id, re-checked right now (never act on a stale or unknown id)."""
+    return next((w for w in _wt_stranded_list(sessions, now, fresh=True)["items"] if w["id"] == wid), None)
+
+
+def _wt_resume_prompt(w):
+    """Pure: what a relaunched session is told."""
+    where = f"branch {w['branch']}" if w.get("branch") else "a detached HEAD"
+    return (f"An earlier agent was working in this git worktree ({where}) and stopped before finishing "
+            f"({w.get('reason') or 'work left over'}). Look at `git status`, `git diff` and `git log {w.get('base') or 'HEAD'}..HEAD` "
+            f"to see what it did, work out what the task was, finish it, run the tests and commit on this branch. "
+            f"Don't merge, push or delete the worktree.")
+
+
+def _wt_stranded_act(kind, wid, sessions=(), git=None, launch=None, now=None):
+    """POST /worktrees/stranded/{commit,relaunch,discard} {id}."""
+    git = git or _wt_git
+    w = _wt_stranded_find(wid, sessions, now)
+    if not w:
+        return {"ok": False, "error": "that worktree is no longer stranded (or is gone) -- refresh"}
+    if kind == "commit":
+        if not w["dirty"]:
+            return {"ok": False, "error": "nothing uncommitted to commit"}
+        if w["detached"] or not w["branch"]:
+            return {"ok": False, "error": "the worktree is on a detached HEAD -- a commit there would get lost; relaunch it instead"}
+        rc, _, er = git(["add", "-A"], w["path"], timeout=60)
+        if rc != 0:
+            return {"ok": False, "error": "git add failed: " + _wt_err(er, "unknown error")}
+        rc, _, er = git(["commit", "-m", _WT_WIP_MESSAGE], w["path"], timeout=120)
+        if rc != 0:
+            return {"ok": False, "error": "git commit failed: " + _wt_err(er, "unknown error")}
+        rc, sha, _ = git(["rev-parse", "HEAD"], w["path"])
+        _wt_stranded_cache[1] = None
+        return {"ok": True, "sha": sha.strip()[:40], "branch": w["branch"]}
+    if kind == "relaunch":
+        r = (launch or _launch_session)({"cwd": w["path"], "prompt": _wt_resume_prompt(w)})
+        if r.get("ok"):
+            _wt_stranded_cache[1] = None
+        return r
+    if kind == "discard":
+        if w["locked"]:
+            return {"ok": False, "error": "git has this worktree locked (an agent may still own it) -- unlock it first"}
+        err = _wt_remove(w["repo"], w["path"], w["branch"], git)
+        if err:
+            return {"ok": False, "error": err}
+        if w["aoc_id"]:
+            with _wt_lock:
+                _wt_save([x for x in _wt_load() if x.get("id") != w["aoc_id"]])
+                _wt_status_cache.pop(w["aoc_id"], None)
+        _wt_stranded_cache[1] = None
+        return {"ok": True}
+    return {"ok": False, "error": "unknown action"}
 
 
 # ── A/B model compare: the same first message, run headless (`claude -p`)
@@ -8183,9 +9086,71 @@ def _danger_hook(hook, cfg=None, wait=_danger_wait, now=None, gone_fn=lambda: Fa
     hits = _danger_check(ti.get("command"), tool, cfg)
     if not hits:
         return {}
-    rid = _danger_open(hook, hits, now or time.time())
+    t0 = now or time.time()
+    rid = _danger_open(hook, hits, t0)
     state, message = wait(rid, cfg["hold_min"] * 60, gone_fn=gone_fn)
+    try:
+        _danger_log_append(_danger_log_entry(hook, hits, state, t0, time.time() - t0))
+    except Exception as e:
+        _log_bg_error("danger log", e)
     return _danger_decision(state, message, hits, cfg["hold_min"])
+
+
+# Every held command and how it ended, newest last (Settings -> Notify ->
+# DANGEROUS COMMANDS shows the recent ones). Trimmed to the newest
+# _DANGER_LOG_KEEP lines once it passes twice that.
+DANGER_LOG_FILE = os.path.join(AOC_DATA_DIR, "danger_log.jsonl")
+_DANGER_LOG_KEEP = 500
+_DANGER_OUTCOMES = {"allow": "allowed", "deny": "denied", "release": "answered in terminal",
+                    "timeout": "no answer, denied", "gone": "cancelled"}
+_danger_log_lock = threading.Lock()
+
+
+def _danger_log_entry(hook, hits, state, at, held_s) -> dict:
+    """Pure: one log line for a held command."""
+    ti = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
+    return {"t": round(at, 1), "sid": str(hook.get("session_id") or "")[:64], "cwd": str(hook.get("cwd") or "")[:300],
+            "tool": str(hook.get("tool_name") or "")[:20], "cmd": str(ti.get("command") or "")[:300],
+            "rules": [h["label"] for h in hits], "outcome": _DANGER_OUTCOMES.get(state, str(state)),
+            "held_s": round(max(0.0, held_s), 1)}
+
+
+def _danger_log_append(entry, path=None) -> None:
+    path = path or DANGER_LOG_FILE
+    with _danger_log_lock:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > 2 * _DANGER_LOG_KEEP:
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_DANGER_LOG_KEEP:])
+
+
+def _danger_log_read(limit=30, path=None) -> list:
+    """Newest first; a broken line is skipped."""
+    try:
+        with open(path or DANGER_LOG_FILE, encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _danger_test(command, shell, cfg) -> dict:
+    """Pure: POST /danger_guard/test -- what the guard would do with a
+    command, without holding or running anything. Judged as if the guard
+    were on, so it also answers "would this be caught?" while it is off."""
+    shell = shell if shell in ("Bash", "PowerShell") else "Bash"
+    hits = _danger_check(command, shell, {**cfg, "mode": "hold"})
+    return {"hits": hits, "would_hold": bool(hits) and cfg.get("mode") != "off", "mode": cfg.get("mode")}
 
 
 def _danger_hook_installed(settings) -> bool:
@@ -13435,6 +14400,14 @@ button.le-tag { cursor:pointer; }
 .dg-rule { display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--t2);line-height:1.4; }
 .dg-rule input { margin-top:2px; }
 .dg-rule small { color:var(--t3);font-size:10px; }
+.dg-test-out { font-size:11px;color:var(--t2);line-height:1.5;min-height:0; }
+.dg-t-ok { color:var(--g); } .dg-t-hold { color:var(--o); } .dg-t-err { color:var(--r); }
+.dg-t-part { font-family:var(--font2);font-size:10px;color:var(--t3);overflow-wrap:anywhere; }
+.dg-log-row { display:flex;gap:8px;align-items:baseline;font-size:10px;padding:2px 0;font-family:var(--font2);min-width:0; }
+.dg-log-when { color:var(--t3);flex:none;width:44px; }
+.dg-log-cmd { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t2); }
+.dg-log-cmd i { color:var(--c);font-style:normal; }
+.dg-log-out { flex:none; }
 .perm-more { font:400 9px var(--font2);color:var(--t3); }
 .perm-sum { margin-top:3px;font:400 11px var(--font2);color:var(--t);word-break:break-all;
   display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden; }
@@ -13778,6 +14751,13 @@ div.td-recap { padding:0; }
 .loop-lbl { flex-shrink:0;font:700 9px var(--font2);letter-spacing:.06em;text-transform:uppercase;color:var(--o); }
 .loop-text { min-width:0;overflow:hidden;color:var(--t2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical; }
 .sbay > .loop-flag { margin:0 12px 8px; }
+.cs-flag { display:flex;align-items:center;flex-wrap:wrap;row-gap:4px;gap:7px;margin-top:5px;padding:3px 8px;border-radius:5px;min-width:0;
+  background:rgba(var(--c-rgb),.08);border:1px solid rgba(var(--c-rgb),.35);font-size:11px;color:var(--t); }
+.cs-flag.armed { border-style:dashed; }
+.cs-flag.sent { background:none;border-color:rgba(var(--c-rgb),.18);color:var(--t2); }
+.cs-lbl { flex:1 1 150px;min-width:0; }
+.cs-btn { margin-left:auto;flex-shrink:0;font-size:9px;padding:3px 9px; }
+.sbay > .cs-flag { margin:0 12px 8px; }
 .ctx-meter { display:flex;align-items:center;gap:7px;margin-top:5px;font:400 10px var(--font2);color:var(--t2);min-width:0;flex-wrap:wrap; }
 .ctx-lbl { font:700 8px var(--font2);letter-spacing:.08em;color:var(--t3); }
 .ctx-bar { flex:0 0 72px;height:5px;border-radius:3px;background:rgba(var(--c-rgb),.14);overflow:hidden; }
@@ -13845,6 +14825,10 @@ div.td-recap { padding:0; }
 .ib-title { font:600 26px var(--font3);letter-spacing:.02em;color:var(--t);margin:0; }
 .ib-sub { font:400 12px var(--font2);color:var(--t3); }
 .ib-list { display:flex;flex-direction:column;gap:10px; }
+.wts-list { display:flex;flex-direction:column;gap:10px; }
+.ib-list + .wts-list { margin-top:10px; }
+.wts-item { border-left:3px solid var(--o); }
+.wts-item .wt-facts { margin:4px 0 2px; }
 .ib-item { border-left:3px solid var(--o) !important;display:flex;flex-direction:column;gap:7px; }
 .ib-item.ib-permission, .ib-item.ib-budget { border-left-color:var(--r) !important; }
 .ib-item.ib-question { border-left-color:var(--o) !important; }
@@ -14255,6 +15239,16 @@ body.light .notif-entry:hover { background:rgba(0,0,0,.025); }
 .accent-swatch { width:22px;height:22px;border-radius:50%;border:2px solid transparent;cursor:pointer;background:var(--sc);transition:transform .15s,border-color .15s; }
 .accent-swatch:hover { transform:scale(1.15); }
 .accent-swatch.active { border-color:rgba(255,255,255,.8);transform:scale(1.1); }
+.wn-overlay { position:fixed;inset:0;z-index:3100;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;padding:16px; }
+.wn-box { width:min(560px,100%);max-height:min(80vh,640px);display:flex;flex-direction:column;background:rgba(34,48,45,.98);border:1px solid rgba(var(--c-rgb),.25);border-radius:10px;box-shadow:0 10px 50px rgba(0,0,0,.6); }
+.wn-hdr { display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid rgba(var(--c-rgb),.12); }
+.wn-title { flex:1;font-family:var(--font2);font-size:11px;font-weight:700;letter-spacing:.14em;color:var(--c); }
+.wn-x { background:none;border:none;color:var(--t2);font-size:14px;cursor:pointer;padding:2px 6px; }
+.wn-list { margin:0;padding:12px 18px 12px 34px;overflow-y:auto;color:var(--t);font-size:13px;line-height:1.5; }
+.wn-list li { margin:0 0 7px; }
+.wn-foot { display:flex;justify-content:flex-end;padding:10px 18px 14px; }
+.wn-ok { background:rgba(var(--c-rgb),.15);border:1px solid rgba(var(--c-rgb),.4);color:var(--c);border-radius:6px;padding:6px 16px;font-family:var(--font2);font-size:10px;letter-spacing:.1em;cursor:pointer; }
+body.light .wn-box { background:rgba(238,242,251,.99); }
 body.light .settings-panel { background:rgba(238,242,251,.98);border-left-color:rgba(var(--c-rgb),.14); }
 body.light .settings-input { background:rgba(0,0,0,.04);border-color:rgba(0,0,0,.12);color:var(--t1); }
 body.light .settings-section { border-bottom-color:rgba(var(--c-rgb),.15); }
@@ -14643,6 +15637,16 @@ body.light::before { content:none; }
 .cc-pill b { display:flex; align-items:center; gap:6px; font-weight:700; color:var(--g); }
 .cc-pill b i { width:7px; height:7px; border-radius:50%; background:currentColor; box-shadow:0 0 8px currentColor; }
 .cc-pill.attn b { color:var(--o); } .cc-pill.bad b { color:var(--r); } .cc-pill.off b { color:var(--t3); }
+/* Health -> CLAUDE CODE SETUP (_hooksHealthHtml) */
+.hh-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:space-between; padding:8px 10px; margin-bottom:6px;
+  border-radius:8px; font-family:var(--font2); font-size:11px; border:1px solid rgba(255,255,255,.08); }
+.hh-head.ok { color:var(--g); } .hh-head.bad { color:var(--o); border-color:color-mix(in srgb, var(--o) 45%, transparent); }
+.hh-btns { display:flex; gap:6px; } .hh-btns .adp-btn { font-size:9px; padding:3px 12px; }
+.hh-btns .hh-fix, body.light .hh-btns .hh-fix { color:var(--o); border-color:var(--o); }
+.hh-row { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; padding:3px 2px; font-family:var(--font2); font-size:10px; }
+.hh-ic { width:12px; flex:none; } .hh-row.ok .hh-ic { color:var(--g); } .hh-row.bad .hh-ic, .hh-row.bad .hh-det { color:var(--o); }
+.hh-lbl { color:var(--t2); } .hh-det { color:var(--t3); min-width:0; overflow-wrap:anywhere; }
+.hh-note { font-family:var(--font2); font-size:9px; color:var(--t3); margin:6px 0 4px; } .hh-note.bad { color:var(--r); }
 .topbar .clock { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); text-align:center;
   display:flex; flex-direction:column-reverse; align-items:center; pointer-events:none; }
 .topbar .clock-time { font:700 23px/1.05 var(--font4); color:#8fe6ff; letter-spacing:.06em; text-shadow:0 0 14px rgba(var(--c-rgb),.55); }
@@ -15583,6 +16587,30 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
           Uses the same "away" time. A held turn shows <b>Reply…</b> on the session; Claude carries on with what you write.
           Up to 7 replies in a row, then the session waits in its terminal.
         </div>
+        <div class="settings-section">CONTEXT ALMOST FULL</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Save state</label>
+          <select class="settings-input" id="st-cs-mode" style="width:auto" onchange="_csSave()"
+            title="When a session's context window fills up, ask Claude to write its state to memory before Claude Code compacts the conversation.">
+            <option value="offer">Offer a Save state button</option>
+            <option value="auto">Send it automatically</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">When context reaches</label>
+          <span style="display:inline-flex;align-items:center;gap:6px">
+            <input class="settings-input" id="st-cs-thr" type="number" min="50" max="95" style="width:64px" onchange="_csSave()">
+            <span style="color:var(--t3);font-size:11px">%</span>
+          </span>
+        </div>
+        <textarea class="settings-input" id="st-cs-prompt" rows="2" style="width:100%;resize:vertical;font-size:11px" onchange="_csSave()"
+          title="The message sent to the session. Empty = the default."></textarea>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:4px 0 10px">
+          Once per session each time it crosses the threshold. The prompt goes in when the current turn ends
+          (straight away if the turn is held for your reply). Skipped right after a compaction.
+          Notification: <b>Context almost full</b> in the table above.
+        </div>
         <div class="settings-section">DANGEROUS COMMANDS</div>
         <div class="settings-row" style="gap:10px;flex-wrap:wrap">
           <label class="settings-lbl">Guard</label>
@@ -15598,17 +16626,28 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
           </span>
         </div>
         <div id="st-dg-hook" style="font-size:10px;color:var(--o);line-height:1.5;margin:0 0 6px;display:none">
-          The guard's hook is not in Claude Code's settings yet. Run <b>python setup.py</b> in the AOC folder once.
+          The guard's hook is not in Claude Code's settings yet -- <a href="#" onclick="closeSettings();setView('diag');return false" style="color:var(--o)">Health → Repair</a> adds it.
         </div>
         <div class="dg-rules" id="st-dg-rules"></div>
         <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
           <label class="settings-lbl">Your own patterns <span style="color:var(--t3);font-weight:400">(regex, one per line, matched against the whole command)</span></label>
           <textarea class="settings-input" id="st-dg-patterns" rows="3" placeholder="e.g. \bkubectl\s+delete\b" onchange="_dgSave()"
-            style="font-family:var(--font2);font-size:11px;resize:vertical"></textarea>
+            style="font-family:var(--font2);font-size:11px;resize:vertical;width:100%;box-sizing:border-box"></textarea>
         </div>
         <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
           A held command shows <b>Run it</b> / <b>Deny</b> on the session and goes to your phone. If AOC isn't running, commands run as usual.
         </div>
+        <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
+          <label class="settings-lbl">Test a command <span style="color:var(--t3);font-weight:400">(only checked -- nothing runs, nothing is held)</span></label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <input class="settings-input" id="st-dg-test" placeholder="e.g. git push --force origin main" style="flex:1;min-width:160px;font-family:var(--font2);font-size:11px"
+              onkeydown="if(event.key==='Enter')_dgTest()">
+            <select class="settings-input" id="st-dg-test-shell" style="width:auto"><option>Bash</option><option>PowerShell</option></select>
+            <button class="adp-btn" onclick="_dgTest()">Check</button>
+          </div>
+          <div id="st-dg-test-out" class="dg-test-out"></div>
+        </div>
+        <div id="st-dg-log"></div>
         <div class="settings-section">PHONE PUSH</div>
         <div class="settings-row" style="gap:10px;flex-wrap:wrap">
           <label class="settings-lbl">Push alerts</label>
@@ -17081,7 +18120,8 @@ function _sbUpdate(sr){
   const running=((sr&&sr.agents)||[]).filter(a=>a.status==='running').length;
   const set=(id,v,warn)=>{ const e=document.getElementById(id); if(e){ e.textContent=v?String(v):''; e.classList.toggle('warn',!!warn); } };
   set('sb-n-today', waiting.length, true);
-  const inbox=_inboxItems(sr, Date.now()/1000).length;
+  _wtStrandedTick();
+  const inbox=_inboxItems(sr, Date.now()/1000).length+(_wtStranded||[]).length;
   set('sb-n-inbox', inbox, true);
   set('mnav-n-inbox', inbox, true);
   set('sb-n-agents', running, false);
@@ -17099,6 +18139,7 @@ function _ccPillState(sr, ageMs){
   if(!sr||ageMs>20000) return ['off','OFFLINE'];
   const wd=((sr.infra_health||{}).watchdog)||null;
   if((wd&&!wd.pid_alive)||((sr.agents||[]).some(a=>a.status==='error'))) return ['bad','DEGRADED'];
+  if((((sr.infra_health||{}).hooks_bad)||[]).length) return ['attn','CHECK HOOKS'];
   const sessions=(sr.sessions_list||[]).filter(s=>s&&s.session_active!==false);
   if(_waitingSessions(sessions,0).length) return ['attn','ATTENTION'];
   return ['ok','OPTIMAL'];
@@ -17109,6 +18150,10 @@ function _ccPillUpdate(){
   const [cls,label]=_ccPillState(lastStatus, Date.now()-_ccStatusAt);
   el.className='cc-pill '+cls;
   const b=el.querySelector('b'); if(b) b.innerHTML='<i></i>'+label;
+  const bad=((((lastStatus||{}).infra_health)||{}).hooks_bad)||[];
+  el.title=label==='CHECK HOOKS'?'Not set up: '+bad.join(', ')+' -- click for Health → Repair':'';
+  el.style.cursor=label==='CHECK HOOKS'?'pointer':'';
+  el.onclick=label==='CHECK HOOKS'?()=>setView('diag'):null;
 }
 setInterval(_ccPillUpdate, 5000);
 
@@ -17226,6 +18271,57 @@ async function _wtAct(id, kind){
   await _wtLoad();
   if(lastStatus&&currentView==='today') renderToday(lastStatus);
 }
+/* ── Stranded worktrees (GET /worktrees/stranded): an agent's or a parallel
+   session's worktree that still holds work nobody is doing any more. Shown
+   in Inbox and on Today; refreshed once a minute. ── */
+let _wtStranded=[], _wtStrandedAt=0, _wtStrandedBusy=false;
+async function _wtStrandedTick(force){
+  if(_wtStrandedBusy||(!force&&Date.now()-_wtStrandedAt<60000)) return;
+  _wtStrandedBusy=true; _wtStrandedAt=Date.now();
+  try{ _wtStranded=(await fetch('/worktrees/stranded').then(r=>r.json())).items||[]; }catch(e){}
+  _wtStrandedBusy=false;
+  if(lastStatus){ _sbUpdate(lastStatus); renderInbox(lastStatus); if(currentView==='today') renderToday(lastStatus); }
+}
+/* Pure: "+12 −3 in 2 files committed · +40 −1 not committed". */
+function _wtStrandedStat(w){
+  const parts=[];
+  if(w.ahead) parts.push(`${w.ahead} commit${w.ahead===1?'':'s'} (+${w.add||0} −${w.del||0} in ${w.files||0} file${w.files===1?'':'s'})`);
+  if(w.dirty) parts.push(`${w.dirty} uncommitted file${w.dirty===1?'':'s'}${w.wip_add||w.wip_del?` (+${w.wip_add||0} −${w.wip_del||0} in tracked files)`:''}`);
+  return parts.join(' · ');
+}
+/* Pure: the cards. */
+function _wtStrandedHtml(items, nowS){
+  if(!items||!items.length) return '';
+  const kinds={agent:'Agent worktree', aoc:'Parallel session', other:'Worktree'};
+  return `<div class="wts-list">${items.map(w=>{
+    const ago=w.last_activity?_fmtDurationDHM(Math.max(60,nowS-w.last_activity))+' ago':'';
+    const noCommit=!w.dirty?'Nothing uncommitted':w.detached||!w.branch?'Detached HEAD — a commit there would get lost':'';
+    return `<article class="td-card ib-item wts-item" data-wts="${escHtml(w.id)}">
+      <div class="ib-row"><span class="ib-kind">Stranded work</span><span class="ib-name" title="${escHtml(w.path||'')}">${escHtml(w.repo_name||'')} · ${escHtml(w.branch||w.name||'')}</span>
+        <span class="ib-when">${escHtml([kinds[w.kind]||kinds.other, ago].filter(Boolean).join(' · '))}</span></div>
+      <div class="ib-text">🧳 ${escHtml(w.reason||'')}. Nothing is working in it any more.</div>
+      <div class="wt-facts">${escHtml(_wtStrandedStat(w))}${w.last_subject?` · <span class="wt-subj" title="${escHtml(w.last_subject)}">${escHtml(w.last_subject)}</span>`:''}</div>
+      <div class="ib-btns">
+        <button class="adp-btn ib-btn" onclick="_wtStrandedAct(${jsq(w.id)},'commit')"${noCommit?` disabled title="${escHtml(noCommit)}"`:' title="Commit everything on its branch as &quot;WIP: rescued by AOC&quot; so nothing gets lost"'}>Commit WIP</button>
+        <button class="adp-btn ib-btn" onclick="_wtStrandedAct(${jsq(w.id)},'relaunch')" title="Start a new Claude Code session in this worktree, told to finish the work">Relaunch</button>
+        <button class="adp-btn ib-btn wt-discard" onclick="_wtStrandedAct(${jsq(w.id)},'discard')"${w.locked?' disabled title="git has it locked — an agent may still own it"':' title="Delete the worktree and its branch, with everything done in it"'}>Discard</button></div></article>`;
+  }).join('')}</div>`;
+}
+async function _wtStrandedAct(id, kind){
+  const w=(_wtStranded||[]).find(x=>x.id===id);
+  if(!w) return;
+  const name=`${w.repo_name} · ${w.branch||w.name}`;
+  if(kind==='discard'&&!confirm(`Discard ${name}?\n\n${_wtStrandedStat(w)||'No changes'}\n\nThe worktree folder${w.branch?' and the branch '+w.branch:''} are deleted with all of that. This can't be undone.`)) return;
+  if(kind==='relaunch'&&!confirm(`Start a new Claude Code session in ${w.path}, told to finish what was left there?`)) return;
+  let d={};
+  try{
+    d=await fetch('/worktrees/stranded/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json());
+  }catch(e){ d={ok:false, error:'Could not reach AOC.'}; }
+  const title={commit:['Committed','Not committed'], relaunch:['Session started','Not started'], discard:['Discarded','Not discarded']}[kind];
+  if(d.ok) showToast('done', title[0], kind==='commit'?`${name} @${(d.sha||'').slice(0,7)}`:name, 6000);
+  else showToast('warning', title[1], d.error||'failed', 9000);
+  await _wtStrandedTick(true);
+}
 async function _wtDiff(id, branch){
   const o=_overlay('// '+branch, '<span style="color:var(--t3)">Loading…</span>');
   try{
@@ -17254,7 +18350,7 @@ async function renderToday(sr){
     try{ _resumeCards=(await fetch('/resume_projects').then(r=>r.json())).cards||[]; }catch(e){}
   }
   if(currentView!=='today') return;
-  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr(), _recaps, _recapMode, _resumeCards, _wtItems);
+  const html=_todayHtml(sr, _kpiAnalytics, _todayCommits&&_todayCommits.stats, now/1000, _localDateStr(), _recaps, _recapMode, _resumeCards, _wtItems, _wtStranded);
   if(el.innerHTML!==html) el.innerHTML=html;
   _recapAuto(sr);
 }
@@ -17355,8 +18451,9 @@ const _INBOX_KINDS={
   question:  {rank:1, label:'Claude asks'},
   budget:    {rank:2, label:'Budget cap hit'},
   cache:     {rank:3, label:'Cache going cold'},
-  loop:      {rank:4, label:'Looks stuck'},
-  waiting:   {rank:5, label:'Your turn'},
+  ctxsave:   {rank:4, label:'Context almost full'},
+  loop:      {rank:5, label:'Looks stuck'},
+  waiting:   {rank:6, label:'Your turn'},
 };
 /* Pure: [{kind, rank, label, s, secs, cacheLeft}] for sessions that need you. */
 function _inboxItems(sr, nowS){
@@ -17377,6 +18474,7 @@ function _inboxItems(sr, nowS){
     else if(waiting&&(s.waiting_kind==='question'||(!wl.blocked&&msg&&msg.asked))) kind='question';
     else if(s.budget&&typeof s.budget.spent==='number') kind='budget';
     else if(cacheLeft!=null) kind='cache';
+    else if(s.ctx_save&&s.ctx_save.state==='offer') kind='ctxsave';
     else if(s.loop&&s.loop.text) kind='loop';
     else if(waiting||s.reply_request) kind='waiting';
     if(!kind) return;
@@ -17385,12 +18483,13 @@ function _inboxItems(sr, nowS){
   return out.sort((a,b)=>(a.rank-b.rank)||(b.secs-a.secs));
 }
 /* Pure: the Inbox page for those items. */
-function _inboxHtml(items, nowS){
+function _inboxHtml(items, nowS, stranded){
   const nameOf=s=>s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||String(s.id||'').slice(0,8);
-  const head=`<div class="ib-head"><h2 class="ib-title">Inbox</h2><span class="ib-sub">${items.length?`${items.length} thing${items.length===1?'':'s'} need${items.length===1?'s':''} you`:'All clear'}</span></div>`;
-  if(!items.length) return head+`<div class="ib-empty"><div class="ib-empty-mark">✓</div><div>Nothing needs you right now.</div><div class="ib-empty-sub">Permission prompts, questions, budget caps, caches about to go cold and stuck sessions show up here.</div></div>`;
+  const n=items.length+(stranded||[]).length;
+  const head=`<div class="ib-head"><h2 class="ib-title">Inbox</h2><span class="ib-sub">${n?`${n} thing${n===1?'':'s'} need${n===1?'s':''} you`:'All clear'}</span></div>`;
+  if(!n) return head+`<div class="ib-empty"><div class="ib-empty-mark">✓</div><div>Nothing needs you right now.</div><div class="ib-empty-sub">Permission prompts, questions, budget caps, caches about to go cold, full contexts, stuck sessions and work an agent left behind show up here.</div></div>`;
   const usd=n=>'$'+(Number(n)||0).toFixed(2);
-  return head+`<div class="ib-list">${items.map(it=>{
+  return head+(items.length?`<div class="ib-list">${items.map(it=>{
     const s=it.s, wl=_waitLabel(s);
     const info=_lastMessageInfo(s.last_message, 220);
     const text=wl.blocked&&s.waiting_message?s.waiting_message:(info?info.text:'');
@@ -17408,17 +18507,17 @@ function _inboxHtml(items, nowS){
         <span class="ib-when">${escHtml(when)}</span></div>
       ${ask}${cache}${_budgetBadgeHtml(s)}${_loopBadgeHtml(s)}${_ctxMeterHtml(s, nowS)}
       <div class="ib-btns">${btns}</div></article>`;
-  }).join('')}</div>`;
+  }).join('')}</div>`:'')+((stranded||[]).length?_wtStrandedHtml(stranded, nowS):'');
 }
 function renderInbox(sr){
   const el=document.getElementById('inbox-area');
   if(!el||!sr||currentView!=='inbox') return;
   /* don't swap the DOM under an open "Details" or a focused button */
   if(el.contains(document.activeElement)&&document.activeElement!==el&&document.activeElement.tagName!=='BUTTON') return;
-  const html=_inboxHtml(_inboxItems(sr, Date.now()/1000), Date.now()/1000);
+  const html=_inboxHtml(_inboxItems(sr, Date.now()/1000), Date.now()/1000, _wtStranded);
   if(el.innerHTML!==html) el.innerHTML=html;
 }
-function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode, resume, worktrees){
+function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode, resume, worktrees, stranded){
   const awayOf=s=>_awayBlockHtml(s, (recaps||{})[(s.machine||'')+'|'+s.id], nowS, recapMode||'auto');
   sr=sr||{}; an=an||{};
   const money=v=>'$'+(Number(v)||0).toFixed(2);
@@ -17490,6 +18589,7 @@ function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode, resume, workt
         ${sec('Working', workRows, sessions.length?'Every open session is waiting on you.':'No Claude Code session is open.')}
         ${(sr.queue||[]).length?sec(`Queued <span class="td-count">${sr.queue.filter(t=>t.state==='queued').length}</span>`, _queueHtml(sr.queue, nowS), ''):''}
         ${(worktrees||[]).length?sec(`Parallel worktrees <span class="td-count">${worktrees.length}</span>`, _wtHtml(worktrees, nowS), ''):''}
+        ${(stranded||[]).length?sec(`Stranded work <span class="td-count">${stranded.length}</span>`, _wtStrandedHtml(stranded, nowS), ''):''}
         ${(resume||[]).length?sec('Pick up where you left off', _resumeHtml(resume, nowS), ''):''}
       </div>
       <div class="td-col">
@@ -18267,10 +19367,12 @@ function _overlay(title, bodyHtml, cls){
   return o;
 }
 /* Ask AOC: a question about your own history, answered by Haiku from facts
-   AOC gathers locally (POST /ask). One question at a time. */
+   AOC gathers locally (POST /ask). One question at a time. "Follow up"
+   sends the next question with the shown answer's key (prev); "Deeper"
+   re-asks the same question with Sonnet. */
 const _ASK_EXAMPLES=['How much did I spend this week?','Which sessions failed the most in the last 7 days?',
   'Koľko ma stál OmniSocial tento mesiac?','What did I commit yesterday?'];
-let _askState={busy:false, last:null, error:'', history:null};
+let _askState={busy:false, last:null, error:'', history:null, follow:null, busyModel:'haiku'};
 /* Pure: an answer's text -> html. Escaped first; [#1a2b3c4d] ids the server
    sent in `sessions` become Replay buttons, '- ' lines a list. */
 function _askAnswerHtml(entry){
@@ -18292,6 +19394,7 @@ function _askAnswerHtml(entry){
   flush();
   const p=entry.period||{};
   const meta=[p.label?`${escHtml(p.label)}${p.from?` (${escHtml(p.from)}${p.to&&p.to!==p.from?' – '+escHtml(p.to):''})`:''}`:'',
+    entry.model==='sonnet'?'Sonnet':'',
     entry.cached?'cached answer':(entry.cost!=null?'$'+(Number(entry.cost)||0).toFixed(3):'')].filter(Boolean).join(' · ');
   return `<div class="ask-answer">${html}${meta?`<div class="ask-meta">${meta}</div>`:''}</div>`;
 }
@@ -18299,10 +19402,23 @@ function _askAnswerHtml(entry){
 function _askBodyHtml(state){
   state=state||{};
   let out='';
-  if(state.busy) out+='<div class="ask-note">Gathering facts and asking Claude Haiku…</div>';
+  const last=state.last;
+  if(state.follow&&last&&last.key===state.follow&&!state.busy)
+    out+=`<div class="ask-note">Follow-up to “${escHtml((last.q||'').length>60?last.q.slice(0,59)+'…':last.q||'')}” <button class="ask-chip" onclick="_askNew()">New question instead</button></div>`;
+  if(state.busy) out+=`<div class="ask-note">Gathering facts and asking Claude ${state.busyModel==='sonnet'?'Sonnet':'Haiku'}…</div>`;
   else if(state.error) out+=`<div class="ask-note err">${escHtml(state.error)}</div>`;
-  if(state.last) out+=`<div class="ask-q-echo ask-h-title">${escHtml(state.last.q||'')}</div>`+_askAnswerHtml(state.last)
-    +(state.last.cached&&!state.busy?`<button class="ask-chip" onclick="_askRun(${jsq(state.last.q||'')},true)">Ask again (fresh)</button>`:'');
+  if(last){
+    const thread=(last.thread||[]).filter(Boolean);
+    if(thread.length) out+=`<div class="ask-note">↳ after: ${thread.map(t=>escHtml(t.length>50?t.slice(0,49)+'…':t)).join(' › ')}</div>`;
+    out+=`<div class="ask-q-echo ask-h-title">${escHtml(last.q||'')}</div>`+_askAnswerHtml(last);
+    if(!state.busy){
+      const chips=[];
+      if(state.follow!==last.key) chips.push(`<button class="ask-chip" onclick="_askFollow()">Follow up</button>`);
+      if(last.model!=='sonnet') chips.push(`<button class="ask-chip" onclick="_askRun(${jsq(last.q||'')},false,${jsq(last.prev||'')},'sonnet')" title="Ask the same question with Claude Sonnet: more careful, a few cents">Deeper (Sonnet)</button>`);
+      if(last.cached) chips.push(`<button class="ask-chip" onclick="_askRun(${jsq(last.q||'')},true,${jsq(last.prev||'')},${jsq(last.model||'haiku')})">Ask again (fresh)</button>`);
+      if(chips.length) out+=`<div class="ask-hint">${chips.join('')}</div>`;
+    }
+  }
   if(!state.last&&!state.busy){
     out+=`<div class="ask-hint">${_ASK_EXAMPLES.map(q=>`<button class="ask-chip" onclick="_askRun(${jsq(q)})">${escHtml(q)}</button>`).join('')}</div>`;
   }
@@ -18311,7 +19427,7 @@ function _askBodyHtml(state){
     out+=`<div class="ask-h-title">Earlier questions</div><div class="ask-hint">${hist.map(h=>
       `<button class="ask-chip" onclick="_askShow(${jsq(h.key)})" title="${escHtml(h.q||'')}">${escHtml((h.q||'').length>60?h.q.slice(0,59)+'…':h.q||'')}</button>`).join('')}</div>`;
   }
-  out+='<div class="ask-note">Answers come only from your own AOC data (sessions, spend, commits, failures, clients). Claude Haiku, about 1 cent per question; repeats on the same day are free.</div>';
+  out+='<div class="ask-note">Answers come only from your own AOC data (sessions, spend, commits, failures, clients). Claude Haiku, about 1 cent per question (Deeper uses Sonnet, a few cents); repeats on the same day are free.</div>';
   return out;
 }
 function _askRender(){
@@ -18322,7 +19438,7 @@ function _askRender(){
 async function openAsk(q){
   let o=document.getElementById('ask-overlay');
   if(!o){
-    o=_overlay('Ask AOC', `<form class="ask-form" onsubmit="event.preventDefault();_askRun(this.q.value)">
+    o=_overlay('Ask AOC', `<form class="ask-form" onsubmit="event.preventDefault();_askRun(this.q.value,false,_askState.follow||'')">
       <input class="ask-input" name="q" maxlength="500" autocomplete="off" placeholder="e.g. How much did the AOC sessions cost last week?">
       <button class="adp-btn ask-go" type="submit">Ask</button></form><div class="ask-out"></div>`, 'ask-box');
     o.id='ask-overlay';
@@ -18335,18 +19451,32 @@ async function openAsk(q){
 }
 function _askShow(key){
   const h=(_askState.history||[]).find(x=>x.key===key);
-  if(h){ _askState.last={...h, cached:true}; _askState.error=''; _askRender();
-    const i=document.querySelector('#ask-overlay .ask-input'); if(i) i.value=h.q||''; }
+  if(h){ _askState.last={...h, cached:true}; _askState.error=''; _askState.follow=null; _askRender();
+    const i=document.querySelector('#ask-overlay .ask-input'); if(i){ i.value=h.q||''; i.placeholder=_ASK_PLACEHOLDER; } }
 }
-async function _askRun(q, force){
+const _ASK_PLACEHOLDER='e.g. How much did the AOC sessions cost last week?';
+/* The next question continues the shown answer (or, _askNew, starts over). */
+function _askFollow(){
+  if(!_askState.last) return;
+  _askState.follow=_askState.last.key; _askRender();
+  const i=document.querySelector('#ask-overlay .ask-input');
+  if(i){ i.value=''; i.placeholder='Follow-up, e.g. “a včera?” or “which of those failed?”'; i.focus(); }
+}
+function _askNew(){
+  _askState.follow=null; _askRender();
+  const i=document.querySelector('#ask-overlay .ask-input'); if(i){ i.placeholder=_ASK_PLACEHOLDER; i.focus(); }
+}
+async function _askRun(q, force, prev, model){
   q=String(q||'').trim();
   if(!q||_askState.busy) return;
   const i=document.querySelector('#ask-overlay .ask-input'); if(i) i.value=q;
-  _askState.busy=true; _askState.error=''; _askRender();
+  _askState.busy=true; _askState.busyModel=model||'haiku'; _askState.error=''; _askRender();
   try{
-    const d=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q, force:!!force})}).then(r=>r.json());
+    const d=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({q, force:!!force, prev:prev||'', model:model||'haiku'})}).then(r=>r.json());
     if(d.ok){
-      _askState.last=d;
+      _askState.last=d; _askState.follow=null;
+      if(i) i.placeholder=_ASK_PLACEHOLDER;
       const h=(_askState.history||[]).filter(x=>x.key!==d.key);
       _askState.history=[d].concat(h);
     } else _askState.error=d.error||'failed';
@@ -19049,6 +20179,39 @@ function _dgApply(d){
   if(v('st-dg-patterns')) v('st-dg-patterns').value=(d.patterns||[]).join('\n');
   if(d.rules&&v('st-dg-rules')) v('st-dg-rules').innerHTML=_dgRulesHtml(d.rules,d.off_rules);
   if(v('st-dg-hook')&&'hook_installed' in d) v('st-dg-hook').style.display=d.hook_installed?'none':'block';
+  if(d.log&&v('st-dg-log')) v('st-dg-log').innerHTML=_dgLogHtml(d.log);
+}
+/* Pure: the self-test's verdict (POST /danger_guard/test). */
+function _dgTestHtml(d){
+  if(!d||!d.ok) return '<span class="dg-t-err">Could not check -- is AOC running?</span>';
+  if(!d.hits.length) return '<span class="dg-t-ok">✓ Runs normally -- no rule matches.</span>';
+  const what=d.hits.map(h=>`<b>${escHtml(h.label)}</b>`).join(', ');
+  return (d.would_hold?`<span class="dg-t-hold">⚠ Would be held for your OK:</span> ${what}`
+                      :`<span class="dg-t-err">Matches ${what}, but the guard is off -- it would run.</span>`)+
+    d.hits.map(h=>`<div class="dg-t-part">${escHtml(h.part)}</div>`).join('');
+}
+/* Pure: the recently held commands (GET /danger_guard -> log, newest first). */
+function _dgLogHtml(log){
+  if(!log||!log.length) return '';
+  const col={allowed:'var(--g)',denied:'var(--r)','no answer, denied':'var(--r)'};
+  const rows=log.slice(0,10).map(e=>{
+    const when=new Date(e.t*1000);
+    const w=when.toDateString()===new Date().toDateString()?when.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):when.toLocaleDateString([], {day:'numeric',month:'short'});
+    const proj=(e.cwd||'').split(/[\\/]/).filter(Boolean).pop()||'';
+    return `<div class="dg-log-row"><span class="dg-log-when">${escHtml(w)}</span>`+
+      `<span class="dg-log-cmd" title="${escHtml(e.cmd)}">${proj?`<i>${escHtml(proj)}</i> `:''}${escHtml(e.cmd)}</span>`+
+      `<span class="dg-log-out" style="color:${col[e.outcome]||'var(--t3)'}">${escHtml(e.outcome)}</span></div>`;
+  }).join('');
+  return `<div class="settings-lbl" style="margin:6px 0 4px">Recently held <span style="color:var(--t3);font-weight:400">(${log.length>10?'last 10 of '+log.length:log.length})</span></div>${rows}`;
+}
+async function _dgTest(){
+  const out=document.getElementById('st-dg-test-out');
+  const command=(document.getElementById('st-dg-test').value||'').trim();
+  if(!out||!command) return;
+  let d=null;
+  try{ d=await (await fetch('/danger_guard/test',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({command,shell:document.getElementById('st-dg-test-shell').value})})).json(); }catch(e){}
+  out.innerHTML=_dgTestHtml(d);
 }
 async function _dgLoad(){
   try{ _dgApply(await (await fetch('/danger_guard')).json()); }catch(e){}
@@ -19065,6 +20228,49 @@ async function _dgSave(){
     if(d.rejected&&d.rejected.length) showToast('warning','Pattern not saved','Not a valid regex: '+d.rejected.join(', '));
     v('st-dg-patterns').value=(d.patterns||[]).join('\n');
   }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
+}
+async function _csLoad(){
+  try{
+    const d=await (await fetch('/context_save')).json();
+    const v=n=>document.getElementById(n);
+    if(v('st-cs-mode')) v('st-cs-mode').value=d.mode||'offer';
+    if(v('st-cs-thr')) v('st-cs-thr').value=d.threshold||90;
+    if(v('st-cs-prompt')){ v('st-cs-prompt').value=d.prompt||''; v('st-cs-prompt').placeholder=d.default_prompt||''; }
+  }catch(e){}
+}
+async function _csSave(){
+  const v=n=>document.getElementById(n);
+  const body={mode:v('st-cs-mode').value, threshold:parseInt(v('st-cs-thr').value,10)||90, prompt:v('st-cs-prompt').value};
+  try{
+    const d=await (await fetch('/context_save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(!d.ok) throw new Error(d.error||'');
+    v('st-cs-thr').value=d.threshold; v('st-cs-prompt').value=d.prompt;
+  }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
+}
+/* Pure: the "save state" strip under the context meter (s.ctx_save, see
+   _ctxsave_view). '' when the context isn't past the threshold. */
+function _ctxSaveHtml(s){
+  const cs=s&&s.ctx_save;
+  if(!cs||s.session_active===false) return '';
+  const sid=jsq(s.id), local=s._isLocal!==false;
+  if(cs.state==='sent'){
+    const at=cs.sent_at?' '+new Date(cs.sent_at*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'';
+    return `<div class="cs-flag sent" title="Claude was asked to save its state to memory${escHtml(at)}."><span class="cs-lbl">🧠 State save sent${escHtml(at)}</span></div>`;
+  }
+  if(cs.state==='armed')
+    return `<div class="cs-flag armed" onclick="event.stopPropagation()"><span class="cs-lbl">🧠 Saves state when this turn ends</span>${local?`<button class="adp-btn cs-btn" onclick="_ctxSaveCancel(${sid})" title="Don't send the save-state prompt">Cancel</button>`:''}</div>`;
+  return `<div class="cs-flag" onclick="event.stopPropagation()"><span class="cs-lbl">🧠 Context over ${escHtml(String(cs.threshold))} % — save state before it compacts</span>${local?`<button class="adp-btn cs-btn" onclick="_ctxSaveSend(${sid})" title="Ask Claude to write what's done, where to resume and next steps to memory (sent when the current turn ends)">Save state</button>`:''}</div>`;
+}
+async function _ctxSaveSend(sid){
+  try{
+    const d=await fetch('/context_save/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})}).then(r=>r.json());
+    if(!d.ok) showToast('warning','Not sent',d.error||'Could not send it.');
+    else showToast('done','Save state',d.state==='sent'?'Sent: Claude is saving its state.':'Queued: it goes in when the current turn ends.');
+  }catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
+}
+async function _ctxSaveCancel(sid){
+  try{ await fetch('/context_save/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})}); }
+  catch(e){ showToast('warning','Not sent','Could not reach AOC.'); }
 }
 async function _raSave(){
   _raSyncIdle();
@@ -19353,7 +20559,7 @@ function _ctxMeterHtml(s, nowSec){
       :`<span class="ctx-cache cold" title="The prompt cache expired: the next message writes the whole context to cache again${escHtml(re)}.">cache cold${c.recache_usd!=null?' · next msg ~'+escHtml(usd(c.recache_usd)):''}</span>`;
   }
   const title=`Context window: ${(c.tokens||0).toLocaleString()} of ${c.window.toLocaleString()} tokens (${pct.toFixed(1)} %). Claude Code auto-compacts close to the limit.`;
-  return `<div class="ctx-meter ctx-${lvl}" title="${escHtml(title)}"><span class="ctx-lbl">CTX</span><span class="ctx-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="ctx-val">${Math.round(pct)}% · ${fmtTok(c.tokens||0)}/${fmtTok(c.window)}${hint}</span>${cache}</div>`;
+  return `<div class="ctx-meter ctx-${lvl}" title="${escHtml(title)}"><span class="ctx-lbl">CTX</span><span class="ctx-bar"><span style="width:${pct.toFixed(1)}%"></span></span><span class="ctx-val">${Math.round(pct)}% · ${fmtTok(c.tokens||0)}/${fmtTok(c.window)}${hint}</span>${cache}</div>`+_ctxSaveHtml(s);
 }
 /* Pure: the strip above the views listing sessions waiting > 10 min. */
 function _waitingStripHtml(list){
@@ -22054,6 +23260,7 @@ async function renderDiag(){
       fetch('/backups').then(r=>r.json()).catch(()=>[]),
     ]);
     const fmtDate=t=>t?new Date(t*1000).toLocaleString():'—';
+    const hooks=await fetch('/hooks_health').then(r=>r.json()).catch(()=>null);
     const backupRows=(backups||[]).map(b=>`
       <div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.05);font-family:var(--font2);font-size:10px">
         <span style="flex:1;color:${b.corrupt?'var(--r)':'var(--t2)'}">${escHtml(b.filename)}${b.corrupt?' ⚠ CORRUPT':''}</span>
@@ -22066,6 +23273,7 @@ async function renderDiag(){
         AOC's own process health -- not your agents or CLI sessions. For watchdog/sentinel status and hook reliability, see
         <a href="#" onclick="openSettings();setSettingsTab('infra');return false" style="color:var(--c);text-decoration:underline;text-decoration-style:dotted">Settings → INFRA →</a>
       </div>
+      <div id="hooks-health">${_hooksHealthHtml(hooks)}</div>
       <div class="hist-section">PROCESS</div>
       <div class="hist-analytics">
         <div class="hist-kpi"><div class="hk-val">${fmtUptime(d.uptime_s)}</div><div class="hk-lbl">Uptime</div></div>
@@ -22084,6 +23292,43 @@ async function renderDiag(){
       ${backupRows||'<div style="font-size:10px;color:var(--t3);font-family:var(--font2)">// no backups yet</div>'}
     `;
   }catch(e){ el.innerHTML='<div style="color:var(--r);padding:20px;font-family:var(--font2);font-size:10px">Error loading diagnostics</div>'; }
+}
+
+/* Pure: Health -> CLAUDE CODE SETUP (GET /hooks_health = setup.py --check). */
+function _hooksHealthHtml(h, busy){
+  if(!h||!Array.isArray(h.checks)){
+    const why=h&&h.error?escHtml(h.error):'not checked yet';
+    return `<div class="hist-section">CLAUDE CODE SETUP</div><div class="hh-note">Couldn't check the install: ${why}</div>`;
+  }
+  const bad=h.checks.filter(c=>!c.ok);
+  const rows=h.checks.map(c=>`<div class="hh-row ${c.ok?'ok':'bad'}"><span class="hh-ic">${c.ok?'✓':'✗'}</span>`+
+    `<span class="hh-lbl">${escHtml(c.label)}</span>${c.detail?`<span class="hh-det">${escHtml(c.detail)}</span>`:''}</div>`).join('');
+  const when=h.at?new Date(h.at*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'';
+  const err=h.error?`<div class="hh-note bad">Last run: ${escHtml(h.error)}</div>`:'';
+  return `<div class="hist-section">CLAUDE CODE SETUP</div>
+    <div class="hh-head ${bad.length?'bad':'ok'}">
+      <span>${bad.length?`${bad.length} part${bad.length>1?'s':''} of AOC not set up -- those features silently do nothing`:'Everything AOC needs is set up'}</span>
+      <span class="hh-btns">
+        <button class="adp-btn" ${busy?'disabled':''} onclick="_hooksHealthRun(false)">${busy==='check'?'Checking…':'Re-check'}</button>
+        ${bad.length?`<button class="adp-btn hh-fix" ${busy?'disabled':''} onclick="_hooksHealthRun(true)">${busy==='repair'?'Repairing…':'Repair'}</button>`:''}
+      </span>
+    </div>
+    ${rows}${err}
+    <div class="hh-note">${when?`Checked ${when}. `:''}Repair re-runs only the needed setup.py steps. Claude Code sessions that are already open pick up hook changes after a restart.</div>`;
+}
+async function _hooksHealthRun(repair){
+  const el=document.getElementById('hooks-health');
+  if(!el) return;
+  let h=null;
+  try{ h=await fetch('/hooks_health').then(r=>r.json()); }catch(e){}
+  el.innerHTML=_hooksHealthHtml(h, repair?'repair':'check');
+  try{
+    h=await fetch(repair?'/hooks_health/repair':'/hooks_health?refresh=1', repair?{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}:{}).then(r=>r.json());
+    if(repair) log(h.bad&&h.bad.length?'Repair left: '+h.bad.join(', '):'AOC setup repaired', h.bad&&h.bad.length?'error':'success');
+  }catch(e){ h={...(h||{}), error:'request failed: '+e.message}; }
+  el.innerHTML=_hooksHealthHtml(h);
+  if(lastStatus&&lastStatus.infra_health) lastStatus.infra_health.hooks_bad=h.bad||[];
+  _ccPillUpdate();
 }
 
 async function _restoreBackup(filename){
@@ -24174,6 +25419,7 @@ function openSettings(){
   _renderLicenseUI();
   _raLoad();
   _dgLoad();
+  _csLoad();
   _capsLoad();
   _pushLoad();
   _ncLoad();
@@ -24479,11 +25725,24 @@ function _selfUpdateUpdateUI(su){
   const checkedAgo=_fmtEpochAgo(su.checked_at);
   const lbl=document.getElementById('selfupdate-badge-lbl');
   if(su.mode==='release'){
-    /* installer build: no git to pull -- link the new installer instead */
-    if(lbl) lbl.textContent='UPDATE '+su.latest;
+    /* installer build: no git to pull -- one click downloads, verifies and
+       installs the new release (job = /selfupdate/install's progress) */
+    const job=su.job||{};
+    if(['downloading','verifying','installing'].includes(job.state)){
+      if(lbl) lbl.textContent=job.state==='downloading'?'UPDATING '+(job.pct||0)+'%':job.state==='verifying'?'VERIFYING':'INSTALLING';
+      badge.style.cursor='default';
+      badge.onclick=null;
+      badge.title=job.state==='installing'
+        ?'Installing AOC '+(job.version||su.latest)+' — the dashboard reconnects when AOC has restarted'
+        :'Downloading AOC '+(job.version||su.latest)+' and checking its SHA-256';
+      return;
+    }
+    const failed=job.state==='error';
+    if(lbl) lbl.textContent=failed?'UPDATE FAILED':'UPDATE '+su.latest;
     badge.style.cursor='pointer';
-    badge.onclick=()=>window.open(su.url,'_blank','noopener');
-    badge.title='AOC '+su.latest+' is available (you have '+su.installed+') — click to download the installer'+(checkedAgo?' (checked '+checkedAgo+')':'');
+    badge.onclick=()=>_selfUpdateInstall(su);
+    badge.title=(failed?'Update failed: '+(job.error||'unknown error')+' — click to try again. ':'')
+      +'AOC '+su.latest+' is available (you have '+su.installed+') — click to update'+(checkedAgo?' (checked '+checkedAgo+')':'');
     return;
   }
   if(lbl) lbl.textContent='UPDATE AVAILABLE';
@@ -24491,6 +25750,48 @@ function _selfUpdateUpdateUI(su){
   badge.onclick=null;
   badge.title=su.behind_by+' commit'+(su.behind_by!==1?'s':'')+' behind origin/master — run git pull'+(checkedAgo?' (checked '+checkedAgo+')':'');
 }
+async function _selfUpdateInstall(su){
+  if(!confirm(`Update AOC to ${su.latest}?\n\nAOC downloads the installer, checks its SHA-256 against the release notes and installs it in the background. The dashboard is gone for about a minute while AOC restarts; your Claude sessions keep running.`)) return;
+  let d;
+  try{ d=await (await fetch('/selfupdate/install',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json(); }
+  catch(e){ d={ok:false,error:'AOC did not answer'}; }
+  if(d.ok) return;  /* progress shows on the badge via /status */
+  if(confirm('Could not start the update: '+(d.error||'unknown error')+'\n\nOpen the download page instead?')) window.open(su.url,'_blank','noopener');
+}
+/* Pure: /whats_new -> the dialog's inner HTML ('' = nothing to show).
+   Items are release-note text from GitHub, so everything is escaped. */
+function _whatsNewHtml(d){
+  if(!d||!Array.isArray(d.items)||!d.items.length) return '';
+  const lis=d.items.map(t=>'<li>'+escHtml(String(t))+'</li>').join('');
+  return '<div class="wn-box" role="document">'
+    +'<div class="wn-hdr"><span class="wn-title">WHAT\'S NEW IN AOC '+escHtml(String(d.version||''))+'</span>'
+    +'<button class="wn-x" onclick="_whatsNewClose()" aria-label="Close">✕</button></div>'
+    +'<ul class="wn-list">'+lis+'</ul>'
+    +'<div class="wn-foot"><button class="wn-ok" onclick="_whatsNewClose()">Got it</button></div></div>';
+}
+let _whatsNewShown=false;
+async function _whatsNewCheck(){
+  if(_whatsNewShown) return;
+  let d;
+  try{ d=await (await fetch('/whats_new')).json(); }catch(e){ return; }
+  const html=_whatsNewHtml(d);
+  if(!html) return;
+  _whatsNewShown=true;
+  const ov=document.createElement('div');
+  ov.id='wn-overlay'; ov.className='wn-overlay';
+  ov.setAttribute('role','dialog'); ov.setAttribute('aria-modal','true'); ov.setAttribute('aria-label',"What's new");
+  ov.onclick=e=>{ if(e.target===ov) _whatsNewClose(); };
+  ov.innerHTML=html;
+  document.body.appendChild(ov);
+}
+function _whatsNewClose(){
+  const ov=document.getElementById('wn-overlay');
+  if(ov) ov.remove();
+  fetch('/whats_new/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{});
+}
+/* the notes of a hand-installed release are fetched in the background
+   right after startup, so look again a little later too */
+[1500,30000,120000].forEach(ms=>setTimeout(_whatsNewCheck,ms));
 /* pure so it's directly testable -- see tests/js/fmt_epoch_ago.test.js.
    watchdog/sentinel last_log_ts (both Python epoch seconds) were already
    computed and shipped in /status's infra_health, but _infraUpdateUI only
@@ -25258,7 +26559,11 @@ def _build_status_payload_uncached() -> dict:
     _replies = _reply_pending_by_session(time.time())
     with _budget_lock:
         _budget_snap = {"sessions": dict(_budget_state["sessions"]), "day": _budget_state["day"]}
+    _cs_cfg = _ctxsave_settings()
+    with _ctxsave_lock:
+        _cs_snap = {k: dict(v) for k, v in _ctxsave_state.items()}
     for s in active_sessions:
+        s["ctx_save"] = _ctxsave_view(_cs_snap.get(s["id"]), _cs_cfg)
         s["context"] = _ctx.get(s["id"])
         if s["context"] and s["context"].get("cache_ttl"):
             cold, warm = _recache_cost(s["context"].get("recache_tokens") or s["context"].get("tokens"),
@@ -25307,6 +26612,8 @@ def _build_status_payload_uncached() -> dict:
     }
     with _self_update_lock:
         data["self_update"] = dict(_self_update_status)
+    with _update_job_lock:
+        data["self_update"]["job"] = dict(_update_job)
     data["infra_health"] = _infra_health_snapshot()
     data["rate_limits"] = _rate_limits_snapshot()
     data["queue"] = _queue_view(data["rate_limits"], time.time())
@@ -25629,6 +26936,11 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(404, "text/plain", b"Log not found")
 
     def do_GET(self):
+        if self.path.split("?")[0] == "/restart_ok" and self._is_direct_loopback():
+            # watchdog.py's code-reload probe (no token, like the hooks)
+            body = {"pid": os.getpid(), "blockers": _restart_blockers(_perm_requests, _tunnel_status[0], _update_job.get("state"))}
+            self._serve(200, "application/json", json.dumps(body).encode(), no_cache=True)
+            return
         if not self._check_auth():
             self._serve(401, "text/plain", b"Unauthorized - token required")
             return
@@ -25688,7 +27000,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps({"session_usd": cfg["session_usd"], "day_usd": cfg["day_usd"], **st}).encode(), no_cache=True)
         elif path_no_qs == "/danger_guard":
             view = _danger_view(_load_danger_guard(), _fix_read_json(_fix_paths()["settings"], {}))
-            self._serve(200, "application/json", json.dumps(view).encode(), no_cache=True)
+            view["log"] = _danger_log_read()
+            self._serve(200, "application/json", json.dumps(view, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/reply/poll":
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -25810,6 +27123,10 @@ class Handler(BaseHTTPRequestHandler):
             date_from, date_to = self._get_csv_date_range()
             self._serve_csv_download(_export_costs_by_subagent_type_csv(date_from, date_to),
                                       f"aoc_costs_by_agent_type_{date_from or 'all'}_{date_to or 'all'}.csv")
+        elif path_no_qs == "/hooks_health":
+            if "refresh=1" in self.path or _hooks_health["checks"] is None:
+                _run_setup("--check")
+            self._serve(200, "application/json", json.dumps(_hooks_health_view()).encode(), no_cache=True)
         elif path_no_qs == "/diag":
             data = _get_diag_info()
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
@@ -25821,6 +27138,13 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(_notify_settings, ensure_ascii=False).encode())
         elif path_no_qs == "/notify_center":
             self._serve(200, "application/json", json.dumps(_notify_center_payload(), ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/whats_new":
+            view = _whats_new_view(_read_installed_version(AOC_VERSION_FILE))
+            self._serve(200, "application/json", json.dumps(view, ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/context_save":
+            self._serve(200, "application/json",
+                        json.dumps({**_ctxsave_settings(), "default_prompt": _CTXSAVE_DEFAULT_PROMPT},
+                                   ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/errors":
             data = _db_get_errors(100)
             self._serve(200, "application/json", json.dumps(data, ensure_ascii=False).encode())
@@ -25831,6 +27155,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path_no_qs == "/launch/dirs":
             self._serve(200, "application/json", json.dumps({"dirs": _launch_known_dirs()}, ensure_ascii=False).encode(),
                         no_cache=True)
+        elif path_no_qs == "/worktrees/stranded":
+            try:
+                reply = _wt_stranded_list((_own_status_payload() or {}).get("sessions_list") or [])
+            except Exception as e:
+                _log_bg_error("stranded worktrees", e)
+                reply = {"ok": False, "error": "failed", "items": []}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs in ("/worktrees", "/worktrees/diff"):
             from urllib.parse import urlparse, parse_qs
             try:
@@ -26326,6 +27657,21 @@ class Handler(BaseHTTPRequestHandler):
                 _log_bg_error("worklog_summary", e)
                 self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
 
+        elif path_no_qs in ("/worktrees/stranded/commit", "/worktrees/stranded/relaunch", "/worktrees/stranded/discard"):
+            # commits in / starts sessions in / deletes git worktrees: only from this PC itself
+            if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
+                self._serve(403, "application/json", b'{"ok":false,"error":"worktrees can only be managed on this PC itself"}'); return
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                reply = _wt_stranded_act(path_no_qs.rsplit("/", 1)[1], str(data.get("id") or ""),
+                                         (_own_status_payload() or {}).get("sessions_list") or [])
+                self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+            except Exception as e:
+                _log_bg_error("stranded worktrees", e)
+                self._serve(500, "application/json", b'{"ok":false,"error":"failed"}')
+
         elif path_no_qs in ("/worktrees/launch", "/worktrees/merge", "/worktrees/discard"):
             # creates/merges/deletes git branches and folders: only from this PC itself
             if not self._is_direct_loopback() or _tunnel_status[0] in ("starting", "ready"):
@@ -26443,6 +27789,17 @@ class Handler(BaseHTTPRequestHandler):
                 reply = {"ok": False, "error": "bad request"}
             self._serve(200, "application/json", json.dumps(reply).encode())
 
+        elif path_no_qs == "/danger_guard/test":
+            # judges a command only -- nothing is held, run or logged
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                reply = {"ok": True, **_danger_test(str(data.get("command") or "")[:5000], data.get("shell"), _load_danger_guard())}
+            except Exception:
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
+
         elif path_no_qs in ("/prompts", "/prompts/delete", "/prompts/used"):
             try:
                 data = json.loads(body or b"{}")
@@ -26542,6 +27899,33 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
 
+        elif path_no_qs == "/hooks_health/repair":
+            # rewrites ~/.claude/settings.json + hook scripts: an explicit
+            # click on this PC only, never automatic, never via the tunnel
+            if self._is_direct_loopback():
+                _run_setup("--repair")
+                reply = _hooks_health_view()
+            else:
+                reply = {**_hooks_health_view(), "error": "repair can only be started on this PC"}
+            self._serve(200, "application/json", json.dumps(reply).encode(), no_cache=True)
+
+        elif path_no_qs == "/selfupdate/install":
+            # Runs an installer on this PC -- only from the PC itself, never
+            # through the tunnel / phone.
+            if not self._is_direct_loopback():
+                reply = {"ok": False, "error": "updates can only be started on this PC"}
+            else:
+                reply = _update_start(_read_installed_version(AOC_VERSION_FILE), _latest_release[0])
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
+
+        elif path_no_qs == "/whats_new/dismiss":
+            try:
+                _whats_new_dismiss()
+                reply = {"ok": True}
+            except Exception as e:
+                reply = {"ok": False, "error": str(e)[:200]}
+            self._serve(200, "application/json", json.dumps(reply).encode(), no_cache=True)
+
         elif path_no_qs == "/ask":
             try:
                 data = json.loads(body or b"{}")
@@ -26550,7 +27934,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._serve(400, "application/json", b'{"ok":false,"error":"bad request"}')
                 return
-            reply = _ask(data.get("q"), force=bool(data.get("force")))
+            reply = _ask(data.get("q"), force=bool(data.get("force")), prev=data.get("prev") or "",
+                         model=data.get("model") or "haiku")
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
 
         elif path_no_qs in ("/permission/request", "/permission/decide", "/permission/settings"):
@@ -26700,6 +28085,22 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path_no_qs == "/notify_settings":
             self._post_notify_settings(body)
+
+        elif path_no_qs in ("/context_save", "/context_save/send", "/context_save/cancel"):
+            try:
+                data = json.loads(body or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("expected an object")
+                if path_no_qs == "/context_save":
+                    reply = {"ok": True, **_ctxsave_save_settings(data)}
+                elif path_no_qs == "/context_save/send":
+                    reply = _ctxsave_request(data.get("session_id"))
+                else:
+                    reply = {"ok": _ctxsave_cancel(data.get("session_id"))}
+            except Exception as e:
+                _log_bg_error("context save", e)
+                reply = {"ok": False, "error": "bad request"}
+            self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
 
         elif path_no_qs in ("/notify_center/set", "/notify_center/test", "/notify_center/clear"):
             try:

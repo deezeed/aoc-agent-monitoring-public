@@ -21,7 +21,7 @@ ns = exec_functions(
      "ASK_CACHE_FILE", "_ASK_MAX_FACTS", "_ASK_MAX_Q", "_ASK_KEEP", "_ask_lock", "_ask_busy", "_ASK_INSTRUCTION",
      "_ASK_STOP", "_ASK_TOPICS", "_ASK_WEEKDAYS", "_ASK_MONTHS", "_ask_norm", "_ask_period", "_ask_topics",
      "_ask_keywords", "_ask_cap", "_ask_sessions", "_ask_facts", "_ask_cache_key", "_ask_load", "_ask_store",
-     "_ask_history", "_ask"],
+     "_ask_history", "_ASK_FOLLOW", "_ASK_MODELS", "_ask_thread", "_ask_period_explicit", "_ask_prompt", "_ask"],
     {"os": os, "json": json, "re": re, "sqlite3": sqlite3, "time": time, "threading": threading,
      "datetime": datetime, "calendar": calendar, "AOC_DATA_DIR": work,
      "TRANSCRIPT_INDEX_DB": os.path.join(work, "missing.db"),
@@ -141,8 +141,8 @@ ask = ns["_ask"]
 calls = []
 
 
-def haiku(instr, stdin):
-    calls.append((instr, stdin))
+def haiku(instr, stdin, model="haiku"):
+    calls.append((instr, stdin, model))
     return "Spolu $7.75; najviac [#aaaa1111] ($5.75).\n", 0.0123
 
 
@@ -175,7 +175,7 @@ c.check("busy guard", rb["ok"] is False and rb.get("busy") is True)
 ns["_ask_busy"][0] = False
 
 
-def broken(instr, stdin):
+def broken(instr, stdin, model="haiku"):
     raise RuntimeError("Claude Code took too long to answer")
 
 
@@ -183,6 +183,76 @@ rf = ask("why did it fail", run=broken, now=NOW, conn_fn=conn_fn, fail_fn=fake_f
 c.check("haiku failure -> error, busy released, logged", rf["ok"] is False and "too long" in rf["error"]
         and ns["_ask_busy"][0] is False and errors)
 c.check("failure not cached", ask("why did it fail", run=haiku, now=NOW, conn_fn=conn_fn, fail_fn=fake_fail)["cached"] is False)
+
+# ── answer quality instruction ──
+I = ns["_ASK_INSTRUCTION"]
+c.check("instruction: native grammar, no word-for-word labels", "native speaker" in I and "'dnes'" in I and "word for word" in I)
+c.check("instruction: refs read as names, no filler", "[#1a2b3c4d]" in I and "title in its place" in I and "no filler" in I
+        and "don't write the title next to it again" in I)
+c.check("instruction: 'agenti' = sessions", "(agenti)" in I and "from the session facts" in I)
+c.check("instruction: follow-up context, numbers only from facts", "EARLIER IN THIS CONVERSATION" in I and "numbers only from the FACTS" in I)
+c.check("plain questions still go to haiku", calls[0][2] == "haiku")
+
+# ── cache key, thread, prompt (pure) ──
+import hashlib
+CK = ns["_ask_cache_key"]
+d30 = date(2026, 10, 30)
+c.check("plain haiku key unchanged (old cache still hits)",
+        CK("Koľko?", d30) == hashlib.sha1(("kolko?|2026-10-30").encode()).hexdigest()[:20])
+c.check("model and prev change the key", len({CK("x y", d30), CK("x y", d30, "sonnet"), CK("x y", d30, "haiku", "a" * 20),
+                                             CK("x y", d30, "sonnet", "a" * 20)}) == 4)
+c.check("key still per normalized question", CK("Koľko  ma", d30, "sonnet") == CK("kolko ma", d30, "sonnet"))
+TH = ns["_ask_thread"]
+chain = {"k1": {"q": "one"}, "k2": {"q": "two", "prev": "k1"}, "k3": {"q": "three", "prev": "k2"},
+         "k4": {"q": "four", "prev": "k3"}, "loopa": {"q": "a", "prev": "loopb"}, "loopb": {"q": "b", "prev": "loopa"}}
+c.check("thread oldest first", [e["q"] for e in TH(chain, "k3")] == ["one", "two", "three"])
+c.check("thread capped at _ASK_FOLLOW (newest kept)", [e["q"] for e in TH(chain, "k4")] == ["two", "three", "four"])
+c.check("thread: missing / empty / loop", TH(chain, "nope") == [] and TH(chain, "") == [] and len(TH(chain, "loopa")) == 2)
+PE = ns["_ask_period_explicit"]
+c.check("explicit period", PE("a včera?", d30) and PE("last 30 days?", d30) and PE("v septembri", d30))
+c.check("no period of its own", not PE("which of those failed?", d30) and not PE("a ktorá bola druhá?", d30))
+PR = ns["_ask_prompt"]
+c.check("prompt without thread = old format", PR("Q?", "F") == "QUESTION: Q?\n\nFACTS:\nF\n")
+p2 = PR("a včera?", "F", [{"q": "dnes?", "answer": "A1"}, {"q": "kto?", "answer": "A2"}])
+c.check("prompt with thread: earlier Q/A first, in order",
+        p2.startswith("EARLIER IN THIS CONVERSATION:\nQ: dnes?\nA: A1\nQ: kto?\nA: A2\n\nQUESTION: a včera?"))
+c.check("prompt: long earlier answer clipped", len(PR("q", "F", [{"q": "x", "answer": "z" * 5000}])) < 1400)
+
+# ── follow-ups end to end ──
+base = ask("Koľko ma stál OmniSocial tento týždeň?", run=haiku, now=NOW + 600, conn_fn=conn_fn, fail_fn=fake_fail, force=True)
+n0 = len(calls)
+f1 = ask("a ktorá bola najdrahšia?", prev=base["key"], run=haiku, now=NOW + 660, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("follow-up answered with context", f1["ok"] and len(calls) == n0 + 1
+        and calls[-1][1].startswith("EARLIER IN THIS CONVERSATION:\nQ: Koľko ma stál OmniSocial tento týždeň?\nA: Spolu $7.75"))
+c.check("follow-up keeps the previous period", f1["period"] == base["period"] and "PERIOD: this week" in calls[-1][1])
+c.check("follow-up searches with earlier words", "omnisocial" in calls[-1][1].lower().split("facts:")[1])
+c.check("follow-up stores prev + thread, own key", f1["prev"] == base["key"] and f1["thread"] == [base["q"]]
+        and f1["key"] != base["key"] and f1["key"] != CK("a ktorá bola najdrahšia?", d30))
+f2 = ask("a včera?", prev=f1["key"], run=haiku, now=NOW + 720, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("follow-up with its own period", f2["period"]["label"] == "yesterday" and "PERIOD: yesterday" in calls[-1][1])
+c.check("follow-up of a follow-up: whole thread", f2["thread"] == [base["q"], f1["q"]]
+        and calls[-1][1].split("QUESTION:")[0].count("\nQ: ") == 2)
+f1b = ask("a ktorá bola najdrahšia?", prev=base["key"], run=haiku, now=NOW + 780, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("same follow-up -> cache", f1b["cached"] is True and f1b["answer"] == f1["answer"] and len(calls) == n0 + 2)
+n1 = len(calls)
+gone = ask("a včera?", prev="f" * 20, run=haiku, now=NOW, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("unknown prev -> error, no call", gone["ok"] is False and "gone" in gone["error"] and len(calls) == n1)
+odd = ask("something odd here", prev="../../etc", run=haiku, now=NOW + 840, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("malformed prev ignored -> plain question", odd["ok"] and "prev" not in odd and not calls[-1][1].startswith("EARLIER"))
+c.check("plain answer records model haiku", odd["model"] == "haiku" and base["model"] == "haiku")
+
+# ── Deeper: Sonnet ──
+n2 = len(calls)
+s1 = ask("Koľko ma stál OmniSocial tento týždeň?", model="sonnet", run=haiku, now=NOW + 900, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("sonnet runs the Sonnet model id", s1["ok"] and s1["cached"] is False and calls[-1][2] == ns["_ASK_MODELS"]["sonnet"]
+        and calls[-1][2] == "claude-sonnet-5" and len(calls) == n2 + 1)
+c.check("sonnet answer cached apart from haiku", s1["model"] == "sonnet" and s1["key"] != base["key"]
+        and ask("Koľko ma stál OmniSocial tento týždeň?", model="sonnet", run=haiku, now=NOW + 960, conn_fn=conn_fn,
+                fail_fn=fake_fail)["cached"] is True)
+sf = ask("a ktorá bola najdrahšia?", prev=base["key"], model="sonnet", run=haiku, now=NOW + 990, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("deeper follow-up keeps its context", sf["cached"] is False and sf["prev"] == base["key"] and calls[-1][1].startswith("EARLIER"))
+uk = ask("unknown model question", model="gpt-5", run=haiku, now=NOW + 1000, conn_fn=conn_fn, fail_fn=fake_fail)
+c.check("unknown model -> haiku", uk["model"] == "haiku" and calls[-1][2] == "haiku")
 
 d = ns["_ask_load"]()
 for i in range(70):

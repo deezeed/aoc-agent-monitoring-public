@@ -9,7 +9,7 @@ const { Checker } = require('./lib/check');
 const src = readMonitorSource();
 eval(src.match(/const _INBOX_KINDS=\{[\s\S]*?\};/)[0].replace(/^const /, 'var '));
 for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_lastMessageInfo', '_waitLabel', '_permAskHtml', '_replyAskHtml',
-                 '_budgetBadgeHtml', '_loopBadgeHtml', '_ctxMeterHtml', '_inboxItems', '_inboxHtml'])
+                 '_budgetBadgeHtml', '_loopBadgeHtml', '_ctxSaveHtml', '_ctxMeterHtml', '_inboxItems', '_inboxHtml'])
   eval(extractFunction(src, f));
 
 const c = new Checker();
