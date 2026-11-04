@@ -122,7 +122,7 @@ ns["_ctxsave_request"]("b", T)
 o = ns["_reply_open"]({"session_id": "b", "idle_s": 0, "stop_hook_active": False, "last_assistant_message": "done"}, ra, T + 1)
 c.check("next turn end (even at the PC) is held for it", o["hold"] and o["id"])
 p = ns["_reply_poll"](o["id"], 0, ra, T + 2)
-c.check("first poll hands over the prompt", p == {"state": "reply", "reply": "Save it now."})
+c.check("first poll hands over the prompt", p == {"state": "reply", "reply": "Save it now.", "kind": "ctx_save"})
 c.check("marked sent, disarmed", state["b"]["sent_at"] == T + 1 and not state["b"]["armed"]
         and view(state["b"], cfg)["state"] == "sent")
 o2 = ns["_reply_open"]({"session_id": "b", "idle_s": 0, "stop_hook_active": True, "last_assistant_message": "saved"}, ra, T + 30)
@@ -132,7 +132,7 @@ o3 = ns["_reply_open"]({"session_id": "e", "idle_s": 999, "stop_hook_active": Fa
 c.check("away: a turn held for a reply", o3["hold"])
 r = ns["_ctxsave_request"]("e", T + 3)
 c.check("held turn -> sent straight away", r == {"ok": True, "state": "sent"} and state["e"]["sent_at"] == T + 3)
-c.check("the held turn gets the prompt", ns["_reply_poll"](o3["id"], 999, ra, T + 4) == {"state": "reply", "reply": "Save it now."})
+c.check("the held turn gets the prompt", ns["_reply_poll"](o3["id"], 999, ra, T + 4) == {"state": "reply", "reply": "Save it now.", "kind": "ctx_save"})
 
 ns["_reply_streak"]["f"] = ns["_REPLY_MAX_STREAK"]
 ns["_ctxsave_request"]("f", T)

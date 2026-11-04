@@ -17,6 +17,9 @@ Usage:
                               calls to report whether a task already exists)
   python setup.py --stop     stop every running AOC process from this directory
                               (used by the installer before an upgrade)
+  python setup.py --restart  stop every AOC process, then start the watchdog
+                              again (works from any shell, incl. Git Bash);
+                              the dashboard's Health -> Restart runs this
   python setup.py --check    print the install's health as JSON (hook entries,
                               statusLine, deployed hook scripts, scheduled
                               tasks vs what this version expects); touches nothing
@@ -54,7 +57,7 @@ def _get_arg_value(flag: str):
     return None
 
 
-_BOOL_FLAGS = {"--dry-run", "--stop", "--uninstall", "--check", "--repair"}
+_BOOL_FLAGS = {"--dry-run", "--stop", "--restart", "--uninstall", "--check", "--repair"}
 _VALUE_FLAGS = {"--cloud-url", "--cloud-key"}
 
 
@@ -645,12 +648,15 @@ def wait_for_dashboard(timeout_s: float = 60.0) -> bool:
     return False
 
 
-def stop_aoc_processes() -> None:
+def stop_aoc_processes(end_tasks: bool = True) -> None:
     """Ends the scheduled tasks' current runs and kills every python
     process running a script from this AOC_DIR (monitor, watchdog,
     sentinel). The installer runs this before replacing files on an
-    upgrade: a running monitor keeps the bundled python DLLs locked."""
-    for task in (TASK_NAME, SENTINEL_TASK_NAME):
+    upgrade: a running monitor keeps the bundled python DLLs locked.
+    end_tasks=False (--restart) skips `schtasks /End`: when the dashboard
+    starts --restart, this process may sit in the watchdog task's job, and
+    ending the task would end us too before we could start AOC again."""
+    for task in ((TASK_NAME, SENTINEL_TASK_NAME) if end_tasks else ()):
         subprocess.run(["schtasks", "/End", "/TN", task], capture_output=True, text=True)
     # Normalized match: the hook launches monitor.py with forward slashes,
     # the scheduled tasks with backslashes, and case can differ too.
@@ -664,6 +670,24 @@ def stop_aoc_processes() -> None:
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     pids = result.stdout.split()
     print(f"[ok] stopped {len(pids)} AOC process(es)" + (f": {', '.join(pids)}" if pids else ""))
+
+
+def restart_aoc() -> None:
+    """--restart: stop every AOC process, then start the watchdog (which
+    starts monitor.py) -- through its scheduled task, or straight from this
+    folder when the task is missing. Calls schtasks directly, so it also
+    works from Git Bash, which rewrites a typed `/Run` into a path."""
+    stop_aoc_processes(end_tasks=False)
+    r = subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], capture_output=True, text=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode == 0:
+        print(f"[ok] started '{TASK_NAME}'")
+    else:
+        subprocess.Popen([_find_pythonw(), WATCHDOG_SCRIPT], cwd=AOC_DIR,
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                         close_fds=True)
+        print(f"[ok] task '{TASK_NAME}' could not be started ({r.stderr.strip() or r.returncode}) -- started watchdog.py directly")
+    wait_for_dashboard()
 
 
 def uninstall() -> None:
@@ -717,6 +741,9 @@ def main():
 
     if "--stop" in sys.argv:
         stop_aoc_processes()
+        return
+    if "--restart" in sys.argv:
+        restart_aoc()
         return
     if "--uninstall" in sys.argv:
         uninstall()

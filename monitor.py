@@ -25,7 +25,21 @@ AOC_DIR  = os.path.dirname(os.path.abspath(__file__))
 # a single stuck OneDrive lock used to be able to freeze the whole server long
 # enough for the watchdog to consider it dead and restart it, dropping any
 # hook /update that landed in that window (agents silently vanishing from AOC).
-AOC_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", AOC_DIR), "AOC")
+#
+# A second, throwaway instance (a preview of a branch, a fork's worktree, a
+# test) sets AOC_PORT + AOC_DATA_DIR instead of patching this file. Any port
+# other than 5151 -- or AOC_PREVIEW=1 -- is a preview: it never shows a
+# toast, sends a phone push or fires a webhook (_win_toast, _push_send_one,
+# _fire_webhook check AOC_PREVIEW), so trying a branch can't ping you.
+def _env_port(raw, default=5151) -> int:
+    """Pure: AOC_PORT -> a usable TCP port, else the default."""
+    try:
+        p = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return p if 1024 <= p <= 65535 else default
+
+AOC_DATA_DIR = os.environ.get("AOC_DATA_DIR") or os.path.join(os.environ.get("LOCALAPPDATA", AOC_DIR), "AOC")
 os.makedirs(AOC_DATA_DIR, exist_ok=True)
 STATUS_FILE = os.path.join(AOC_DATA_DIR, "monitor-status.json")
 LOGS_DIR    = os.path.join(AOC_DATA_DIR, "logs")
@@ -33,7 +47,8 @@ DB_FILE     = os.path.join(AOC_DATA_DIR, "history.db")
 KNOWN_VERSIONS_FILE = os.path.join(AOC_DATA_DIR, "known_cc_versions.json")
 KILL_AUDIT_LOG = os.path.join(LOGS_DIR, "kill_audit.log")
 ALERT_AUDIT_LOG = os.path.join(LOGS_DIR, "alert_audit.log")
-PORT = 5151
+PORT = _env_port(os.environ.get("AOC_PORT"))
+AOC_PREVIEW = PORT != 5151 or os.environ.get("AOC_PREVIEW") == "1"
 
 # Static SVG app icon for the PWA manifest/apple-touch-icon -- mirrors the
 # hexagon+center-dot brand mark the dynamic favicon already draws on a
@@ -2294,6 +2309,8 @@ def _fire_webhook(url: str, payload: dict):
     """Shared relay used by both /webhook_fire (client-triggered, tab must be
     open) and _webhook_notify_worker (server-triggered, works with no tab
     open) -- one place the actual HTTP delivery can drift, not two."""
+    if AOC_PREVIEW:
+        return
     if not url:
         return
     _log_alert_fired(payload)
@@ -3697,6 +3714,7 @@ def _reply_open(data, cfg, now) -> dict:
             _reply_requests[rid] = {
                 "id": rid, "session_id": sid, "message": str(data.get("last_assistant_message") or "")[-6000:],
                 "created": now, "last_poll": now, "state": "reply", "reply": _ctxsave_settings()["prompt"],
+                "kind": "ctx_save",   # the Stop hook words its preamble by this
             }
             return {"hold": True, "id": rid}
         if not sid or not _reply_should_hold(cfg, data.get("idle_s"), _reply_streak.get(sid, 0)):
@@ -3738,12 +3756,13 @@ def _reply_poll(rid, idle_s, cfg, now) -> dict:
         del _reply_requests[rid]
         if req["state"] == "reply":
             _reply_streak[req["session_id"]] = _reply_streak.get(req["session_id"], 0) + 1
-        return {"state": req["state"], "reply": req["reply"]}
+        return {"state": req["state"], "reply": req["reply"], "kind": req.get("kind", "")}
 
 
-def _reply_send(rid, action, text="") -> tuple:
+def _reply_send(rid, action, text="", kind="") -> tuple:
     """POST /reply/send from the dashboard: action "reply" (needs text) or
     "done" (let the turn end; the session waits in the terminal as usual).
+    kind="ctx_save" marks AOC's own Save state prompt (hook preamble).
     Returns (ok, error)."""
     text = str(text or "").strip()
     if action not in ("reply", "done"):
@@ -3756,6 +3775,7 @@ def _reply_send(rid, action, text="") -> tuple:
             return False, "no longer waiting"
         req["state"] = "reply" if action == "reply" else "release"
         req["reply"] = text[:20000]
+        req["kind"] = kind
     return True, ""
 
 
@@ -3903,7 +3923,7 @@ def _ctxsave_request(sid, now=None, prompt=None) -> dict:
         return {"ok": False, "error": "no session"}
     prompt = prompt or _ctxsave_settings()["prompt"]
     held = _reply_pending_by_session(now).get(sid)
-    if held and _reply_send(held["id"], "reply", prompt)[0]:
+    if held and _reply_send(held["id"], "reply", prompt, kind="ctx_save")[0]:
         with _ctxsave_lock:
             st = _ctxsave_state.setdefault(sid, {"t": now})
             st.update(armed=False, sent_at=now)
@@ -4145,6 +4165,8 @@ def _push_should_send(mode, idle_s, idle_min, urgent) -> bool:
 
 def _push_send_one(sub, payload: bytes, urlopen=None) -> int:
     """POST one encrypted message; returns the HTTP status (0 = network error)."""
+    if AOC_PREVIEW:
+        return 0
     import urllib.request
     import urllib.error
     priv, pub = _vapid_keys()
@@ -4429,7 +4451,7 @@ def _infra_health_snapshot():
 # because nothing re-checked after an update; now a worker does, every
 # _HOOKS_HEALTH_EVERY_S, and the Health view offers a one-click repair.
 _HOOKS_HEALTH_EVERY_S = 600
-_hooks_health = {"checks": None, "at": 0.0, "error": ""}
+_hooks_health = {"checks": None, "at": 0.0, "error": "", "repairing": False}
 _hooks_health_lock = threading.Lock()  # one setup.py run at a time
 
 
@@ -4459,6 +4481,7 @@ def _run_setup(flag: str) -> None:
     if not os.path.exists(py):
         py = sys.executable
     with _hooks_health_lock:
+        _hooks_health["repairing"] = flag == "--repair"
         try:
             r = subprocess.run([py, os.path.join(AOC_DIR, "setup.py"), flag], cwd=AOC_DIR,
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
@@ -4468,7 +4491,7 @@ def _run_setup(flag: str) -> None:
         except Exception as e:
             checks, err = None, f"{type(e).__name__}: {e}"[:300]
         _hooks_health.update({"checks": checks if checks is not None else _hooks_health["checks"],
-                              "at": time.time(), "error": err})
+                              "at": time.time(), "error": err, "repairing": False})
 
 
 def _hooks_health_view() -> dict:
@@ -4791,7 +4814,20 @@ _self_update_notified = [False]
 # use the git check below. build.ps1 writes its version to VERSION instead,
 # and those installs check the public repo's latest GitHub release.
 AOC_VERSION_FILE = os.path.join(AOC_DIR, "VERSION")
-AOC_RELEASES_API = "https://api.github.com/repos/deezeed/aoc-agent-monitoring-public/releases/latest"
+
+def _update_source(raw) -> str:
+    """Pure: AOC_UPDATE_SOURCE -> the base URL of a stand-in release server,
+    or "" (= GitHub, the default). Test-only, for CI's one-click update run
+    (installer/one_click_update_e2e.py): read from the environment alone --
+    no setting, file or HTTP route can change it -- and only a plain-http
+    loopback address counts, so it can't send an install somewhere else.
+    The SHA-256 check from the release notes still applies."""
+    m = re.fullmatch(r"http://(127\.0\.0\.1|localhost):(\d{2,5})/?", str(raw or "").strip())
+    return f"http://{m.group(1)}:{m.group(2)}/" if m else ""
+
+_UPDATE_SOURCE = _update_source(os.environ.get("AOC_UPDATE_SOURCE"))
+AOC_RELEASES_API = (_UPDATE_SOURCE + "releases/latest" if _UPDATE_SOURCE else
+                    "https://api.github.com/repos/deezeed/aoc-agent-monitoring-public/releases/latest")
 _RELEASE_CHECK_INTERVAL_S = 6 * 3600  # unauthenticated GitHub API: 60 req/h per IP
 
 def _read_installed_version(path) -> str:
@@ -4867,8 +4903,10 @@ def _release_update_worker(installed: str):
 # one, so the installer is started detached and outside our job object --
 # it has to outlive us. The "What's new" list of that release is kept in
 # WHATS_NEW_FILE and shown once when the new version first starts.
-AOC_RELEASE_DL_PREFIX = "https://github.com/deezeed/aoc-agent-monitoring-public/releases/download/"
-AOC_RELEASE_TAG_API = "https://api.github.com/repos/deezeed/aoc-agent-monitoring-public/releases/tags/"
+AOC_RELEASE_DL_PREFIX = (_UPDATE_SOURCE + "releases/download/" if _UPDATE_SOURCE else
+                         "https://github.com/deezeed/aoc-agent-monitoring-public/releases/download/")
+AOC_RELEASE_TAG_API = (_UPDATE_SOURCE + "releases/tags/" if _UPDATE_SOURCE else
+                       "https://api.github.com/repos/deezeed/aoc-agent-monitoring-public/releases/tags/")
 UPDATE_DIR = os.path.join(AOC_DATA_DIR, "update")
 WHATS_NEW_FILE = os.path.join(AOC_DATA_DIR, "whats_new.json")
 _INSTALLER_SILENT_ARGS = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
@@ -5000,8 +5038,15 @@ def _whats_new_startup(installed: str, path=None, fetch_fn=None):
     """Run once when an installed copy starts (from the release worker)."""
     try:
         with _whats_new_lock:
-            state, needs_fetch = _whats_new_next(_whats_new_load(path), installed)
+            prev = _whats_new_load(path)
+            state, needs_fetch = _whats_new_next(prev, installed)
             _whats_new_save(state, path)
+        try:   # best effort, never in the way of the What's new list
+            change = _version_change_entry(prev, installed)
+            if change and path is None:   # tests pass their own path and keep the real history alone
+                _update_history_add(change)
+        except Exception:
+            pass
         if not needs_fetch:
             return
         items = (fetch_fn or _fetch_release_notes)(installed)
@@ -5042,6 +5087,83 @@ def _update_job_set(event: str, **kw):
         new = _update_job_next(_update_job, event, **kw)
         _update_job.clear()
         _update_job.update(new)
+    if event == "fail":
+        try:   # best effort: the history must never break the job itself
+            _update_history_add({"outcome": "failed", "from": _read_installed_version(AOC_VERSION_FILE),
+                                 "to": new.get("version", ""), "error": str(new.get("error") or "")[:300]})
+        except Exception:
+            pass
+
+
+# Health -> VERSION & UPDATES: what happened to past updates, across the
+# restarts an update causes (_update_job is in memory only). A failure is
+# written by the updater; a version change by the new version's first start.
+UPDATE_HISTORY_FILE = os.path.join(AOC_DATA_DIR, "update_history.jsonl")
+_UPDATE_HISTORY_KEEP = 50
+
+def _update_history_add(entry, path=None, now=None):
+    path = path or UPDATE_HISTORY_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": round(now or time.time(), 1), **entry}, ensure_ascii=False) + "\n")
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > 2 * _UPDATE_HISTORY_KEEP:
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_UPDATE_HISTORY_KEEP:])
+    except OSError as e:
+        _log_bg_error("update history", e)
+
+def _update_history_read(limit=10, path=None) -> list:
+    """Newest first; broken lines skipped."""
+    try:
+        with open(path or UPDATE_HISTORY_FILE, encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+def _version_change_entry(prev_state, installed):
+    """Pure: WHATS_NEW_FILE state before this start + the running version ->
+    the history entry for a version change, None if nothing changed (or a
+    first install). "updated" when the one-click updater staged it."""
+    prev_state = prev_state if isinstance(prev_state, dict) else {}
+    seen = str(prev_state.get("seen") or "")
+    if not installed or not seen or seen == installed:
+        return None
+    pending = prev_state.get("pending")
+    via = "one-click update" if isinstance(pending, dict) and pending.get("version") == installed else "installed by hand"
+    return {"outcome": "updated", "from": seen, "to": installed, "via": via}
+
+def _install_log_tail(path=None, lines=40) -> dict:
+    """GET /update/log: the end of the last installer log ({} if none)."""
+    path = path or os.path.join(UPDATE_DIR, "install.log")
+    try:
+        st = os.stat(path)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-lines:]
+    except OSError:
+        return {}
+    return {"path": path, "mtime": st.st_mtime, "text": "".join(tail)[-8000:]}
+
+def _update_status_view() -> dict:
+    """GET /update/status for Health: version, what's available, the job
+    now, past updates, whether an installer log exists."""
+    installed = _read_installed_version(AOC_VERSION_FILE)
+    with _self_update_lock:
+        su = dict(_self_update_status)
+    with _update_job_lock:
+        job = dict(_update_job)
+    log = _install_log_tail(lines=1)
+    return {"installed": installed, "mode": "release" if installed else "git", "self_update": su, "job": job,
+            "history": _update_history_read(), "log": {"path": log.get("path"), "mtime": log.get("mtime")} if log else None}
 
 def _download_file(url, dest, progress_fn):
     """url -> dest (via dest.part); progress_fn(pct) while it runs."""
@@ -5065,19 +5187,34 @@ def _file_sha256(path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def _launch_installer(exe, log_path):
-    """Start the installer so it survives this monitor being stopped by it:
-    detached, own process group, and broken away from the Task Scheduler job
-    the watchdog runs us in (when that job doesn't allow breakaway, plain
-    detached is the best we can do)."""
-    args = [exe] + _INSTALLER_SILENT_ARGS + ["/LOG=" + log_path]
+def _spawn_detached(args, cwd):
+    """Start a process that must outlive this monitor (it is about to stop
+    us): detached, own process group, and broken away from the Task
+    Scheduler job the watchdog runs us in (when that job doesn't allow
+    breakaway, plain detached is the best we can do)."""
     base = (getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     try:
         subprocess.Popen(args, creationflags=base | 0x01000000,  # CREATE_BREAKAWAY_FROM_JOB
-                         close_fds=True, cwd=os.path.dirname(exe))
+                         close_fds=True, cwd=cwd)
     except OSError:
-        subprocess.Popen(args, creationflags=base, close_fds=True, cwd=os.path.dirname(exe))
+        subprocess.Popen(args, creationflags=base, close_fds=True, cwd=cwd)
+
+def _launch_installer(exe, log_path):
+    """Start the installer so it survives this monitor being stopped by it."""
+    _spawn_detached([exe] + _INSTALLER_SILENT_ARGS + ["/LOG=" + log_path], os.path.dirname(exe))
+
+def _restart_aoc(force=False, blockers=None, spawn=None) -> dict:
+    """POST /restart: hand the restart to `setup.py --restart` (stops every
+    AOC process, starts the watchdog task again). Held prompts / an open
+    tunnel / an update on its way are named first unless force."""
+    blockers = _restart_blockers(_perm_requests, _tunnel_status[0], _update_job.get("state"), _hooks_health["repairing"]) if blockers is None else blockers
+    if blockers and not force:
+        return {"ok": False, "blockers": blockers}
+    py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    (spawn or _spawn_detached)([py if os.path.exists(py) else sys.executable,
+                                os.path.join(AOC_DIR, "setup.py"), "--restart"], AOC_DIR)
+    return {"ok": True, "blockers": blockers}
 
 _UPDATE_INSTALL_WAIT_S = 600  # a working installer stops this process well before
 
@@ -5195,11 +5332,15 @@ _threading.Thread(target=_selfupdate_worker, daemon=True).start()
 # Code hook request open, and a restart would drop it -- the hook then fails
 # open and the command runs unapproved -- so those block the restart.
 
-def _restart_blockers(perm_requests, tunnel_state, update_state=None) -> list:
+def _restart_blockers(perm_requests, tunnel_state, update_state=None, repairing=False) -> list:
     """Pure: reasons not to restart right now (empty = safe). An open remote
     tunnel blocks too: the restart would cut the phone off mid-use, and so
-    does a one-click update on its way (the installer restarts AOC itself)."""
+    does a one-click update on its way (the installer restarts AOC itself)
+    and a hook repair (taskkill /F of this process takes setup.py with it,
+    so Repair silently did nothing when a code reload landed mid-run)."""
     out = []
+    if repairing:
+        out.append("hook repair running")
     if update_state not in (None, "idle", "error"):
         out.append(f"update {update_state}")
     held = [r for r in (perm_requests or {}).values() if isinstance(r, dict) and r.get("state") == "pending"]
@@ -15647,6 +15788,11 @@ body.light::before { content:none; }
 .hh-ic { width:12px; flex:none; } .hh-row.ok .hh-ic { color:var(--g); } .hh-row.bad .hh-ic, .hh-row.bad .hh-det { color:var(--o); }
 .hh-lbl { color:var(--t2); } .hh-det { color:var(--t3); min-width:0; overflow-wrap:anywhere; }
 .hh-note { font-family:var(--font2); font-size:9px; color:var(--t3); margin:6px 0 4px; } .hh-note.bad { color:var(--r); }
+.hh-sec-row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.hh-sec-row .adp-btn { font-size:9px; padding:2px 10px; letter-spacing:0; }
+.uh-new { color:var(--o); }
+.uh-log { font-family:var(--font2); font-size:9px; color:var(--t2); white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px;
+  overflow:auto; padding:8px; margin:6px 0; border:1px solid rgba(255,255,255,.08); border-radius:6px; }
 .topbar .clock { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); text-align:center;
   display:flex; flex-direction:column-reverse; align-items:center; pointer-events:none; }
 .topbar .clock-time { font:700 23px/1.05 var(--font4); color:#8fe6ff; letter-spacing:.06em; text-shadow:0 0 14px rgba(var(--c-rgb),.55); }
@@ -23260,7 +23406,8 @@ async function renderDiag(){
       fetch('/backups').then(r=>r.json()).catch(()=>[]),
     ]);
     const fmtDate=t=>t?new Date(t*1000).toLocaleString():'—';
-    const hooks=await fetch('/hooks_health').then(r=>r.json()).catch(()=>null);
+    const [hooks,upd]=await Promise.all([fetch('/hooks_health').then(r=>r.json()).catch(()=>null),
+                                        fetch('/update/status').then(r=>r.json()).catch(()=>null)]);
     const backupRows=(backups||[]).map(b=>`
       <div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.05);font-family:var(--font2);font-size:10px">
         <span style="flex:1;color:${b.corrupt?'var(--r)':'var(--t2)'}">${escHtml(b.filename)}${b.corrupt?' ⚠ CORRUPT':''}</span>
@@ -23274,7 +23421,9 @@ async function renderDiag(){
         <a href="#" onclick="openSettings();setSettingsTab('infra');return false" style="color:var(--c);text-decoration:underline;text-decoration-style:dotted">Settings → INFRA →</a>
       </div>
       <div id="hooks-health">${_hooksHealthHtml(hooks)}</div>
-      <div class="hist-section">PROCESS</div>
+      <div id="update-status">${_updateStatusHtml(upd, Date.now()/1000)}</div>
+      <div class="hist-section hh-sec-row">PROCESS <button class="adp-btn" id="aoc-restart-btn" onclick="_restartAoc()" title="Stops every AOC process and starts it again (python setup.py --restart)">Restart AOC</button></div>
+      <div id="aoc-restart-msg" class="hh-note"></div>
       <div class="hist-analytics">
         <div class="hist-kpi"><div class="hk-val">${fmtUptime(d.uptime_s)}</div><div class="hk-lbl">Uptime</div></div>
         <div class="hist-kpi"><div class="hk-val">${d.thread_count??'—'}</div><div class="hk-lbl">Threads</div></div>
@@ -23329,6 +23478,76 @@ async function _hooksHealthRun(repair){
   el.innerHTML=_hooksHealthHtml(h);
   if(lastStatus&&lastStatus.infra_health) lastStatus.infra_health.hooks_bad=h.bad||[];
   _ccPillUpdate();
+}
+
+/* Pure: Health -> VERSION & UPDATES (GET /update/status). */
+function _updateStatusHtml(u, nowS){
+  if(!u) return '';
+  const su=u.self_update||{}, job=u.job||{};
+  const ago=t=>{ const s=Math.max(0,nowS-t); return s<3600?Math.round(s/60)+' min ago':s<86400?Math.round(s/3600)+' h ago':Math.round(s/86400)+' d ago'; };
+  let ver, avail;
+  if(u.mode==='release'){
+    ver=`AOC ${escHtml(u.installed)}`;
+    avail=su.stale?`<span class="uh-new">${escHtml(su.latest)} available</span>`:(su.checked_at?`up to date (checked ${ago(su.checked_at)})`:'not checked yet');
+  }else{
+    ver='Dev checkout (git)';
+    avail=su.stale?`<span class="uh-new">${Number(su.behind_by)||0} commit(s) behind origin/master</span>`:(su.checked_at?'up to date with origin/master':'not checked yet');
+  }
+  const busy=['downloading','verifying','installing'].includes(job.state);
+  const now=busy?`<div class="hh-row"><span class="hh-ic">⟳</span><span class="hh-lbl">Updating to ${escHtml(job.version||'')}: ${escHtml(job.state)}${job.state==='downloading'&&job.pct!=null?' '+Math.round(job.pct)+'%':''}</span></div>`
+    :job.state==='error'?`<div class="hh-row bad"><span class="hh-ic">✗</span><span class="hh-lbl">Update failed</span><span class="hh-det">${escHtml(job.error||'')}</span></div>`:'';
+  const hist=(u.history||[]).slice(0,5).map(h=>{
+    const ok=h.outcome==='updated';
+    return `<div class="hh-row ${ok?'ok':'bad'}"><span class="hh-ic">${ok?'✓':'✗'}</span>`+
+      `<span class="hh-lbl">${ok?`${escHtml(h.from)} → ${escHtml(h.to)}`:`Update to ${escHtml(h.to||'?')} failed`}</span>`+
+      `<span class="hh-det">${escHtml(ok?(h.via||''):(h.error||''))} · ${ago(h.t)}</span></div>`;
+  }).join('');
+  const logBtn=u.log?`<button class="adp-btn" onclick="_updateLogShow()">Installer log</button>`:'';
+  return `<div class="hist-section hh-sec-row">VERSION &amp; UPDATES ${logBtn}</div>
+    <div class="hh-row"><span class="hh-ic">•</span><span class="hh-lbl">${ver}</span><span class="hh-det">${avail}</span></div>
+    ${now}${hist||(u.mode==='release'?'<div class="hh-note">No updates recorded yet.</div>':'')}
+    <pre id="update-log" class="uh-log" style="display:none"></pre>`;
+}
+async function _updateLogShow(){
+  const el=document.getElementById('update-log');
+  if(!el) return;
+  if(el.style.display!=='none'){ el.style.display='none'; return; }
+  let d={};
+  try{ d=await fetch('/update/log').then(r=>r.json()); }catch(e){}
+  el.textContent=d.text?`${d.path}\n\n${d.text}`:'No installer log yet.';
+  el.style.display='block';
+}
+/* Pure: the confirm text when something would be lost by a restart. */
+function _restartConfirmText(blockers){
+  return 'Restart AOC now?\n\nRight now: '+(blockers||[]).join('; ')+
+    '.\nA held command or prompt is dropped by the restart (Claude Code then decides on its own), and an open tunnel closes.';
+}
+async function _restartAoc(){
+  const btn=document.getElementById('aoc-restart-btn'), msg=document.getElementById('aoc-restart-msg');
+  const say=(t,col)=>{ if(msg){ msg.textContent=t; msg.style.color=col||''; } };
+  const post=force=>fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force})}).then(r=>r.json());
+  try{
+    let d=await post(false);
+    if(!d.ok&&d.blockers&&d.blockers.length){
+      if(!confirm(_restartConfirmText(d.blockers))) return;
+      d=await post(true);
+    }
+    if(!d.ok){ say('✗ '+(d.error||'restart failed'),'var(--r)'); return; }
+  }catch(e){ say('✗ could not reach AOC','var(--r)'); return; }
+  if(btn) btn.disabled=true;
+  say('Restarting… the page reloads when AOC is back.');
+  const t0=Date.now();
+  await new Promise(r=>setTimeout(r,4000));
+  while(Date.now()-t0<120000){
+    try{
+      const s=await fetch('/status',{cache:'no-store'}).then(r=>r.json());
+      const up=((s.infra_health||{}).monitor_uptime_s);
+      if(up!=null&&up<(Date.now()-t0)/1000){ location.reload(); return; }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,2000));
+  }
+  if(btn) btn.disabled=false;
+  say('✗ AOC did not come back within 2 min -- run python setup.py --restart in the AOC folder','var(--r)');
 }
 
 async function _restoreBackup(filename){
@@ -26938,7 +27157,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0] == "/restart_ok" and self._is_direct_loopback():
             # watchdog.py's code-reload probe (no token, like the hooks)
-            body = {"pid": os.getpid(), "blockers": _restart_blockers(_perm_requests, _tunnel_status[0], _update_job.get("state"))}
+            body = {"pid": os.getpid(), "blockers": _restart_blockers(_perm_requests, _tunnel_status[0], _update_job.get("state"), _hooks_health["repairing"])}
             self._serve(200, "application/json", json.dumps(body).encode(), no_cache=True)
             return
         if not self._check_auth():
@@ -27123,6 +27342,10 @@ class Handler(BaseHTTPRequestHandler):
             date_from, date_to = self._get_csv_date_range()
             self._serve_csv_download(_export_costs_by_subagent_type_csv(date_from, date_to),
                                       f"aoc_costs_by_agent_type_{date_from or 'all'}_{date_to or 'all'}.csv")
+        elif path_no_qs == "/update/status":
+            self._serve(200, "application/json", json.dumps(_update_status_view(), ensure_ascii=False).encode(), no_cache=True)
+        elif path_no_qs == "/update/log":
+            self._serve(200, "application/json", json.dumps(_install_log_tail(), ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/hooks_health":
             if "refresh=1" in self.path or _hooks_health["checks"] is None:
                 _run_setup("--check")
@@ -27909,6 +28132,21 @@ class Handler(BaseHTTPRequestHandler):
                 reply = {**_hooks_health_view(), "error": "repair can only be started on this PC"}
             self._serve(200, "application/json", json.dumps(reply).encode(), no_cache=True)
 
+        elif path_no_qs == "/restart":
+            if not self._is_direct_loopback() or AOC_PREVIEW:
+                reply = {"ok": False, "error": "restart can only be started on this PC" if not AOC_PREVIEW
+                         else "a preview instance doesn't restart AOC"}
+            else:
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                try:
+                    reply = _restart_aoc(force=bool(isinstance(data, dict) and data.get("force")))
+                except Exception as e:
+                    reply = {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+            self._serve(200, "application/json", json.dumps(reply).encode(), no_cache=True)
+
         elif path_no_qs == "/selfupdate/install":
             # Runs an installer on this PC -- only from the PC itself, never
             # through the tunnel / phone.
@@ -28528,6 +28766,8 @@ def _win_toast(title: str, message: str):
     name/icon on the notification instead of PowerShell's -- also
     live-tested and confirmed showing distinctly from the borrowed one.
     Toast only -- _show_native_toast adds the phone push."""
+    if AOC_PREVIEW:
+        return  # a preview instance never pings you (see AOC_PREVIEW)
     try:
         def xml_esc(s: str) -> str:
             return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -28725,7 +28965,9 @@ if __name__ == "__main__":
     # detection reuses _pid_exe_name, the same technique watchdog.py's own
     # lock file (watchdog.pid) uses, so a PID recycled by an unrelated
     # process after a crash doesn't wedge every future start.
-    _MONITOR_PID_FILE = os.path.join(AOC_DIR, "monitor.pid")
+    # one lock per port: a preview (AOC_PORT) must not be refused because
+    # the real AOC holds monitor.pid in the same folder
+    _MONITOR_PID_FILE = os.path.join(AOC_DIR, "monitor.pid" if PORT == 5151 else f"monitor-{PORT}.pid")
 
     def _acquire_monitor_lock(max_attempts: int = 5) -> bool:
         for _ in range(max_attempts):

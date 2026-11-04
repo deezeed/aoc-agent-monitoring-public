@@ -66,7 +66,7 @@ c.check("unknown action rejected", ns["_reply_send"](r["id"], "maybe", "x")[0] i
 c.check("reply accepted", ns["_reply_send"](r["id"], "reply", " yes, ship it ") == (True, ""))
 c.check("second answer rejected", ns["_reply_send"](r["id"], "done") == (False, "no longer waiting"))
 c.check("answered -> not listed", "s1" not in ns["_reply_pending_by_session"](1004))
-c.check("poll hands out the reply once (trimmed)", ns["_reply_poll"](r["id"], 700, away5, 1004) == {"state": "reply", "reply": "yes, ship it"})
+c.check("poll hands out the reply once (trimmed)", ns["_reply_poll"](r["id"], 700, away5, 1004) == {"state": "reply", "reply": "yes, ship it", "kind": ""})
 c.check("then gone -> release", ns["_reply_poll"](r["id"], 700, away5, 1005) == {"state": "release"})
 c.check("streak counted", ns["_reply_streak"].get("s1") == 1)
 
@@ -193,6 +193,14 @@ hookmod.MAX_HOLD_S = 5
 c.check("nobody answers -> turn ends", run_with([600]) is None)
 hookmod.MAX_HOLD_S = real_max
 c.check("reply_output: release / empty -> None", hookmod.reply_output("release") is None and hookmod.reply_output("reply", "  ") is None)
+c.check("reply_output: a dashboard reply says so",
+        hookmod.reply_output("reply", "go on")["reason"].startswith("The user replied from the AOC dashboard"))
+r = hookmod.reply_output("reply", "Ulož stav", "ctx_save")["reason"]
+c.check("reply_output: Save state is worded as AOC's context-full request, not a reply from away",
+        r.startswith("AOC: this session's context is almost full") and "away from the PC" not in r and r.endswith("Ulož stav"))
+c.check("reply_output: unknown kind falls back to the reply wording",
+        hookmod.reply_output("reply", "x", "nope")["reason"].startswith("The user replied"))
+c.check("hook passes the poll's kind on", 'reply_output(state, r.get("reply") or "", r.get("kind") or "")' in open(os.path.join(ROOT, "hooks", "aoc_permission.py"), encoding="utf-8").read())
 
 
 def stop_server(t):

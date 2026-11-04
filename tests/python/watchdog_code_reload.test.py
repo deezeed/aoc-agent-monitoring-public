@@ -56,6 +56,7 @@ c.check("open tunnel blocks", blockers({}, "ready") == ["remote tunnel is open"]
 c.check("starting tunnel blocks", blockers(None, "starting") == ["remote tunnel is open"])
 c.check("update on its way blocks", blockers({}, "off", "installing") == ["update installing"])
 c.check("idle / failed update doesn't block", blockers({}, "off", "idle") == [] and blockers({}, "off", "error") == [])
+c.check("hook repair running blocks (a reload would kill setup.py mid-repair)", blockers({}, "off", "idle", True) == ["hook repair running"])
 
 # _restart_ok against a real server
 REPLY = [b""]

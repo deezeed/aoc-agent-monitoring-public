@@ -107,12 +107,21 @@ def _set_waiting(hook, waiting, message=""):
         pass
 
 
-def reply_output(state, text=""):
+# What Claude is told before the text it gets back. "ctx_save" is AOC's own
+# "Save state" prompt (context almost full), not something the user typed
+# while away; anything else is a reply from the dashboard.
+REPLY_PREAMBLES = {
+    "ctx_save": "AOC: this session's context is almost full, and the user asked (via AOC's Save state) "
+                "for this before it gets compacted:\n\n",
+}
+REPLY_PREAMBLE_DEFAULT = "The user replied from the AOC dashboard (away from the PC):\n\n"
+
+
+def reply_output(state, text="", kind=""):
     """Pure: the Stop hook JSON that hands your reply to Claude, None otherwise."""
     if state != "reply" or not text.strip():
         return None
-    return {"decision": "block",
-            "reason": "The user replied from the AOC dashboard (away from the PC):\n\n" + text}
+    return {"decision": "block", "reason": REPLY_PREAMBLES.get(kind, REPLY_PREAMBLE_DEFAULT) + text}
 
 
 def run_reply(hook, sleep=time.sleep, clock=time.monotonic, idle=idle_seconds, env=os.environ):
@@ -149,7 +158,7 @@ def run_reply(hook, sleep=time.sleep, clock=time.monotonic, idle=idle_seconds, e
         state = r.get("state")
         if state == "pending":
             continue
-        out = reply_output(state, r.get("reply") or "")
+        out = reply_output(state, r.get("reply") or "", r.get("kind") or "")
         if out:
             _set_waiting(hook, False)
         return out

@@ -45,7 +45,7 @@ try:
          "_parse_version", "_update_job_next", "_release_sha256", "_release_whats_new", "_update_plan",
          "_whats_new_next", "_whats_new_load", "_whats_new_save", "_whats_new_startup", "_whats_new_view",
          "_whats_new_dismiss", "_update_job_set", "_file_sha256", "_update_install_worker", "_update_start"],
-        {"os": os, "json": json, "time": time, "re": re, "_threading": threading,
+        {"os": os, "json": json, "time": time, "re": re, "_threading": threading, "_UPDATE_SOURCE": "",
          "WHATS_NEW_FILE": os.path.join(SCRATCH, "whats_new.json"), "UPDATE_DIR": os.path.join(SCRATCH, "update"),
          "_UPDATE_INSTALL_WAIT_S": 0, "_latest_release": [None],
          "_update_job": {"state": "idle", "pct": 0, "version": "", "error": ""},

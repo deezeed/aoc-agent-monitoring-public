@@ -23,7 +23,7 @@ ns = exec_functions(
      "_push_endpoint_ok", "_push_sanitize_sub", "_push_subs", "_push_save_subs", "_push_subscribe",
      "_push_unsubscribe", "_load_push_settings", "_save_push_settings", "_push_should_send", "_push_send_one"],
     {"os": os, "json": json, "time": time, "base64": base64, "threading": threading,
-     "AOC_DATA_DIR": os.path.join(data_dir, "AOC")})
+     "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "AOC_PREVIEW": False})
 d = ns["_b64u_dec"]
 J = lambda s: d(s.replace(" ", ""))
 
@@ -136,6 +136,10 @@ c.check("201 from the push service", code == 201 and seen["url"] == sub["endpoin
 c.check("headers: vapid auth, aes128gcm, TTL, urgency", hd["authorization"].startswith("vapid t=") and hd["content-encoding"] == "aes128gcm"
         and hd["ttl"] == "3600" and hd["urgency"] == "high")
 c.check("body decrypts on the device", decrypt(seen["body"], ua_priv, auth2) == b'{"title":"t"}\x02')
+ns["AOC_PREVIEW"] = True
+seen.clear()
+c.check("a preview instance sends nothing", ns["_push_send_one"](sub, b'{"title":"t"}', urlopen=fake_urlopen) == 0 and not seen)
+ns["AOC_PREVIEW"] = False
 
 shutil.rmtree(data_dir, ignore_errors=True)
 c.finish()
