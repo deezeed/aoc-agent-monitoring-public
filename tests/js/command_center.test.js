@@ -12,12 +12,16 @@ const a = src.indexOf('const _ccData=');
 const b = src.indexOf("/* Pure: 'claude-opus-5-5'");
 eval(src.slice(a, b).replace(/^(const|let) /gm, 'var '));
 for (const f of ['escHtml', 'jsq', '_waitingSessions', '_waitLabel', '_lastMessageInfo', '_fmtDurShort', '_ccModelName', '_ccWave',
-  '_ccWaveHtml', '_ccRing', '_commandParts', '_commandShell', '_ccPillState', '_ccSatAlpha', '_ccGlobeState'])
+  '_ccWaveHtml', '_ccRing', '_limitForecast', '_commandParts', '_commandShell', '_ccPillState', '_ccSatAlpha', '_ccGlobeState'])
   eval(extractFunction(src, f));
 
 const c = new Checker();
 c.check('model names', _ccModelName('claude-opus-5-5') === 'Opus 5.5' && _ccModelName('claude-haiku-4-5-20251001') === 'Haiku 4.5'
   && _ccModelName('claude-sonnet-5') === 'Sonnet 5' && _ccModelName('') === '?');
+c.check('model names: dated ids lose the date, never "Haiku-4 5.20251001"', _ccModelName('claude-sonnet-4-5-20250929') === 'Sonnet 4.5'
+  && _ccModelName('claude-sonnet-4-20250514') === 'Sonnet 4' && _ccModelName('claude-fable-5-1') === 'Fable 5.1');
+// every model label in the dashboard goes through _ccModelName (a hand-rolled regex mangled dated ids)
+c.check('no other model-name regex in the dashboard', (src.match(/\.replace\(\/\^claude-\//g) || []).length === 1);
 c.check('waveform is deterministic and in range', JSON.stringify(_ccWave('abc', 8)) === JSON.stringify(_ccWave('abc', 8))
   && _ccWave('abc', 8).every(v => v >= 0.25 && v <= 1) && JSON.stringify(_ccWave('abc', 8)) !== JSON.stringify(_ccWave('abd', 8)));
 

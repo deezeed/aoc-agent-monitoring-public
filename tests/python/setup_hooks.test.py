@@ -19,6 +19,7 @@ c = Checker()
 def ns_for(aoc_dir="C:\\nowhere"):
     return exec_functions(
         ["_hook_command", "_is_aoc_hook", "_is_run_hook", "_is_held_hook", "_is_budget_hook", "_merge_http_hook", "_merge_budget_hook", "BUDGET_HOOK_URL", "BUDGET_HOOK_TIMEOUT_S", "_merge_hook_entries", "_remove_hook_entries", "stop_aoc_processes",
+         "_runs_from_aoc_dir", "_stop_aoc_processes_psutil", "_stop_aoc_processes_cim",
          "PERMISSION_SCRIPT", "PERMISSION_EVENT", "PERMISSION_TIMEOUT_S", "_permission_command", "_merge_permission_hook"],
         {"os": os, "subprocess": subprocess, "HOOK_SPECS": HOOK_SPECS, "HOOKS_DST_DIR": HOOKS_DST_DIR,
          "AOC_DIR": aoc_dir, "TASK_NAME": r"\AOC-test-nonexistent\A",
@@ -85,33 +86,64 @@ c.check("removal on settings without hooks is a no-op", ns["_remove_hook_entries
 c.check("backslash-style old AOC command is recognized too",
         ns["_is_aoc_hook"]({"command": "C:\\Py\\pythonw.exe C:\\u\\.claude\\hooks\\run_hook.pyw"}))
 
-# 7. stop_aoc_processes kills python processes running from AOC_DIR only
-SCRATCH = tempfile.mkdtemp(prefix="aoc_test_stop_")
-procs = []
+# 7. stop_aoc_processes kills python processes running from AOC_DIR only --
+#    via psutil when it's installed (the installer bundles it), else via the
+#    WMI query; both paths for real. Sleepers live 10 min (killed in finally):
+#    the WMI query alone has taken > 60 s on a loaded machine, and a sleeper
+#    that exits by itself would fake "stopped" / break "survived".
 try:
-    aoc_dir = os.path.join(SCRATCH, "AOC")
-    other_dir = os.path.join(SCRATCH, "AOC-other")  # prefix of the name must not match
-    for d in (aoc_dir, other_dir):
-        os.makedirs(d)
-        with open(os.path.join(d, "sleeper.py"), "w") as f:
-            f.write("import time\ntime.sleep(60)\n")
-    # forward slashes, like the hook's ensure_monitor launch
-    inside = subprocess.Popen([sys.executable, os.path.join(aoc_dir, "sleeper.py").replace("\\", "/")])
-    outside = subprocess.Popen([sys.executable, os.path.join(other_dir, "sleeper.py")])
-    procs = [inside, outside]
-    time.sleep(1.0)
-    ns_for(aoc_dir)["stop_aoc_processes"]()
-    deadline = time.time() + 10
-    while inside.poll() is None and time.time() < deadline:
-        time.sleep(0.2)
-    c.check("process running a script from AOC_DIR was stopped", inside.poll() is not None)
-    c.check("process in a sibling dir sharing the name prefix survived", outside.poll() is None)
-finally:
-    for p in procs:
-        if p.poll() is None:
-            p.kill()
-            p.wait()
-    shutil.rmtree(SCRATCH, ignore_errors=True)
+    import psutil  # noqa: F401
+    paths = ["psutil", "cim"]
+except ImportError:
+    paths = ["cim"]
+for path in paths:
+    SCRATCH = tempfile.mkdtemp(prefix="aoc_test_stop_")
+    procs = []
+    try:
+        aoc_dir = os.path.join(SCRATCH, "AOC")
+        other_dir = os.path.join(SCRATCH, "AOC-other")  # prefix of the name must not match
+        for d in (aoc_dir, other_dir):
+            os.makedirs(d)
+            with open(os.path.join(d, "sleeper.py"), "w") as f:
+                f.write("import time\ntime.sleep(600)\n")
+        # forward slashes, like the hook's ensure_monitor launch
+        inside = subprocess.Popen([sys.executable, os.path.join(aoc_dir, "sleeper.py").replace("\\", "/")])
+        outside = subprocess.Popen([sys.executable, os.path.join(other_dir, "sleeper.py")])
+        procs = [inside, outside]
+        ns_stop = ns_for(aoc_dir)
+        if path == "cim":
+            ns_stop["_stop_aoc_processes_psutil"] = lambda: None
+        ns_stop["stop_aoc_processes"]()
+        deadline = time.time() + 30
+        while inside.poll() is None and time.time() < deadline:
+            time.sleep(0.2)
+        c.check(f"[{path}] process running a script from AOC_DIR was stopped", inside.poll() is not None)
+        c.check(f"[{path}] process in a sibling dir sharing the name prefix survived", outside.poll() is None)
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+
+# WMI not answering in time -> a warning and no kill list, never a traceback
+import io, contextlib
+ns_slow = ns_for("C:\\nowhere")
+def _slow_run(*a, **kw):
+    raise subprocess.TimeoutExpired(a[0], kw.get("timeout"))
+ns_slow["subprocess"] = type("S", (), {"run": staticmethod(_slow_run), "TimeoutExpired": subprocess.TimeoutExpired})
+ns_slow["_stop_aoc_processes_psutil"] = lambda: None
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    try:
+        ns_slow["stop_aoc_processes"](end_tasks=False)
+        raised = False
+    except Exception:
+        raised = True
+c.check("WMI timeout -> warning, no exception", not raised and "[WARN] could not list AOC processes" in buf.getvalue())
+c.check("path match is normalized (slashes, case), not a name prefix",
+        ns_for("C:\\Apps\\AOC")["_runs_from_aoc_dir"]("pythonw c:/apps/aoc/monitor.py --headless")
+        and not ns_for("C:\\Apps\\AOC")["_runs_from_aoc_dir"]("pythonw C:\\Apps\\AOC-other\\monitor.py"))
 
 # ── PermissionRequest hook (remote approve): own command + timeout ──
 pns = ns_for()

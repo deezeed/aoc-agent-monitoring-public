@@ -17,13 +17,16 @@ errors = []
 ns = exec_functions(
     ["_RATE_LIMIT_KINDS", "_RATE_LIMIT_WARN_PCT", "_rate_limit_pace", "_rate_limit_view",
      "_fmt_reset_time", "_rate_limit_alerts", "_record_rate_limit_hit", "_rate_limits_snapshot",
-     "_load_rate_limit_notified", "_save_rate_limit_notified", "_load_json_file", "_iso_to_epoch"],
+     "_load_rate_limit_notified", "_save_rate_limit_notified", "_load_json_file", "_iso_to_epoch",
+     "_RATE_LIMIT_SOON_S", "_RATE_LIMIT_KEY_TOL_S", "_RATE_LIMIT_SAVE_EVERY_S", "_rate_limit_sample_key",
+     "_rate_limit_samples_load", "_rate_limit_samples_dump", "_fmt_in", "_rate_limit_soon_alerts"],
     {"os": os, "json": json, "time": time, "datetime": datetime, "calendar": calendar,
      "threading": threading, "_rate_limit_lock": threading.Lock(),
      "_rate_limit_state": {"mtime": None, "snap": None, "samples": {}, "hits": {}},
      "AOC_DATA_DIR": tmp,
      "RATE_LIMITS_FILE": os.path.join(tmp, "rate_limits.json"),
      "RATE_LIMIT_NOTIFIED_FILE": os.path.join(tmp, "rate_limit_notified.json"),
+     "RATE_LIMIT_SAMPLES_FILE": os.path.join(tmp, "rate_limit_samples.json"),
      "_log_bg_error": lambda where, e: errors.append((where, e))})
 
 pace, view, alerts = ns["_rate_limit_pace"], ns["_rate_limit_view"], ns["_rate_limit_alerts"]

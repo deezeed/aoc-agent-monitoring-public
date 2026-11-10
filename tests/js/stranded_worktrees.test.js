@@ -9,7 +9,7 @@ const src = readMonitorSource();
 eval(src.match(/const _INBOX_KINDS=\{[\s\S]*?\};/)[0].replace(/^const /, 'var '));
 for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_lastMessageInfo', '_waitLabel', '_waitingSessions', '_ctxMeterHtml',
                  '_permAskHtml', '_replyAskHtml', '_budgetBadgeHtml', '_loopBadgeHtml', '_awayBlockHtml', '_changesBtnHtml', '_replayBtnHtml',
-                 '_inboxItems', '_inboxHtml', '_todayHtml', '_wtMergeBlock', '_wtHtml', '_wtStrandedStat', '_wtStrandedHtml'])
+                 '_inboxItems', '_inboxHtml', '_todayHtml', '_wtMergeBlock', '_wtHtml', '_wtStrandedStat', '_wtStrandedBtns', '_wtStrandedHtml', '_bgDead', '_bgStrandedLeft', '_bgAgentsHtml'])
   eval(extractFunction(src, f));
 
 const c = new Checker();

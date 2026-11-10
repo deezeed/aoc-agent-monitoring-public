@@ -1,6 +1,6 @@
 # AOC — Agent Operations Center
 
-A local, single-file monitoring dashboard for Claude Code CLI sessions and
+A local, no-build monitoring dashboard for Claude Code CLI sessions and
 the subagents ("agents") they spawn. Tracks live status, tokens, cost,
 files changed, session history, and server-side notifications (native
 Windows toasts, webhooks) — all from one Python process, no external
@@ -50,14 +50,21 @@ still catches the agent. Cards created this way are marked with a
 
 ## Architecture
 
-Everything above is one process, one file. There's no build step, no
-frontend framework, no ORM — `monitor.py` is a `ThreadingHTTPServer`
-subclass whose `Handler` class serves both the JSON API and a single
-`HTML = r"""..."""` triple-quoted string holding the entire dashboard
-(CSS in a `<style>` block, then vanilla JS in a `<script>` block —
-everything from the theme system to the SVG dependency graph is plain
-DOM manipulation, no React/Vue/build tooling of any kind). The Python
-half above that string holds the DB layer, the hook-facing `/update`
+Everything above is one process. There's no build step, no frontend
+framework, no ORM — `monitor.py` is a `ThreadingHTTPServer` subclass whose
+`Handler` class serves both the JSON API and the dashboard. The dashboard
+lives in `web/`: `index.html` (markup), `app.css` and `js/01_core.js` …
+`js/18_*.js` (vanilla JS — everything from the theme system to the SVG
+dependency graph is plain DOM manipulation, no React/Vue/build tooling of
+any kind). At startup `monitor.py` joins the `js/` parts in number order
+into one script and inlines it and `app.css` into `index.html`, so the
+browser still gets one self-contained page from the token-gated `/`; edit
+the files and restart (in a dev checkout the watchdog reloads after the
+commit). The Python side lives in `server/01_core.py` … `server/18_app.py`:
+`monitor.py` is only a loader that `exec()`s those parts in number order
+into its own namespace, so they share one set of globals exactly as when
+everything was one file (not importable modules — a name from an earlier
+part is a plain global in a later one). Together they hold the DB layer, the hook-facing `/update`
 endpoint, ~12 background daemon threads, and the webhook/notification
 logic. `do_POST`/`do_GET` are thin dispatchers — each route with more
 than a handful of lines of real logic (`/update`, `/reset`,
@@ -388,6 +395,159 @@ and it works for queued tasks too. Three starters (fix failing tests,
 review uncommitted changes, dependency audit) are offered until you save
 your own; most-used templates come first. `GET/POST /prompts`,
 `POST /prompts/delete|used`; stored in `%LOCALAPPDATA%\AOC\prompts.json`.
+
+**ORCHESTRATE** runs one goal with a small team of agents. You give it the
+goal and a repo; an orchestrator (`claude -p`, Opus by default, read-only
+tools) writes a plan: a few tasks, each with a role (*research* -- repo +
+web, no edits; *analyst* -- reads code; *developer* -- edits; *qa* -- runs
+the tests, no edits), exact instructions, a checkable done criterion, its
+dependencies, a model and a budget. It is told to plan the fewest agents
+that do the job, and says so when one is enough. You can edit the plan
+(JSON) and nothing runs before you approve it. The tasks then run as
+headless `claude -p` agents -- independent ones side by side (up to 4),
+dependent ones once their inputs are done -- each in its own git worktree on
+a branch that already has its inputs' commits, with only its role's tools
+(`--permission-mode dontAsk`) and its own `--max-budget-usd`, answering in a
+fixed JSON contract (status, summary, result, files changed, a note for the
+next agent, errors). A failed or invalid answer is retried once with the
+reason; a task whose inputs failed is blocked; nothing starts that would
+take the run past its budget. Agents keep AOC's hooks, so they show up as
+sessions and the danger guard still holds destructive commands for your OK.
+When nothing is left to run, the orchestrator reviews the results and
+finishes with a report, re-runs a task with feedback or adds tasks (at most
+3 reviews). Last, you approve the merge: the developers' branches go into
+the branch the run started from in dependency order, each checked with
+`git merge-tree` first -- it stops at a conflict and names the files. Each
+run shows its cost split into coordination (planner + reviews) and the
+agents' work, time, success rate, retries and your interventions, plus a
+log of every step. The planner is told the run's budget, and a plan whose
+task budgets take more than 85 % of it is scaled down to fit.
+
+**Agents** (the library under the form) are what a team is made of: the
+four built-ins (research, analyst, developer, qa) and your own. One of
+yours has a role description (its system prompt), the built-in tools it
+may use, MCP services (claude.ai connectors such as Shopify, Gmail, Drive,
+or plugin servers -- found with `claude mcp list`), skills (from
+`~/.claude/skills` and plugins), a default model and budget, and
+*sensitive* (each of its tasks waits for your OK). Duplicate a built-in to
+start from it. A run's **Team** picks which agents the planner may use;
+each planned task keeps a copy of its agent, so editing an agent later
+doesn't change a run in progress. An agent with MCP services runs on your
+Claude subscription (the claude.ai login, plan limits apply): with an API
+key set Claude Code doesn't load the connectors. It loads only its own
+servers -- every other known one is denied (all connectors together are
+far more tool definitions than a model's context holds); until AOC has
+scanned the server list (`%LOCALAPPDATA%\AOC\orch_catalog.json`) such a
+task waits. `GET /orch/agents`, `GET /orch/catalog`,
+`POST /orch/agent_save|agent_delete`.
+
+**Entities** (top of the view) are autonomous teams with a mission: a
+mission text, where they work (a repo or a workspace), a team of agents,
+an orchestrator, budgets per run / day / month and when they act -- when
+you say (*Run now*), every N hours or daily at HH:MM, and optionally again
+some minutes after each run. When one is due and its budget and your plan
+limits allow (it waits while a 5-hour or weekly window is 90 % used), a
+scout (`claude -p`, read-only tools in its folder) reads the mission, the
+team's capabilities, the entity's memory and what's in progress, and names
+the next concrete goal -- or says there's nothing to do now, and why. The
+goal becomes an ordinary run; the entity approves its plan itself (within
+the per-run budget), merging / accepting the results always waits for you.
+Each finished run is remembered (goal, kept or dropped by you, cost,
+summary) and the next scout reads it, so the team builds on what you
+accepted and doesn't redo what you dropped. New entities start paused.
+The card shows its state, why it waits, today's and this month's spend,
+the next time it looks, its runs, memory and log. `GET /orch/entities`,
+`POST /orch/entity_save|entity_run|entity_pause|entity_forget|entity_delete`.
+
+**What waits for you** -- a plan to approve, a team's plan you approve
+yourself, a task of a *sensitive* agent (it stops at a gate until you
+Allow or Skip it; the tasks after it wait, the run isn't reviewed
+meanwhile), results to merge or accept -- shows in the Inbox (with
+Approve / Allow / Skip / Open), on the Orchestrate badge, and once as a
+toast + phone push (Settings -> Notify -> *Orchestration needs you*;
+announced items are remembered across reloads). An entity's own plans
+don't ask: it approves them itself. **Stats** (last 90 days): runs, how
+many you kept, cost, coordination share, and per kind of run (one team /
+hierarchical / an entity's), per agent and per model: tasks, success,
+average cost and time, retries -- what to keep, what to drop.
+`GET /orch/stats`, `POST /orch/gate {id, task, allow}`.
+
+**Runs on** (top right) picks who pays: the API key (`ANTHROPIC_API_KEY`,
+per token) or your Claude subscription (the claude.ai login; plan limits
+apply). On the subscription every process gets only the MCP servers it
+needs (the rest denied), and an "credit balance is too low" error from the
+API key says to switch. `GET/POST /orch/settings`. Agents are told to
+write with paths relative to their folder (Git Bash's `pwd` prints `/tmp/...`
+paths that the file tools on Windows read as `C:\tmp\...`), and an agent
+that reports files its folder doesn't have is retried with that feedback.
+
+A run works either in a code repository or, for work that isn't code --
+research, reports, store operations through connected services -- in a
+**workspace** (Where: *A workspace*): a folder AOC makes and keeps in git
+under `%LOCALAPPDATA%\AOC\workspaces\<name>`. The same engine runs on it
+(parallel agents in their own copies, managers, retries), every file an
+agent writes is a commit, and *Accept results* merges them in. Your own
+folders are never turned into git repositories. `GET /orch/workspaces`.
+
+*Hierarchical* (the Structure choice) is for goals too big for one team:
+the plan may also have **managers** -- one per workstream (backend,
+frontend, docs ...), each with its own goal and a budget for its whole
+team. When a workstream is due, AOC gives it a branch (the base plus the
+work of the tasks it depends on) and starts a run of its own on it: the
+manager reads that branch and plans its team, the team runs exactly like a
+flat run, the manager reviews it, and AOC merges the team's branches into
+the workstream branch. That branch is the manager task's result; the top
+orchestrator reviews managers like any task, and your final merge takes the
+workstream branches. The team plans are approved by your approval of the
+top plan (within each manager's budget), unless you tick *also approve
+each team's plan*. A manager card shows its team's progress and opens its
+run; the team's costs roll up into the run, its planning and reviews
+counted as coordination. One level of managers; cancelling or discarding
+the run stops its teams. State lives in `%LOCALAPPDATA%\AOC\orchestration.db`;
+every process writes its answer to `%LOCALAPPDATA%\AOC\orch\<run>\`, so a
+monitor reload in the middle of a run loses nothing. `GET /orch/runs`,
+`GET /orch/run?id=`, `POST /orch/create|plan|approve|cancel|merge|discard`
+(this PC only).
+
+**People** (Settings → PEOPLE): several people on one AOC. This AOC is
+the host; others join through its tunnel with a personal invite link (one
+use, 7 days; only a hash of the code and of their token is stored) and get
+their own token -- the page they load carries theirs, never yours. Roles:
+*owner* (this PC and the main token: everything), *member* (everything but
+people, AOC's own settings -- tunnel, license, updates, restart, hooks,
+notifications, billing, memory files -- and actions on this PC itself;
+may approve, start runs and entities, also through the tunnel), *viewer*
+(reads; the voice assistant only answers). Every request is checked
+against the role; what people approve, start, merge or skip is logged with
+their name; the top bar shows who's here; a viewer sees a read-only strip.
+Disable or remove someone and their token stops working at once; 20 wrong
+invite codes an hour close `/join`. `GET /users`, `GET /me`,
+`POST /users/invite|update|cancel_invites`, `GET/POST /join`.
+
+**Shared sessions** (🤝 in the top bar): work in one Claude Code terminal
+together. The owner starts one -- an interactive `claude` (or a shell) in
+a folder, in a terminal AOC owns -- and ends it; anyone signed in to this
+AOC opens it: everyone sees the same screen (someone joining later gets the
+recent output first), the owner and members type, viewers watch; who's
+there and who's typing shows on top. It runs until the owner ends it, or
+4 hours after the last person left. The owner's private terminal (TERM)
+stays the owner's alone. `GET /shared`, `GET /shared/ws?id=` (websocket),
+`POST /shared/start|stop` (owner).
+
+**Voice assistant** (🎙 in the top bar, off until you turn it on): speak
+or type to AOC from any device -- the phone too, through the tunnel. The
+browser turns speech into text (Web Speech API; Slovak, Czech or English)
+and reads the answer out loud. AOC gives your words and a snapshot of what's
+going on (sessions, who waits, plan limits, what orchestration waits for,
+runs, entities) to `claude -p` (Haiku or Sonnet, billed like Orchestrate's
+*Runs on*), which answers and may act: approve a plan, allow / skip a gate,
+run / pause / resume an entity, start a run, merge results; open a web page,
+search, open an app, a timer, a note (`voice_notes.md`), system info.
+Starting a run, merging and opening an app wait for your yes (say *áno* /
+*yes*, or tap); anything that starts paid work, merges or touches the PC
+only works at the PC itself -- from the phone it answers, pauses entities
+and skips gates. No shell commands. `GET/POST /voice/settings`,
+`POST /voice/ask {text, history}`, `POST /voice/confirm {token, yes}`.
 
 Views (toolbar buttons, each with a single-letter hotkey once the page has
 focus): toda(**Y**), **A**gents(**C**), **C**LI(**B**), **T**imeline, **S**ummary,

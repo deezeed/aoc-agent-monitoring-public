@@ -3,7 +3,7 @@ project CLAUDE.md files and every auto-memory folder; _mem_lint flags size,
 long index lines, dead links / paths, orphans, frontmatter, duplicates;
 _memory_save / _memory_undo write with a conflict check and keep backups
 outside the memory folder."""
-import sys, os, re, glob, tempfile, time, threading
+import sys, os, re, glob, json, tempfile, time, threading
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -36,8 +36,11 @@ ns = exec_functions(
      "_MEM_LOADED", "_MEM_BIG_TOKENS", "_MEM_BIG_TOPIC_TOKENS", "_MEM_INDEX_MAX_LINES", "_MEM_INDEX_LINE_CHARS",
      "_MEM_DUPE_MIN_CHARS", "_MEM_LINK", "_MEM_WIKI", "_MEM_ABS", "_MEM_SEV", "_mem_discover", "_mem_frontmatter",
      "_mem_find_path", "_mem_lint", "_mem_read", "_mem_files", "_mem_known", "_mem_backup_prefix", "_mem_backups",
-     "_mem_write_text", "_memory_save", "_memory_undo", "_memory_lint"],
-    {"os": os, "re": re, "glob": glob, "datetime": datetime, "AOC_DATA_DIR": data,
+     "_mem_write_text", "_memory_save", "_memory_undo", "_memory_lint", "_mem_backup", "_mem_archive_record",
+     "_mem_archive_target", "_mem_is_archive", "_mem_intro_end", "_mem_pieces", "_mem_archive_split",
+     "_MEM_ARCHIVE_KEEP_TOKENS", "_MEM_ARCHIVE_MIN_KEEP", "_MEM_ARCHIVE_MIN_MOVE", "_MEM_DATE", "_MEM_RESUME",
+     "_MEM_LIST_ITEM"],
+    {"os": os, "re": re, "glob": glob, "json": json, "datetime": datetime, "AOC_DATA_DIR": data,
      "_launch_known_dirs": lambda: [{"path": proj}]})
 os.path.expanduser = lambda p, _o=os.path.expanduser: p.replace("~", home, 1) if p.startswith("~") else p
 

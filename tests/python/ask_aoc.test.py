@@ -17,7 +17,8 @@ errors = []
 ns = exec_functions(
     ["_load_json_file", "_TRANSCRIPT_INDEX_VERSION", "_transcript_index_connect", "_fts_query", "_search_transcripts",
      "_MODEL_PRICING", "_CACHE_WRITE_1H_MULT", "_model_pricing", "_cache_stats", "_commit_stats",
-     "CLIENTS_FILE", "_CLIENT_NONE", "_sanitize_clients", "_load_clients", "_client_for", "_client_report",
+     "CLIENTS_FILE", "_CLIENT_NONE", "_CLIENT_CURRENCY", "_sanitize_clients", "_load_clients", "_client_for", "_client_report",
+     "_iso_to_epoch", "_BILL_STEP_H", "_billable_hours", "_WORKLOG_GAP_S", "_WORKLOG_HOME_GROUP", "_worklog_active_s", "_worklog_project",
      "ASK_CACHE_FILE", "_ASK_MAX_FACTS", "_ASK_MAX_Q", "_ASK_KEEP", "_ask_lock", "_ask_busy", "_ASK_INSTRUCTION",
      "_ASK_STOP", "_ASK_TOPICS", "_ASK_WEEKDAYS", "_ASK_MONTHS", "_ask_norm", "_ask_period", "_ask_topics",
      "_ask_keywords", "_ask_cap", "_ask_sessions", "_ask_facts", "_ask_cache_key", "_ask_load", "_ask_store",

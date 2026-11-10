@@ -4,7 +4,7 @@ const { readMonitorSource, extractFunction } = require('./lib/extract');
 const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
-for (const f of ['escHtml', '_waitingSessions', '_hooksHealthHtml', '_ccPillState']) eval(extractFunction(src, f));
+for (const f of ['escHtml', '_waitingSessions', '_hooksHealthHtml', '_ccPillState', '_repairResultSentence', '_repairResultHtml']) eval(extractFunction(src, f));
 const c = new Checker();
 
 const ok = (id, label) => ({ id, label, ok: true, detail: '' });
@@ -29,9 +29,32 @@ c.check('nothing yet: placeholder', _hooksHealthHtml(null).includes('not checked
 h = _hooksHealthHtml({ ...allOk, error: 'TimeoutExpired' });
 c.check('last run error shown under the list', h.includes('Last run: TimeoutExpired'));
 
+// the last Repair click's outcome stays on the card
+const lr = (state, extra) => ({ at: 1793640000, state, fixed: [], left: [], error: '', ...extra });
+h = _hooksHealthHtml({ ...allOk, last_repair: lr('fixed', { fixed: ['Hook scripts in ~/.claude/hooks'] }) });
+c.check('repair fixed: green line names what it fixed', /hh-repair ok[^]*✓ Repair at [^:]*\d[^]*fixed Hook scripts in ~\/\.claude\/hooks/.test(h));
+c.check('repair fixed: says open sessions need a restart', h.includes('after a restart.'));
+h = _hooksHealthHtml({ ...broken, last_repair: lr('unchanged', { left: ['Dangerous-command guard'] }) });
+c.check('repair did nothing: red line says so', h.includes('hh-repair bad') && h.includes('ran, but nothing changed -- still not set up: Dangerous-command guard'));
+h = _hooksHealthHtml({ ...broken, last_repair: lr('partial', { fixed: ['Budget caps'], left: ['Dangerous-command guard'] }) });
+c.check('repair partial: both lists', h.includes('fixed Budget caps; still not set up: Dangerous-command guard'));
+h = _hooksHealthHtml({ ...broken, error: 'setup <x>', last_repair: lr('failed', { error: 'setup <x>' }) });
+c.check('repair failed: error escaped, shown once', h.includes('failed: setup &lt;x&gt;') && !h.includes('Last run:'));
+h = _hooksHealthHtml({ ...broken, last_repair: lr('failed', { error: 'repair can only be started on this PC' }) });
+c.check('repair refused remotely: says why', h.includes('failed: repair can only be started on this PC'));
+c.check('no repair yet: no repair line', !_hooksHealthHtml(broken).includes('hh-repair'));
+c.check('sentence for the toast matches', _repairResultSentence(lr('unchanged', { left: ['A', 'B'] })) === 'ran, but nothing changed -- still not set up: A, B.');
+c.check('no result -> empty sentence', _repairResultSentence(null) === '' && _repairResultHtml(undefined) === '');
+
 const sr = (ih) => ({ sessions_list: [], agents: [], infra_health: ih });
 c.check('pill: hooks missing -> CHECK HOOKS', _ccPillState(sr({ watchdog: { pid_alive: true }, hooks_bad: ['Budget caps'] }), 0)[1] === 'CHECK HOOKS');
 c.check('pill: hooks fine -> OPTIMAL', _ccPillState(sr({ watchdog: { pid_alive: true }, hooks_bad: [] }), 0)[1] === 'OPTIMAL');
 c.check('pill: unknown hooks -> OPTIMAL', _ccPillState(sr({ watchdog: { pid_alive: true } }), 0)[1] === 'OPTIMAL');
 c.check('pill: dead watchdog still wins', _ccPillState(sr({ watchdog: { pid_alive: false }, hooks_bad: ['x'] }), 0)[1] === 'DEGRADED');
+// auto-repair switch + an automatic repair's result line
+c.check('auto-repair switch shown, on by default', /id="hh-auto-repair" checked/.test(_hooksHealthHtml(allOk)));
+c.check('auto-repair switch off when the server says so', !/id="hh-auto-repair" checked/.test(_hooksHealthHtml({ ...allOk, auto_repair: false })));
+const autoLr = { ...allOk, last_repair: { at: 1793640000, state: 'fixed', fixed: ['Hook scripts'], left: [], error: '', source: 'auto' } };
+c.check('automatic repair named as such', _hooksHealthHtml(autoLr).includes('Automatic repair after the update'));
+c.check('a click is still just Repair', !_hooksHealthHtml({ ...autoLr, last_repair: { ...autoLr.last_repair, source: undefined } }).includes('Automatic repair'));
 c.finish();

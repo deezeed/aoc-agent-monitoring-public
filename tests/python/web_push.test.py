@@ -23,7 +23,9 @@ ns = exec_functions(
      "_push_endpoint_ok", "_push_sanitize_sub", "_push_subs", "_push_save_subs", "_push_subscribe",
      "_push_unsubscribe", "_load_push_settings", "_save_push_settings", "_push_should_send", "_push_send_one"],
     {"os": os, "json": json, "time": time, "base64": base64, "threading": threading,
-     "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "AOC_PREVIEW": False})
+     "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "AOC_PREVIEW": False,
+     "_current_user": lambda: me})
+me = {"id": "owner"}   # who the request runs as (18_users' _current_user)
 d = ns["_b64u_dec"]
 J = lambda s: d(s.replace(" ", ""))
 
@@ -99,6 +101,18 @@ c.check("same endpoint again -> replaced, not duplicated", ns["_push_subscribe"]
 c.check("stored with label", ns["_push_subs"]()[0]["label"] == "Android phone")
 c.check("unsubscribe", ns["_push_unsubscribe"]("https://fcm.googleapis.com/fcm/send/dev1") and ns["_push_subs"]() == [])
 c.check("unsubscribe unknown -> False", ns["_push_unsubscribe"]("nope") is False)
+
+# ── whose device: a member can't switch off the owner's phone ──
+ns["_push_subscribe"](good)
+c.check("stored as the owner's", ns["_push_subs"]()[0]["user"] == "owner")
+c.check("a member can't unsubscribe the owner's device",
+        ns["_push_unsubscribe"]("https://fcm.googleapis.com/fcm/send/dev1", "anna") is False and len(ns["_push_subs"]()) == 1)
+c.check("the owner can", ns["_push_unsubscribe"]("https://fcm.googleapis.com/fcm/send/dev1", "owner") and ns["_push_subs"]() == [])
+me = {"id": "anna"}
+ns["_push_subscribe"](good)
+c.check("a member's device is stored as theirs", ns["_push_subs"]()[0]["user"] == "anna")
+c.check("... and they can unsubscribe it", ns["_push_unsubscribe"]("https://fcm.googleapis.com/fcm/send/dev1", "anna") and ns["_push_subs"]() == [])
+me = {"id": "owner"}
 
 # ── when to send ──
 sh = ns["_push_should_send"]

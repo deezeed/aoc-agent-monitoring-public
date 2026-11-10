@@ -658,18 +658,59 @@ def stop_aoc_processes(end_tasks: bool = True) -> None:
     ending the task would end us too before we could start AOC again."""
     for task in ((TASK_NAME, SENTINEL_TASK_NAME) if end_tasks else ()):
         subprocess.run(["schtasks", "/End", "/TN", task], capture_output=True, text=True)
-    # Normalized match: the hook launches monitor.py with forward slashes,
-    # the scheduled tasks with backslashes, and case can differ too.
+    pids = _stop_aoc_processes_psutil()
+    if pids is None:
+        pids = _stop_aoc_processes_cim()
+    if pids is None:
+        return
+    print(f"[ok] stopped {len(pids)} AOC process(es)" + (f": {', '.join(pids)}" if pids else ""))
+
+
+def _runs_from_aoc_dir(cmdline: str) -> bool:
+    """Normalized match: the hook launches monitor.py with forward slashes,
+    the scheduled tasks with backslashes, and case can differ too."""
+    return os.path.normpath(AOC_DIR).lower() + "\\" in cmdline.replace("/", "\\").lower()
+
+
+def _stop_aoc_processes_psutil():
+    """In-process kill via psutil (bundled with the installer, so always
+    there on the upgrade path) -> killed pids as strings, None without
+    psutil. The WMI query below took > 60 s on a loaded machine."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    pids = []
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if (p.info["pid"] != os.getpid() and (p.info["name"] or "").lower().startswith("python")
+                    and _runs_from_aoc_dir(" ".join(p.info["cmdline"] or []))):
+                p.kill()
+                pids.append(str(p.info["pid"]))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return pids
+
+
+def _stop_aoc_processes_cim():
+    """Fallback without psutil (a git-clone install on a system Python):
+    PowerShell + Get-CimInstance -> killed pids as strings, or None if WMI
+    didn't answer in time -- a warning, not a traceback: under heavy load
+    the query has taken over 60 s, and raising there crashed the restart."""
     aoc_dir = os.path.normpath(AOC_DIR).lower().replace("'", "''")
     ps = ("Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
           f"Where-Object {{ $_.ProcessId -ne {os.getpid()} -and $_.CommandLine -and "
           f"$_.CommandLine.Replace('/', '\\').ToLower().Contains('{aoc_dir}\\') }} | "
           "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }")
-    result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                            capture_output=True, text=True, timeout=60,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    pids = result.stdout.split()
-    print(f"[ok] stopped {len(pids)} AOC process(es)" + (f": {', '.join(pids)}" if pids else ""))
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                                capture_output=True, text=True, timeout=120,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        print("[WARN] could not list AOC processes (Windows WMI did not answer in 120 s) -- "
+              "close AOC from the tray, or reboot, if files stay locked")
+        return None
+    return result.stdout.split()
 
 
 def restart_aoc() -> None:

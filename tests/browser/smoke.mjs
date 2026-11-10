@@ -17,7 +17,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const VIEWS = ['command', 'today', 'inbox', 'agents', 'cli', 'history', 'diag'];
+const VIEWS = ['command', 'today', 'inbox', 'orch', 'agents', 'cli', 'history', 'diag'];
 const SIZES = [[1440, 900], [390, 844]];
 const shotsArg = process.argv.indexOf('--shots');
 const SHOTS = shotsArg > 0 ? resolve(process.argv[shotsArg + 1] || 'smoke-shots') : '';

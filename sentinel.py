@@ -102,7 +102,7 @@ def main() -> None:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
         proc = subprocess.Popen(
-            [PYTHONW, WATCHDOG],
+            [PYTHONW, WATCHDOG, "--from-sentinel"],  # quiet if one is already alive
             startupinfo=si,
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )

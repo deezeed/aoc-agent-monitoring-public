@@ -2,8 +2,12 @@
 override > first client with a keyword in title / project / folder /
 committed repos), _client_report over a real sqlite transcript-index
 schema (month split by day, commits + repos, markup, unassigned last),
-_client_report_csv and the printable page (escaping, markup lines)."""
-import sys, os, json, sqlite3, tempfile, shutil, csv, io
+_client_report_csv and the printable page (escaping, markup lines).
+Round 9: hourly rate + currency per client, active time per session
+counted only inside the month (local dates, a session past midnight on
+the 31st is split), project subtotals, CSV time columns + UTF-8 BOM,
+ASCII file names for clients with diacritics."""
+import sys, os, re, json, sqlite3, tempfile, shutil, csv, io, time, calendar
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -14,8 +18,10 @@ c = Checker()
 data = tempfile.mkdtemp(prefix="aoc_cl_")
 ns = exec_functions(["_load_json_file", "CLIENTS_FILE", "_CLIENT_NONE", "_sanitize_clients", "_load_clients",
                      "_save_clients", "_client_for", "_client_report", "_client_report_csv",
-                     "_client_report_print_html"],
-                    {"os": os, "json": json, "datetime": datetime, "AOC_DATA_DIR": data})
+                     "_client_report_print_html", "_CLIENT_CURRENCY", "_BILL_STEP_H", "_billable_hours", "_csv_dec", "_client_file_slug", "_iso_to_epoch",
+                     "_WORKLOG_GAP_S", "_WORKLOG_HOME_GROUP", "_worklog_active_s", "_worklog_project"],
+                    {"os": os, "re": re, "json": json, "time": time, "calendar": calendar, "datetime": datetime,
+                     "AOC_DATA_DIR": data})
 
 # ── sanitize ──
 san = ns["_sanitize_clients"]
@@ -53,6 +59,7 @@ CREATE TABLE sessions_meta (session_id TEXT PRIMARY KEY, project TEXT, cwd TEXT,
                             last_call_epoch REAL, run_cost REAL);
 CREATE TABLE commits (session_id TEXT, sha TEXT, kind TEXT, branch TEXT, subject TEXT, cwd TEXT, ts TEXT, epoch REAL,
                       end_epoch REAL, day TEXT, cost_at REAL, files INT, ins INT, dels INT);
+CREATE TABLE msgs (session_id TEXT, ts TEXT, role TEXT, text TEXT);
 """)
 U = lambda sid, day, cost, tok=1000, model="opus": conn.execute(
     "INSERT INTO usage VALUES (?,?,?,1,?,0,0,0,0,?,0,0,0,0)", (sid, model, day, tok, cost))
@@ -93,13 +100,14 @@ c.check("months available, newest first", rep["months"] == ["2026-10", "2026-09"
 c.check("empty month -> zero, no crash", ns["_client_report"](conn, "2025-01", cfg)["total"] == 0)
 
 # ── CSV ──
-rows = list(csv.reader(io.StringIO(ns["_client_report_csv"](rep))))
-c.check("CSV header", rows[0][:3] == ["month", "client", "session"] and rows[0][-1] == "billed_usd")
+rows = list(csv.reader(io.StringIO(ns["_client_report_csv"](rep)), delimiter=";"))
+c.check("CSV header (time columns appended after billed_usd)", rows[0][:3] == ["month", "client", "session"]
+        and rows[0][11] == "billed_usd" and rows[0][12:] == ["project", "hours", "rate", "currency", "time_amount"])
 c.check("CSV: session lines + one TOTAL per client with sessions", sum(1 for r in rows if r[2] == "TOTAL") == 3)
 omni_total = next(r for r in rows if r[1] == "Omni Social" and r[2] == "TOTAL")
-c.check("CSV total with markup", omni_total[9] == "16.50" and omni_total[10] == "20" and omni_total[11] == "19.80")
+c.check("CSV total with markup", omni_total[9] == "16,50" and omni_total[10] == "20" and omni_total[11] == "19,80")
 c.check("CSV unassigned named", any(r[1] == "(unassigned)" for r in rows))
-one = list(csv.reader(io.StringIO(ns["_client_report_csv"](rep, "Phantom"))))
+one = list(csv.reader(io.StringIO(ns["_client_report_csv"](rep, "Phantom")), delimiter=";"))
 c.check("CSV for one client", {r[1] for r in one[1:]} == {"Phantom"} and len(one) == 4)
 
 # ── printable page ──
@@ -110,6 +118,94 @@ c.check("print: date range shown", "2026-10-02 – 2026-10-03" in h)
 h = ns["_client_report_print_html"](rep, "")
 c.check("print: unassigned, titles escaped", "Unassigned sessions" in h and "Random &lt;question&gt;" in h and "<question>" not in h)
 c.check("print: unknown client", "No client named" in ns["_client_report_print_html"](rep, "<x>") and "&lt;x&gt;" in ns["_client_report_print_html"](rep, "<x>"))
+
+# ── round 9: rate, currency, active time, projects, BOM ──
+cfg9 = san({"clients": [{"name": "Čajovňa Ľubo", "match": ["cajovna"], "rate": "45.5", "currency": "eur"},
+                        {"name": "US Co", "match": ["usco"], "rate": 100, "currency": "USD", "markup": 10},
+                        {"name": "Bad", "match": ["bad"], "rate": -5, "currency": "euro"},
+                        {"name": "Nan", "match": ["nan"], "rate": "nan"}]})
+by9 = {x["name"]: x for x in cfg9["clients"]}
+c.check("rate parsed, currency upper-cased", by9["Čajovňa Ľubo"]["rate"] == 45.5 and by9["Čajovňa Ľubo"]["currency"] == "EUR")
+c.check("bad rate -> 0, bad currency -> EUR default", by9["Bad"]["rate"] == 0 and by9["Bad"]["currency"] == "EUR"
+        and by9["Nan"]["rate"] == 0)
+c.check("old config without rate -> rate 0, EUR", cfg["clients"][0]["rate"] == 0 and cfg["clients"][0]["currency"] == "EUR")
+
+
+def local_iso(y, mo, d, h, mi):
+    """UTC ISO timestamp (as transcripts store it) of a LOCAL wall-clock time."""
+    ep = time.mktime((y, mo, d, h, mi, 0, 0, 0, -1))
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ep)), ep
+
+
+conn9 = sqlite3.connect(":memory:")
+for (sql,) in conn.execute("SELECT sql FROM sqlite_master WHERE type='table'").fetchall():
+    conn9.execute(sql)
+U9 = lambda sid, day, cost: conn9.execute("INSERT INTO usage VALUES (?,?,?,1,1000,0,0,0,0,?,0,0,0,0)", (sid, "opus", day, cost))
+M9 = lambda sid, *t: conn9.execute("INSERT INTO msgs VALUES (?,?,?,?)", (sid, local_iso(*t)[0], "user", "x"))
+# a session over midnight 31 Oct -> 1 Nov: 23:50, 23:55 | 00:02, 00:05
+U9("tea1", "2026-10-31", 6.0); U9("tea1", "2026-11-01", 2.0)
+for t in [(2026, 10, 31, 23, 50), (2026, 10, 31, 23, 55), (2026, 11, 1, 0, 2), (2026, 11, 1, 0, 5)]:
+    M9("tea1", *t)
+# a second project for the same client: a 2 h pause counts as the gap only, a commit 4 min after the last message extends the work
+U9("tea2", "2026-10-10", 1.0)
+for t in [(2026, 10, 10, 9, 0), (2026, 10, 10, 9, 20), (2026, 10, 10, 11, 20), (2026, 10, 10, 11, 30)]:
+    M9("tea2", *t)
+conn9.execute("INSERT INTO commits (session_id, sha, cwd, day, epoch) VALUES (?,?,?,?,?)",
+              ("tea2", "d1", "C:/p/cajovna-eshop", "2026-10-10", local_iso(2026, 10, 10, 11, 34)[1]))
+U9("us1", "2026-10-12", 10.0)
+for t in [(2026, 10, 12, 14, 0), (2026, 10, 12, 14, 30)]:
+    M9("us1", *t)
+for row in [("tea1", "home", "C:/Users/marek", "Cajovna menu"), ("tea2", "x", "C:/p/whatever", "cajovna eshop"),
+            ("us1", "usco", "C:/p/usco-api", "usco api")]:
+    conn9.execute("INSERT INTO sessions_meta (session_id, project, cwd, title) VALUES (?,?,?,?)", row)
+oct9 = {g["name"]: g for g in ns["_client_report"](conn9, "2026-10", cfg9, "C:/Users/marek")["clients"]}
+nov9 = {g["name"]: g for g in ns["_client_report"](conn9, "2026-11", cfg9, "C:/Users/marek")["clients"]}
+tea_o = {s["id"]: s for s in oct9["Čajovňa Ľubo"]["sessions"]}
+# every gap counts up to 10 min: 9:00-9:20 -> 10, 9:20-11:20 -> 10, 11:20-11:30 -> 10, 11:30-11:34 commit -> 4
+TEA2 = (10 + 10 + 10 + 4) * 60
+c.check("midnight session: October gets only its October minutes", tea_o["tea1"]["active_s"] == 300)
+c.check("midnight session: November gets the rest", nov9["Čajovňa Ľubo"]["sessions"][0]["active_s"] == 180)
+c.check("a pause over the gap counts as the gap; the commit extends the work", tea_o["tea2"]["active_s"] == TEA2)
+g9 = oct9["Čajovňa Ľubo"]
+c.check("client hours + time amount at its rate", g9["active_s"] == 300 + TEA2 and g9["hours"] == 0.75
+        and g9["time_amount"] == round(0.75 * 45.5, 2) and g9["currency"] == "EUR")
+c.check("projects: committed repo first, home folder grouped last",
+        [p["name"] for p in g9["projects"]] == ["cajovna-eshop", "Other (home folder)"]
+        and g9["projects"][1]["active_s"] == 300 and g9["projects"][0]["sessions"] == 1)
+c.check("session carries its work project", tea_o["tea2"]["work_project"] == "cajovna-eshop")
+c.check("client without time -> 0 h, 0 amount", oct9["Bad"]["active_s"] == 0 and oct9["Bad"]["time_amount"] == 0)
+
+raw = ns["_client_report_csv"]({"month": "2026-10", "clients": list(oct9.values())}, "Čajovňa Ľubo", bom=True)
+c.check("CSV with BOM for Excel, diacritics intact", raw.startswith("\ufeffmonth;client;") and "Čajovňa Ľubo" in raw)
+c.check("CSV rows end in CRLF, no blank lines", "\r\n" in raw and "\r\r" not in raw and "\n\n" not in raw.replace("\r\n", "\n"))
+r9 = list(csv.reader(io.StringIO(raw.lstrip("\ufeff")), delimiter=";"))
+tot = next(r for r in r9 if r[2] == "TOTAL")
+c.check("CSV total: hours, rate, currency, time amount", tot[13] == "0,75" and tot[14] == "45,5"
+        and tot[15] == "EUR" and tot[16] == f"{round(0.75 * 45.5, 2):.2f}".replace(".", ","))
+row2 = next(r for r in r9 if r[3] == "tea2")
+c.check("CSV session: project + hours", row2[12] == "cajovna-eshop" and row2[13] == f"{TEA2 / 3600:.2f}".replace(".", ","))
+c.check("no BOM unless asked", not ns["_client_report_csv"](rep).startswith("\ufeff"))
+
+bh = ns["_billable_hours"]
+c.check("billable hours: a started quarter hour counts, exact quarters stay", bh(0) == 0 and bh(None) == 0 and bh(1) == 0.25
+        and bh(900) == 0.25 and bh(901) == 0.5 and bh(3600) == 1.0 and bh(2340) == 0.75)
+c.check("CSV decimal comma", ns["_csv_dec"](12.5) == "12,50" and ns["_csv_dec"](45.5, "g") == "45,5"
+        and ns["_csv_dec"](20, "g") == "20")
+
+slug = ns["_client_file_slug"]
+c.check("file slug drops diacritics, keeps letters", slug("Čajovňa Ľubo s.r.o.") == "Cajovna-Lubo-s.r.o" and slug(None) == "all"
+        and slug("日本") == "client")
+
+h9 = ns["_client_report_print_html"]({"month": "2026-10", "clients": list(oct9.values())}, "Čajovňa Ľubo")
+c.check("print: time column as h:mm, locale-free", "<th class=n>Time</th>" in h9 and ">0:34<" in h9 and ">0:05<" in h9
+        and "(0:39, rounded up to 0.25 h)" in h9 and ">0.75 h<" in h9)
+c.check("print: project subtotals when 2+ projects", "<h2>By project</h2>" in h9 and "cajovna-eshop" in h9)
+c.check("print: work time in the client's currency, no USD grand total", "Work time" in h9
+        and f"{round(0.75 * 45.5, 2):,.2f} EUR" in h9 and "45.50 EUR/h" in h9 and "Total due" not in h9)
+hu = ns["_client_report_print_html"]({"month": "2026-10", "clients": list(oct9.values())}, "US Co")
+c.check("print: USD rate -> one total due (AI billed + time)", "Total due" in hu and f"{11.0 + 0.25 * 100:,.2f} USD" in hu
+        and "<h2>By project</h2>" not in hu)
+c.check("print: no rate -> no work time block", "Work time" not in ns["_client_report_print_html"](rep, "Omni Social"))
 
 shutil.rmtree(data, ignore_errors=True)
 c.finish()

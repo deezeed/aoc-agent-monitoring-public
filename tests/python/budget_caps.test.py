@@ -8,7 +8,7 @@ import sys, os, json, shutil, sqlite3, tempfile, threading, re
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
-from lib.extract import exec_functions
+from lib.extract import exec_functions, read_monitor_source
 from lib.check import Checker
 
 c = Checker()
@@ -91,7 +91,7 @@ c.check("today = saved rows + live cost replacing the saved one",
         abs(ns["_budget_today_spend"]([("live1", 4.5), ("live2", 2.0)], "2026-10-13") - 9.5) < 1e-9)
 
 # ── the real handler: /hook/pretool without a token, loopback only ──
-mon = open(os.path.join(os.path.dirname(__file__), "..", "..", "monitor.py"), encoding="utf-8").read()
+mon = read_monitor_source()
 c.check("do_POST answers /hook/pretool before the auth check",
         mon.index('== "/hook/pretool" and self._is_direct_loopback()') < mon.index("if not self._check_auth():", mon.index("    def do_POST(self):")))
 

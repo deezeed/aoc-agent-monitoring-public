@@ -48,7 +48,7 @@ c.check('agent label falls back to id when name is empty', agents.some(x => x.la
 c.check('agent sub includes its status', agents.some(x => x.sub === 'Agent · running') && agents.some(x => x.sub === 'Agent · done'));
 
 c.check('exactly 7 Settings entries', out.filter(x => x.sub === 'Settings').length === 7);
-c.check('exactly 13 View entries (Command Center + Inbox)', out.filter(x => x.sub === 'View').length === 13);
+c.check('exactly 14 View entries (Command Center + Inbox + Orchestrate)', out.filter(x => x.sub === 'View').length === 14);
 c.check('Today is a palette view', out.some(x => x.sub === 'View' && x.label === 'View → Today'));
 c.check('every candidate has a run descriptor', out.every(x => Array.isArray(x.run) && typeof x.run[0] === 'string'));
 

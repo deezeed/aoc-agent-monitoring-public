@@ -6,7 +6,7 @@ Extracted straight from monitor.py; files live in a temp dir."""
 import sys, os, json, tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(__file__))
-from lib.extract import exec_functions, read_monitor_source
+from lib.extract import exec_functions, read_monitor_source, read_web_source
 from lib.check import Checker
 
 c = Checker()
@@ -69,6 +69,6 @@ c.check("tail: last lines + path + mtime", t["text"] == "line 97\nline 98\nline 
 
 src = read_monitor_source()
 c.check("startup records the version change", "change = _version_change_entry(prev, installed)" in src)
-c.check("Health asks /update/status", "fetch('/update/status')" in src)
+c.check("Health asks /update/status", "fetch('/update/status')" in read_web_source())
 c.check("no logging errors", errors == [])
 c.finish()

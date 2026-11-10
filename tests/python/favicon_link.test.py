@@ -7,12 +7,12 @@ bring either half back."""
 import os, re, sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from lib.extract import read_monitor_source
+from lib.extract import read_monitor_source, read_web_source
 from lib.check import Checker
 
-src = read_monitor_source()
-head = src[src.index('HTML = r"""'):]
-head = head[:head.index("</head>") if "</head>" in head else head.index("<style>")]
+web = read_web_source()
+src = web + read_monitor_source()
+head = web[:web.index("</head>")]
 
 c = Checker()
 c.check("page head declares a real rel=icon link", '<link rel="icon"' in head)

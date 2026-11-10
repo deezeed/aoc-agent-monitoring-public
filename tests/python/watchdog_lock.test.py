@@ -66,6 +66,27 @@ try:
 
     logs.clear()
 
+    # --- a live watchdog holds the lock: logged, unless sentinel's routine revive attempt ---
+    live_pid_file = os.path.join(SCRATCH, "live.pid")
+    with open(live_pid_file, "w") as f:
+        f.write("4242")
+    ns4 = exec_functions(["_acquire_lock"], {
+        "os": os, "PID_FILE": live_pid_file, "_log": fake_log,
+        "_is_python_process": lambda pid: True, "sys": sys,
+    }, path=WATCHDOG_PATH)
+    c.check("another live watchdog -> lock refused", ns4["_acquire_lock"]() is False)
+    c.check("a second watchdog started by hand is logged", any("Another watchdog appears to be running (PID 4242)" in m for m in logs))
+    logs.clear()
+    c.check("sentinel's launch (quiet) -> still refused", ns4["_acquire_lock"](quiet=True) is False)
+    c.check("sentinel's launch finding it alive -> nothing in watchdog.log", logs == [])
+    with open(live_pid_file) as f:
+        c.check("the live watchdog's PID file is left alone", f.read().strip() == "4242")
+    with open(os.path.join(os.path.dirname(WATCHDOG_PATH), "sentinel.py"), encoding="utf-8") as f:
+        c.check("sentinel.py passes --from-sentinel", '"--from-sentinel"' in f.read())
+    with open(WATCHDOG_PATH, encoding="utf-8") as f:
+        c.check("watchdog.py main() reads --from-sentinel", '_acquire_lock(quiet="--from-sentinel" in sys.argv)' in f.read())
+    logs.clear()
+
     # --- _release_lock: file already gone -- os.remove raises FileNotFoundError ---
     ns3 = exec_functions(["_release_lock"], {
         "os": os,

@@ -14,7 +14,8 @@ c = Checker()
 spawned = []
 ns = exec_functions(["_restart_blockers", "_restart_aoc"],
                     {"os": os, "sys": sys, "AOC_DIR": "C:\\aoc", "_perm_requests": {}, "_tunnel_status": ["off"],
-                     "_update_job": {"state": "idle"}, "_hooks_health": {"repairing": False}})
+                     "_update_job": {"state": "idle"}, "_hooks_health": {"repairing": False},
+                     "_release_job": {"state": "idle"}})
 r = ns["_restart_aoc"](spawn=lambda args, cwd: spawned.append((args, cwd)))
 c.check("nothing held -> restarts", r == {"ok": True, "blockers": []} and len(spawned) == 1)
 args, cwd = spawned[0]

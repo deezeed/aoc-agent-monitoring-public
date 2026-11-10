@@ -4,7 +4,7 @@ const { readMonitorSource, extractFunction } = require('./lib/extract');
 const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
-for (const f of ['escHtml', '_updateStatusHtml', '_restartConfirmText']) eval(extractFunction(src, f));
+for (const f of ['escHtml', '_updateStatusHtml', '_restartConfirmText', '_repairResultSentence']) eval(extractFunction(src, f));
 const c = new Checker();
 const now = 1_800_000_000;
 
@@ -30,4 +30,12 @@ c.check('dev checkout: commits behind, no empty-history note', h.includes('Dev c
 
 const t = _restartConfirmText(['1 prompt(s) waiting for your OK', 'remote tunnel is open']);
 c.check('restart confirm names what is dropped', t.includes('1 prompt(s) waiting for your OK; remote tunnel is open') && t.includes('dropped'));
+// automatic hook repair entries in the history
+const repU = { mode: 'release', installed: '1.0.500', self_update: {}, job: {}, history: [
+  { t: 1000, outcome: 'repaired', state: 'fixed', fixed: ['Hook scripts in ~/.claude/hooks'], left: [], error: '', via: 'auto-repair' },
+  { t: 1000, outcome: 'repair_failed', state: 'failed', fixed: [], left: ['Budget caps'], error: 'Timeout <x>', via: 'auto-repair' }] };
+const rh = _updateStatusHtml(repU, 1060);
+c.check('auto repair row: fixed, names what', /hh-row ok[^]*Hooks repaired automatically[^]*Hook scripts in ~\/.claude\/hooks/.test(rh));
+c.check('auto repair row: failed, error escaped', rh.includes('not finished') && rh.includes('Timeout &lt;x&gt;'));
+c.check('auto repair rows are not shown as failed updates', !rh.includes('Update to'));
 c.finish();

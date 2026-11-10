@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#16201e">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<title>AOC — Agent Operations Center</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="root">
+
+  <!-- TOP BAR -->
+  <div id="reconnect-overlay">
+    <div class="ro-icon"></div>
+    <div class="ro-text">RECONNECTING...</div>
+  </div>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="logo-wrap">
+      <svg class="logo-mark" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <!-- hex outer border -->
+        <polygon points="26,3 48,15 48,37 26,49 4,37 4,15"
+                 stroke="rgba(var(--c-rgb),0.55)" stroke-width="1.5"
+                 fill="rgba(var(--c-rgb),0.07)"/>
+        <!-- dashed radar ring outer -->
+        <circle cx="26" cy="26" r="17" stroke="rgba(var(--c-rgb),0.22)" stroke-width="0.8"
+                stroke-dasharray="2.8 2.2" fill="none"/>
+        <!-- mid ring -->
+        <circle cx="26" cy="26" r="11" stroke="rgba(var(--c-rgb),0.38)" stroke-width="0.8" fill="none"/>
+        <!-- inner ring -->
+        <circle cx="26" cy="26" r="5.5" stroke="rgba(var(--c-rgb),0.28)" stroke-width="0.6" fill="none"/>
+        <!-- cardinal ticks -->
+        <line x1="26" y1="5" x2="26" y2="10" stroke="rgba(var(--c-rgb),0.65)" stroke-width="1"/>
+        <line x1="26" y1="42" x2="26" y2="47" stroke="rgba(var(--c-rgb),0.65)" stroke-width="1"/>
+        <line x1="5" y1="26" x2="10" y2="26" stroke="rgba(var(--c-rgb),0.65)" stroke-width="1"/>
+        <line x1="42" y1="26" x2="47" y2="26" stroke="rgba(var(--c-rgb),0.65)" stroke-width="1"/>
+        <!-- diagonal ticks -->
+        <line x1="10" y1="10" x2="13" y2="13" stroke="rgba(var(--c-rgb),0.3)" stroke-width="0.8"/>
+        <line x1="42" y1="10" x2="39" y2="13" stroke="rgba(var(--c-rgb),0.3)" stroke-width="0.8"/>
+        <line x1="10" y1="42" x2="13" y2="39" stroke="rgba(var(--c-rgb),0.3)" stroke-width="0.8"/>
+        <line x1="42" y1="42" x2="39" y2="39" stroke="rgba(var(--c-rgb),0.3)" stroke-width="0.8"/>
+        <!-- rotating sweep group -->
+        <g>
+          <animateTransform attributeName="transform" type="rotate"
+                            from="0 26 26" to="360 26 26"
+                            dur="4s" repeatCount="indefinite"/>
+          <!-- main sweep line -->
+          <line x1="26" y1="26" x2="43" y2="26"
+                stroke="var(--c)" stroke-width="1.6" stroke-linecap="round"/>
+          <!-- trail lines -->
+          <line x1="26" y1="26" x2="41" y2="21"
+                stroke="rgba(var(--c-rgb),0.45)" stroke-width="0.9" stroke-linecap="round"/>
+          <line x1="26" y1="26" x2="37" y2="17"
+                stroke="rgba(var(--c-rgb),0.2)" stroke-width="0.7" stroke-linecap="round"/>
+        </g>
+        <!-- blip 1 — near, 1-o'clock -->
+        <circle cx="26" cy="15" r="1.8" fill="var(--c)">
+          <animate attributeName="fill-opacity" values="0;1;1;0" dur="4s" begin="0.9s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="1.8;2.6;1.8" dur="4s" begin="0.9s" repeatCount="indefinite"/>
+        </circle>
+        <!-- blip 2 — mid, 2-o'clock -->
+        <circle cx="36" cy="18" r="1.3" fill="var(--c)">
+          <animate attributeName="fill-opacity" values="0;0.8;0.8;0" dur="4s" begin="2.1s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="1.3;2;1.3" dur="4s" begin="2.1s" repeatCount="indefinite"/>
+        </circle>
+        <!-- blip 3 — far, 7-o'clock -->
+        <circle cx="17" cy="34" r="1" fill="var(--c)">
+          <animate attributeName="fill-opacity" values="0;0.65;0.65;0" dur="4s" begin="3.3s" repeatCount="indefinite"/>
+        </circle>
+        <!-- center dot with pulse -->
+        <circle cx="26" cy="26" r="3" fill="var(--c)">
+          <animate attributeName="r" values="3;4;3" dur="2s" repeatCount="indefinite"/>
+          <animate attributeName="fill-opacity" values="1;0.6;1" dur="2s" repeatCount="indefinite"/>
+        </circle>
+        <!-- center pulse ring -->
+        <circle cx="26" cy="26" r="5" stroke="var(--c)" stroke-width="0.8" fill="none">
+          <animate attributeName="r" values="4;7;4" dur="2s" repeatCount="indefinite"/>
+          <animate attributeName="stroke-opacity" values="0.5;0;0.5" dur="2s" repeatCount="indefinite"/>
+        </circle>
+      </svg>
+      <div class="logo-text">
+        <div class="t1">AOC</div>
+        <div class="t2">AGENT OPERATIONS CENTER</div>
+      </div>
+    </div>
+
+    <nav class="sb-nav">
+      <button class="vtbtn" id="vt-command" onclick="setView('command')" title="Command Center: everything at a glance"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg><span>Command Center</span></button>
+      <button class="vtbtn" id="vt-today" onclick="setView('today')" title="Today: what needs you, what's running, today's spend and commits (Y)"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg><span>Today</span><b class="sb-badge" id="sb-n-today"></b></button>
+      <button class="vtbtn" id="vt-inbox" onclick="setView('inbox')" title="Inbox: everything that needs you, with one-tap answers (J)"><svg viewBox="0 0 24 24"><path d="M3 13l3-8h12l3 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 13h5l1.5 3h5l1.5-3h5"/></svg><span>Inbox</span><b class="sb-badge" id="sb-n-inbox"></b></button>
+      <button class="vtbtn" id="vt-orch" onclick="setView('orch')" title="Orchestrate: a goal, a plan of specialised agents, parallel work, your merge"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="19" r="2.5"/><circle cx="19" cy="19" r="2.5"/><path d="M12 7.5v4M12 11.5l-5.5 5.5M12 11.5l5.5 5.5"/></svg><span>Orchestrate</span><b class="sb-badge" id="sb-n-orch"></b></button>
+      <button class="vtbtn" id="vt-agents" onclick="setView('agents')" title="Live agents"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Agents</span><b class="sb-badge" id="sb-n-agents"></b></button>
+      <button class="vtbtn" id="vt-cli" onclick="setView('cli')" title="Claude Code sessions (CLI)"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg><span>Sessions</span><b class="sb-badge" id="sb-n-cli"></b></button>
+      <button class="vtbtn" id="vt-views" onclick="setView(_vizView)" title="Live views: timeline (T), graph (G), heat map (X), agent tree (W)"><svg viewBox="0 0 24 24"><path d="M3 12h18"/><circle cx="7" cy="12" r="2"/><circle cx="14" cy="12" r="2"/><path d="M7 6v4M14 14v4M19 8v8"/></svg><span>Views</span></button>
+      <button class="vtbtn" id="vt-summary" onclick="setView('summary')" title="Summary"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Summary</span></button>
+      <div class="sb-sep"></div>
+      <button class="vtbtn" id="vt-history" onclick="setView('history')" title="Session history, analytics, cache, failures, permissions"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg><span>History</span></button>
+      <button class="vtbtn" id="vt-diag" onclick="setView('diag')" title="Health"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span>Health</span></button>
+      <button class="vtbtn term-btn" id="vt-term" onclick="setView('term')" title="Terminal"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Terminal</span></button>
+    </nav>
+    <div class="sb-attn" id="sb-attn">
+      <div class="sb-attn-h">NEEDS YOU</div>
+      <span class="sb-wave"><i style="height:30%"></i><i style="height:55%"></i><i style="height:40%"></i><i style="height:80%"></i><i style="height:60%"></i><i style="height:95%"></i><i style="height:50%"></i><i style="height:70%"></i><i style="height:35%"></i><i style="height:85%"></i><i style="height:45%"></i><i style="height:65%"></i><i style="height:30%"></i><i style="height:75%"></i><i style="height:50%"></i><i style="height:90%"></i><i style="height:40%"></i><i style="height:60%"></i><i style="height:30%"></i><i style="height:50%"></i></span>
+      <div class="sb-attn-ring" id="sb-attn-n" onclick="setView('today')" title="Open Today">0</div>
+      <div class="sb-attn-txt" id="sb-attn-txt">No session open</div>
+    </div>
+    <button class="sb-focus" onclick="toggleRightPanel()" title="Hide or show the right panel [P]"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span>Focus mode</span></button>
+  </aside>
+
+  <div class="topbar">
+    <div class="cc-pill ok" id="cc-pill"><span>SYSTEM STATUS</span><b><i></i>OPTIMAL</b></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-run">—</div><div class="lbl">Online</div></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-done">—</div><div class="lbl">Done</div></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-tasks">—</div><div class="lbl">Tasks</div></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-files">—</div><div class="lbl">Files</div></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-clis" style="color:var(--c)">—</div><div class="lbl">CLIs</div></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-errors" style="color:var(--t3)">—</div><div class="lbl">Errors</div></div>
+    <div class="divider"></div>
+    <div class="top-stat"><div class="val" id="s-elapsed" style="font-size:13px">—</div><div class="lbl">Duration</div></div>
+    <div class="divider rl-part" style="display:none"></div>
+    <div class="top-stat rl-part rl-stat" id="rl-stat" style="display:none" title="">
+      <div class="val" id="rl-val">—</div>
+      <div class="rl-meter"><i id="rl-fill"></i><b id="rl-proj"></b></div>
+      <div class="lbl" id="rl-lbl">5h limit</div>
+    </div>
+
+    <div class="topbar-right">
+      <button class="cc-search" onclick="openPalette()" title="Command palette (Ctrl+K)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><span>Search…</span><kbd>Ctrl K</kbd></button>
+      <button class="btn-reset" id="btn-reset" onclick="resetSession()" title="Reset session">
+        <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        <span class="btn-reset-lbl">RESET SESSION</span>
+      </button>
+      <div id="tunnel-badge" style="display:none;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;background:rgba(var(--c-rgb),.1);border:1px solid rgba(var(--c-rgb),.25);cursor:pointer;transition:background .2s" onclick="openSettings()" title="Cloudflare Tunnel active — click for URL">
+        <span style="width:6px;height:6px;border-radius:50%;background:rgba(var(--c-rgb),1);box-shadow:0 0 6px rgba(var(--c-rgb),.8);animation:pulse 2s infinite;flex-shrink:0"></span>
+        <span id="tunnel-badge-lbl" style="font-family:var(--font2);font-size:9px;color:rgba(var(--c-rgb),.9);letter-spacing:.05em;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      </div>
+      <div id="selfupdate-badge" style="display:none;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;background:rgba(224,161,58,.1);border:1px solid rgba(224,161,58,.3);cursor:default" title="">
+        <span style="width:6px;height:6px;border-radius:50%;background:var(--o);flex-shrink:0"></span>
+        <span id="selfupdate-badge-lbl" style="font-family:var(--font2);font-size:9px;color:var(--o);letter-spacing:.05em;white-space:nowrap">UPDATE AVAILABLE</span>
+      </div>
+      <div id="infra-badge" style="display:none;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;background:rgba(204,26,53,.1);border:1px solid rgba(204,26,53,.3);cursor:pointer" onclick="openSettings();setSettingsTab('infra')" title="">
+        <span style="width:6px;height:6px;border-radius:50%;background:var(--r);flex-shrink:0"></span>
+        <span id="infra-badge-lbl" style="font-family:var(--font2);font-size:9px;color:var(--r);letter-spacing:.05em;white-space:nowrap">WATCHDOG DOWN</span>
+      </div>
+      <span class="pe-presence" id="pe-presence"></span>
+      <button class="btn-mute" id="btn-shared" onclick="sharedToggle()" title="Shared sessions: work in one Claude Code terminal together">🤝</button>
+      <button class="btn-mute muted" id="btn-voice" onclick="voiceToggle()" title="Voice assistant">🎙</button>
+      <button class="btn-mute" id="btn-settings" onclick="openSettings()" title="Settings [,]">⚙</button>
+      <button class="btn-mute" id="btn-notes" onclick="openNotesPanel()" title="Session notes [O]">📝</button>
+      <button class="btn-mute" id="btn-fs" onclick="toggleFullscreen()" title="Fullscreen [Z]">⛶</button>
+      <button class="btn-mute" id="btn-mute" onclick="openSoundPanel()" title="Sound settings">🔊</button>
+      <button class="btn-mute" id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark theme [H]">🌙</button>
+      <button class="btn-mute" id="btn-notif" onclick="openNotifPanel()" title="Notification history [N]">🔔<span class="notif-badge" id="notif-badge" style="display:none">0</span></button>
+      <div class="divider"></div>
+      <div class="status-online" id="conn-status">
+        <div class="dot"></div><span id="conn-label">SYSTEM ONLINE</span>
+      </div>
+      <div class="divider"></div>
+      <div class="clock">
+        <div class="clock-time" id="clock">--:--:--</div>
+        <div class="clock-date" id="cdate">----.--.--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main" id="main-area">
+    <div class="kpi-bar" id="kpi-bar">
+      <div class="kpi-card" title="Agents currently running">
+        <div class="kpi-val" id="kpi-running">0</div>
+        <div class="kpi-lbl">RUNNING</div>
+      </div>
+      <div class="kpi-sep"></div>
+      <div class="kpi-card" title="Active CLI sessions">
+        <div class="kpi-val" id="kpi-sessions" style="color:var(--c)">—</div>
+        <div class="kpi-lbl">SESSIONS</div>
+      </div>
+      <div class="kpi-sep"></div>
+      <div class="kpi-card" title="Agents with errors">
+        <div class="kpi-val" id="kpi-errors" style="color:var(--t3)">—</div>
+        <div class="kpi-lbl">ERRORS</div>
+      </div>
+      <div class="kpi-sep"></div>
+      <div class="kpi-card" title="Today's agent success rate (done / total)">
+        <div class="kpi-val" id="kpi-success" style="color:var(--t3)">—</div>
+        <div class="kpi-lbl">SUCCESS</div>
+      </div>
+      <div class="kpi-card kpi-card-cost" id="kpi-cost-card" title="Live session cost — set budget in Settings">
+        <svg class="cost-gauge-svg" id="cost-gauge-svg" viewBox="0 0 70 34">
+          <path d="M 7 32 A 28 28 0 0 0 63 32" stroke="rgba(255,255,255,.09)" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+          <path id="cost-gauge-arc" d="M 7 32 A 28 28 0 0 0 63 32" stroke="rgba(76,194,133,.85)" stroke-width="4.5" fill="none" stroke-linecap="round" stroke-dasharray="88 89" stroke-dashoffset="88" style="transition:stroke-dashoffset .6s ease,stroke .3s"/>
+          <text id="kpi-cost" x="35" y="25" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="12" font-weight="800" fill="rgba(76,194,133,.9)" style="transition:fill .3s">$0.000</text>
+          <text id="cost-gauge-tok" x="35" y="33" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="7" fill="rgba(255,255,255,.28)">— tok</text>
+        </svg>
+        <div class="kpi-lbl">SESSION COST</div>
+      </div>
+      <div class="kpi-sep"></div>
+      <div class="kpi-card" title="Total agents tracked all time">
+        <div class="kpi-val" id="kpi-total">—</div>
+        <div class="kpi-lbl">ALL TIME</div>
+      </div>
+    </div>
+    <div id="waiting-strip" class="woy-strip" style="display:none"></div>
+    <div id="top-projects-bar" style="display:none;gap:10px;padding:0 0 10px;flex-shrink:0;font-family:var(--font2);font-size:10px;color:var(--t3);align-items:center;flex-wrap:wrap"></div>
+    <div id="cards-area">
+      <div id="sweep-bar" style="display:flex;gap:6px;padding:0 0 10px;flex-shrink:0">
+        <button class="stab" id="btn-sweep-stale" onclick="sweepStaleSessions()" style="margin-left:auto;display:none;color:var(--t3)" title="Dismiss all idle CLI sessions at once">SWEEP&nbsp;<span id="sweep-stale-n" style="opacity:.55;font-weight:400"></span></button>
+      </div>
+      <div class="search-wrap" id="search-wrap" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input class="search-input" id="search-input" type="text" placeholder="Search agents..." oninput="setSearch(this.value)">
+        <button class="search-clear" id="search-clear" onclick="setSearch('')">✕</button>
+      </div>
+      <div id="session-tab-bar" style="display:none;gap:4px;padding:0 0 6px;flex-wrap:wrap"></div>
+      <div id="status-filter-bar" style="display:none;gap:6px;padding:0 0 8px;flex-wrap:wrap"></div>
+      <div class="agents" id="agents"></div>
+    </div>
+    <div id="command-area" style="display:none"></div>
+    <div id="today-area" style="display:none"></div>
+    <div id="inbox-area" style="display:none"></div>
+    <div id="orch-area" style="display:none"></div>
+    <div id="viz-switch" class="viz-switch" style="display:none"></div>
+    <div id="timeline-area" style="display:none"></div>
+    <div id="summary-area" style="display:none;flex-direction:column;gap:0;flex:1;align-items:center"></div>
+    <div id="graph-area"   style="display:none;flex:1;align-items:center;justify-content:center;padding:20px;overflow:auto;min-height:0"></div>
+    <div id="heat-area"    style="display:none;flex:1;overflow-y:auto;padding:20px 24px;flex-direction:column;align-items:center"></div>
+    <div id="diag-area"    style="display:none;flex:1;overflow-y:auto;padding:20px 24px"></div>
+    <div id="tree-area"    style="display:none;flex:1;overflow:auto;padding:20px 24px;display:flex;align-items:flex-start;justify-content:center"></div>
+    <div id="history-area" style="display:none;flex:1;flex-direction:column;min-height:0"></div>
+    <div id="term-area">
+      <div id="term-toolbar">
+        <span class="tt-title">▶ TERMINAL</span>
+        <span class="tt-git" id="term-git"></span>
+        <div style="flex:1"></div>
+        <button class="adp-btn tt-btn" onclick="_termNew_pub()" title="New shell session">+ SHELL</button>
+        <button class="adp-btn tt-btn tt-claude" onclick="_termClaude()" title="Launch Claude CLI in new session">◈ CLAUDE</button>
+        <button class="adp-btn tt-btn" onclick="_termClearActive()" title="Clear active terminal">⊘ CLEAR</button>
+        <button class="adp-btn tt-btn" onclick="_termKillActive()" title="Kill active session">⊗ KILL</button>
+      </div>
+      <div id="term-tabs"></div>
+      <div id="xterm-area"></div>
+    </div>
+    <div id="audit-area"   style="display:none;flex:1;flex-direction:column;min-height:0">
+      <div style="display:flex;align-items:center;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0">
+        <div class="adp-tabs" style="flex:1;border-bottom:none" role="tablist">
+          <div class="adp-tab active" id="audt-log"   role="tab" aria-selected="true"  tabindex="0" onclick="setAuditTab('log')">LOG</div>
+          <div class="adp-tab"        id="audt-files" role="tab" aria-selected="false" tabindex="0" onclick="setAuditTab('files')">FILES</div>
+        </div>
+        <span id="al-fname" style="color:var(--t3);font-size:9px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;max-width:180px;padding:0 8px"></span>
+        <a id="btn-dl" class="btn-dl" href="#" target="_blank" style="display:none;margin-right:12px">↓ DOWNLOAD</a>
+      </div>
+      <div class="audit-list" id="audit-list" style="flex:1;overflow-y:auto;padding:8px 16px;"></div>
+      <div id="audit-files" class="audit-files" style="display:none;padding:8px 16px;flex-wrap:wrap;gap:6px;border-top:1px solid rgba(255,255,255,.05)"></div>
+      <div id="audit-file-changes" style="display:none;flex:1;overflow-y:auto;padding:8px 16px;flex-direction:column;gap:4px"></div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div class="right" id="right-panel">
+    <button class="panel-toggle" id="panel-toggle-btn" onclick="toggleRightPanel()" title="Toggle sidebar [P]">◀</button>
+    <div class="adp-tabs" style="flex-shrink:0;border-top:none;border-bottom:1px solid rgba(255,255,255,.06)" role="tablist">
+      <div class="adp-tab active" id="rpt-log"   role="tab" aria-selected="true"  tabindex="0" onclick="setRightTab('log')">LOG</div>
+      <div class="adp-tab"        id="rpt-files" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('files')">FILES<b class="rp-n"></b></div>
+      <div class="adp-tab"        id="rpt-audit" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('audit')">AUDIT<b class="rp-n"></b></div>
+      <div class="adp-tab"        id="rpt-errors" role="tab" aria-selected="false" tabindex="0" onclick="setRightTab('errors')">ERRORS<b class="rp-n"></b></div>
+      <button id="rp-mobile-close" onclick="_mnavToggleLogs(false)" aria-label="Close" style="display:none;margin-left:auto;margin-right:8px;background:none;border:none;color:var(--t3);font-size:16px;cursor:pointer;padding:4px 8px;line-height:1">✕</button>
+    </div>
+    <div class="log-area" id="log-area" style="flex:1;overflow-y:auto"></div>
+    <div id="rp-files" style="display:none;flex:1;overflow-y:auto;padding:6px 10px;flex-direction:column;gap:4px"></div>
+    <div id="rp-audit" style="display:none;flex:1;overflow-y:auto;padding:4px 10px;flex-direction:column;gap:1px"></div>
+    <div id="rp-errors-wrap" style="display:none;flex:1;min-height:0;flex-direction:column">
+      <div class="search-wrap" id="rp-errors-search" style="padding:6px 10px 4px">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input class="search-input" id="rp-errors-search-input" type="text" placeholder="Search errors..." oninput="_setErrorSearch(this.value)">
+        <button class="search-clear" id="rp-errors-search-clear" onclick="_setErrorSearch('')">✕</button>
+      </div>
+      <div id="rp-errors-types" style="display:none;flex-wrap:wrap;gap:4px;padding:0 10px 6px"></div>
+      <div id="rp-errors" style="flex:1;overflow-y:auto;padding:0 10px 6px;display:flex;flex-direction:column;gap:6px"></div>
+    </div>
+  </div>
+
+  <!-- MOBILE BOTTOM NAV -->
+  <nav id="mobile-nav">
+    <button class="mnav-btn" id="mnav-command" onclick="_mnavGo('command')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>
+      HOME
+    </button>
+    <button class="mnav-btn" id="mnav-today" onclick="_mnavGo('today')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+      TODAY
+    </button>
+    <button class="mnav-btn active" id="mnav-agents" onclick="_mnavGo('agents')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      AGENTS
+    </button>
+    <button class="mnav-btn" id="mnav-inbox" onclick="_mnavGo('inbox')">
+      <svg viewBox="0 0 24 24"><path d="M3 13l3-8h12l3 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 13h5l1.5 3h5l1.5-3h5"/></svg>
+      INBOX<b class="mnav-badge" id="mnav-n-inbox"></b>
+    </button>
+    <button class="mnav-btn" id="mnav-term" onclick="_mnavGo('term')">
+      <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      TERM
+    </button>
+    <button class="mnav-btn" id="mnav-logs" onclick="_mnavToggleLogs()">
+      <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      LOGS
+    </button>
+    <button class="mnav-btn" id="mnav-settings" onclick="openSettings()">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      SETTINGS
+    </button>
+  </nav>
+
+  <!-- AGENT COMPARE OVERLAY -->
+  <div class="cmp-overlay" id="cmp-overlay" role="dialog" aria-modal="true" aria-label="Agent Compare" onclick="if(event.target===this)closeCompare()">
+    <div class="cmp-panel">
+      <div class="cmp-hdr">
+        <div class="cmp-hdr-title">AGENT COMPARE</div>
+        <div style="font-family:var(--font2);font-size:9px;color:var(--t3);margin-right:14px;letter-spacing:.06em" id="cmp-hint">select agents with ⊞ on cards</div>
+        <button class="adp-close" onclick="closeCompare()" aria-label="Close">✕</button>
+      </div>
+      <div class="cmp-body" id="cmp-body"></div>
+    </div>
+  </div>
+
+  <div class="cmp-overlay" id="sess-cmp-overlay" role="dialog" aria-modal="true" aria-label="Session Compare" onclick="if(event.target===this)closeSessionCompare()">
+    <div class="cmp-panel">
+      <div class="cmp-hdr">
+        <div class="cmp-hdr-title">SESSION COMPARE</div>
+        <div style="font-family:var(--font2);font-size:9px;color:var(--t3);margin-right:14px;letter-spacing:.06em" id="sess-cmp-hint">select sessions with ⊞ on cards</div>
+        <button class="adp-close" onclick="closeSessionCompare()" aria-label="Close">✕</button>
+      </div>
+      <div class="cmp-body" id="sess-cmp-body"></div>
+    </div>
+  </div>
+
+  <!-- KEYBOARD SHORTCUTS OVERLAY -->
+  <div class="kb-overlay" id="kb-overlay" role="dialog" aria-modal="true" aria-label="Keyboard Shortcuts" onclick="if(event.target===this)_toggleKbHelp()">
+    <div class="kb-panel">
+      <div class="kb-hdr">
+        <div class="kb-hdr-title">KEYBOARD SHORTCUTS</div>
+        <div style="font-family:var(--font2);font-size:9px;color:var(--t3);margin-right:14px;letter-spacing:.08em">press <kbd class="kb-key" style="font-size:9px;padding:0 5px">?</kbd> or ESC to close</div>
+        <button class="adp-close" onclick="_toggleKbHelp()" aria-label="Close">✕</button>
+      </div>
+      <div id="kb-body" style="display:grid;grid-template-columns:1fr 1fr;gap:0 36px"></div>
+    </div>
+  </div>
+
+  <!-- COMMAND PALETTE -->
+  <div class="palette-overlay" id="palette-overlay" role="dialog" aria-modal="true" aria-label="Command Palette" onclick="if(event.target===this)closePalette()">
+    <div class="palette-panel">
+      <input id="palette-input" class="palette-input" type="text" placeholder="Type a command, session, project or setting…" spellcheck="false" autocomplete="off" oninput="_paletteRender(this.value)" onkeydown="_paletteInputKeydown(event)">
+      <div id="palette-results" class="palette-results"></div>
+    </div>
+  </div>
+
+  <!-- NOTIFICATION HISTORY PANEL -->
+  <div class="notif-overlay" id="notif-overlay" role="dialog" aria-modal="true" aria-label="Notification History" onclick="if(event.target===this)closeNotifPanel()">
+    <div class="notif-panel">
+      <div class="notif-hdr">
+        <div class="notif-hdr-title">NOTIFICATION HISTORY</div>
+        <div class="notif-hdr-count" id="notif-hdr-count">—</div>
+        <button class="adp-btn" onclick="clearNotifHistory()" style="padding:2px 10px;font-size:9px">CLEAR</button>
+        <button class="adp-close" onclick="closeNotifPanel()" aria-label="Close">✕</button>
+      </div>
+      <div class="notif-list" id="notif-list"></div>
+    </div>
+  </div>
+
+  <!-- SESSION NOTES PANEL -->
+  <div class="notes-overlay" id="notes-overlay" role="dialog" aria-modal="true" aria-labelledby="notes-title-lbl" onclick="if(event.target===this)closeNotesPanel()">
+    <div class="notes-panel">
+      <div class="notif-hdr">
+        <div class="notif-hdr-title" id="notes-title-lbl">SESSION NOTES</div>
+        <div style="font-size:9px;font-family:var(--font2);color:var(--t3);flex:1;padding-left:8px" id="notes-subtitle-lbl">saved to session history</div>
+        <button class="adp-close" onclick="closeNotesPanel()" aria-label="Close">✕</button>
+      </div>
+      <div style="padding:14px 16px;flex:1;display:flex;flex-direction:column;gap:10px">
+        <textarea id="notes-ta" placeholder="Čo si robil v tejto session..." style="flex:1;min-height:180px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:9px;color:var(--t1);font-family:var(--font2);font-size:12px;line-height:1.65;padding:10px 12px;resize:none;outline:none;transition:border-color .2s" onfocus="this.style.borderColor='rgba(var(--c-rgb),.35)'" onblur="this.style.borderColor='rgba(255,255,255,.1)'"></textarea>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="adp-btn" onclick="saveNotes()" style="padding:5px 16px;font-size:10px;letter-spacing:.08em">SAVE</button>
+          <button class="adp-btn" onclick="clearNotes()" style="padding:5px 12px;font-size:10px;color:var(--t3)">CLEAR</button>
+        </div>
+        <div id="notes-saved-msg" style="display:none;font-size:10px;font-family:var(--font2);color:var(--g);text-align:right;letter-spacing:.07em">✓ Saved</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS PANEL -->
+  <div class="settings-overlay" id="settings-overlay" role="dialog" aria-modal="true" aria-label="Settings" onclick="if(event.target===this)closeSettings()">
+    <div class="settings-panel">
+      <div class="notif-hdr">
+        <div class="notif-hdr-title">SETTINGS</div>
+        <button class="adp-close" onclick="closeSettings()" aria-label="Close">✕</button>
+      </div>
+      <div class="settings-tabs" role="tablist">
+        <div class="settings-tab active" data-pane="cost" role="tab" aria-selected="true"  tabindex="0" onclick="setSettingsTab('cost')">COST</div>
+        <div class="settings-tab" data-pane="notify" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('notify')">NOTIFY</div>
+        <div class="settings-tab" data-pane="look" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('look')">LOOK</div>
+        <div class="settings-tab" data-pane="access" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('access')">ACCESS</div>
+        <div class="settings-tab" data-pane="people" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('people')">PEOPLE</div>
+        <div class="settings-tab" data-pane="tunnel" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('tunnel')">TUNNEL</div>
+        <div class="settings-tab" data-pane="remote" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('remote')">REMOTE</div>
+        <div class="settings-tab" data-pane="infra" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('infra')">INFRA</div>
+        <div class="settings-tab" data-pane="license" role="tab" aria-selected="false" tabindex="0" onclick="setSettingsTab('license')">LICENSE</div>
+      </div>
+      <div class="settings-body">
+
+        <div class="settings-pane" data-pane="cost">
+        <div class="settings-section">COST &amp; BUDGET</div>
+        <div class="settings-row">
+          <label class="settings-lbl">Cost rate ($/M tokens)</label>
+          <input class="settings-input" id="st-cost-rate" type="number" min="0.1" max="100" step="0.1" value="9.0" title="Claude Sonnet ~$9/M avg">
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl">Budget alert ($/session)</label>
+          <input class="settings-input" id="st-budget" type="number" min="0" step="0.01" placeholder="e.g. 1.00" title="Show red KPI when exceeded">
+        </div>
+        <div class="settings-section">HARD CAPS</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Stop a session at ($)</label>
+          <input class="settings-input" id="st-cap-session" type="number" min="0" step="0.5" placeholder="no cap" style="width:110px" onchange="_capsSave()"
+            title="When one Claude Code session has cost this much, AOC denies its tool calls so Claude stops and reports. 'Let it continue' on the session gives it one more cap's worth.">
+          <label class="settings-lbl">Stop all at ($/day)</label>
+          <input class="settings-input" id="st-cap-day" type="number" min="0" step="1" placeholder="no cap" style="width:110px" onchange="_capsSave()"
+            title="When today's Claude Code spend (all sessions) reaches this, AOC denies tool calls in every session until you lift it for today.">
+          <span id="st-cap-today" style="font-family:var(--font2);font-size:10px;color:var(--t3)"></span>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          Enforced through Claude Code's PreToolUse hook: the model is told the cap is reached and stops. Empty = no cap.
+          If AOC isn't running, nothing is blocked.
+        </div>
+        <div class="settings-row" style="align-items:flex-start">
+          <label class="settings-lbl" style="padding-top:6px">Per-project budgets</label>
+          <textarea class="settings-input settings-input-wide" id="st-project-budgets" rows="3" spellcheck="false"
+            placeholder='{"AOC": 5, "PHANTOM AI": 10}'
+            title="JSON object: project name -> monthly budget in $. Toast + webhook (if enabled below) fire once per project per calendar month when month-to-date spend crosses it -- works even with no browser tab open."
+            style="font-family:var(--font2);font-size:11px;resize:vertical"></textarea>
+        </div>
+        <div id="st-project-budget-summary" style="display:flex;flex-direction:column;gap:2px;font-family:var(--font2);font-size:9px;margin:2px 0 8px"></div>
+        <div class="settings-row">
+          <label class="settings-lbl">Projected month-end spend</label>
+          <span id="st-projected-spend" style="font-family:var(--font2);font-size:11px;color:var(--t2)" title="Simple run-rate projection: (cost so far this month / days elapsed) x days remaining, added to cost so far">—</span>
+        </div>
+
+        </div>
+
+        <div class="settings-pane" data-pane="notify" style="display:none">
+        <div class="settings-section">NOTIFICATION CENTER</div>
+        <div id="nc-status" style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 6px"></div>
+        <div id="nc-table" class="nc-table"></div>
+        <div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">
+          <span style="font-size:9px;font-family:var(--font2);color:var(--t3);letter-spacing:1px">RECENTLY SENT</span>
+          <button class="adp-btn" onclick="_ncClear()" style="font-size:9px;padding:2px 8px;margin-left:auto">Clear</button>
+        </div>
+        <div id="nc-log" class="nc-log"></div>
+        <div class="settings-section">REMOTE APPROVE</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Permission prompts</label>
+          <select class="settings-input" id="st-ra-mode" style="width:auto" onchange="_raSave()"
+            title="Where Claude Code's 'Allow this?' prompts go. Claude Code shows its terminal dialog only after AOC lets go of the prompt, so AOC holds it only while you're away.">
+            <option value="away">Dashboard while I'm away</option>
+            <option value="always">Always dashboard first</option>
+            <option value="off">Terminal only</option>
+          </select>
+          <span id="st-ra-idle-wrap" style="display:inline-flex;align-items:center;gap:6px">
+            <span style="color:var(--t3);font-size:11px">away after</span>
+            <input class="settings-input" id="st-ra-idle" type="number" min="1" max="120" style="width:64px" onchange="_raSave()">
+            <span style="color:var(--t3);font-size:11px">min without keyboard or mouse</span>
+          </span>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          Held prompts show <b>Allow</b> / <b>Deny</b> on the session, here and on your phone (remote access).
+          Touch the PC again and the prompt goes back to the terminal dialog.
+        </div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Finished turns</label>
+          <select class="settings-input" id="st-ra-reply" style="width:auto" onchange="_raSave()"
+            title="When Claude finishes a turn while you're away, keep the session open for a reply from the dashboard or your phone.">
+            <option value="away">Reply from dashboard while I'm away</option>
+            <option value="off">Terminal only</option>
+          </select>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          Uses the same "away" time. A held turn shows <b>Reply…</b> on the session; Claude carries on with what you write.
+          Up to 7 replies in a row, then the session waits in its terminal.
+        </div>
+        <div class="settings-section">CONTEXT ALMOST FULL</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Save state</label>
+          <select class="settings-input" id="st-cs-mode" style="width:auto" onchange="_csSave()"
+            title="When a session's context window fills up, ask Claude to write its state to memory before Claude Code compacts the conversation.">
+            <option value="offer">Offer a Save state button</option>
+            <option value="auto">Send it automatically</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">When context reaches</label>
+          <span style="display:inline-flex;align-items:center;gap:6px">
+            <input class="settings-input" id="st-cs-thr" type="number" min="50" max="95" style="width:64px" onchange="_csSave()">
+            <span style="color:var(--t3);font-size:11px">%</span>
+          </span>
+        </div>
+        <textarea class="settings-input" id="st-cs-prompt" rows="2" style="width:100%;resize:vertical;font-size:11px" onchange="_csSave()"
+          title="The message sent to the session. Empty = the default."></textarea>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:4px 0 10px">
+          Once per session each time it crosses the threshold. The prompt goes in when the current turn ends
+          (straight away if the turn is held for your reply). Skipped right after a compaction.
+          Notification: <b>Context almost full</b> in the table above.
+        </div>
+        <div class="settings-section">DANGEROUS COMMANDS</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Guard</label>
+          <select class="settings-input" id="st-dg-mode" style="width:auto" onchange="_dgSave()"
+            title="Before Claude runs a destructive shell command, AOC holds it until you allow it here or on your phone -- in every permission mode, auto and bypass included.">
+            <option value="hold">Hold for my OK</option>
+            <option value="off">Off</option>
+          </select>
+          <span style="display:inline-flex;align-items:center;gap:6px">
+            <span style="color:var(--t3);font-size:11px">deny if no answer in</span>
+            <input class="settings-input" id="st-dg-hold" type="number" min="1" max="60" style="width:64px" onchange="_dgSave()">
+            <span style="color:var(--t3);font-size:11px">min</span>
+          </span>
+        </div>
+        <div id="st-dg-hook" style="font-size:10px;color:var(--o);line-height:1.5;margin:0 0 6px;display:none">
+          The guard's hook is not in Claude Code's settings yet -- <a href="#" onclick="closeSettings();setView('diag');return false" style="color:var(--o)">Health → Repair</a> adds it.
+        </div>
+        <div class="dg-rules" id="st-dg-rules"></div>
+        <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
+          <label class="settings-lbl">Your own patterns <span style="color:var(--t3);font-weight:400">(regex, one per line, matched against the whole command)</span></label>
+          <textarea class="settings-input" id="st-dg-patterns" rows="3" placeholder="e.g. \bkubectl\s+delete\b" onchange="_dgSave()"
+            style="font-family:var(--font2);font-size:11px;resize:vertical;width:100%;box-sizing:border-box"></textarea>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          A held command shows <b>Run it</b> / <b>Deny</b> on the session and goes to your phone. If AOC isn't running, commands run as usual.
+        </div>
+        <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
+          <label class="settings-lbl">Test a command <span style="color:var(--t3);font-weight:400">(only checked -- nothing runs, nothing is held)</span></label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <input class="settings-input" id="st-dg-test" placeholder="e.g. git push --force origin main" style="flex:1;min-width:160px;font-family:var(--font2);font-size:11px"
+              onkeydown="if(event.key==='Enter')_dgTest()">
+            <select class="settings-input" id="st-dg-test-shell" style="width:auto"><option>Bash</option><option>PowerShell</option></select>
+            <button class="adp-btn" onclick="_dgTest()">Check</button>
+          </div>
+          <div id="st-dg-test-out" class="dg-test-out"></div>
+        </div>
+        <div id="st-dg-log"></div>
+        <div class="settings-section">PHONE PUSH</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Push alerts</label>
+          <select class="settings-input" id="st-push-mode" style="width:auto" onchange="_pushSaveMode()"
+            title="Which AOC alerts go to the devices below. Held prompts and turns waiting for your reply always go (they only happen while you're away).">
+            <option value="away">While I'm away from the PC</option>
+            <option value="always">Always</option>
+            <option value="off">Off</option>
+          </select>
+          <button class="adp-btn" id="st-push-enable" onclick="_pushEnable()" style="font-size:10px;padding:4px 12px">Enable on this device</button>
+          <button class="adp-btn" onclick="_pushTest()" style="font-size:10px;padding:4px 12px">Send test</button>
+        </div>
+        <div id="st-push-devices" style="display:flex;flex-direction:column;gap:4px;margin:0 0 6px"></div>
+        <div id="st-push-hint" style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px"></div>
+        <div class="settings-section">AWAY RECAPS</div>
+        <div class="settings-row" style="gap:10px;flex-wrap:wrap">
+          <label class="settings-lbl">Recap on Today</label>
+          <select class="settings-input" id="st-recap-mode" style="width:auto" onchange="_recapSaveMode()"
+            title="A short recap of what a session did since your last message, written by Claude Haiku through your own Claude Code login (about 1 cent each).">
+            <option value="auto">Summarize automatically</option>
+            <option value="click">Summarize when I click</option>
+            <option value="off">Off (counts only)</option>
+          </select>
+        </div>
+        <div style="font-size:10px;color:var(--t3);line-height:1.5;margin:0 0 10px">
+          For sessions you last wrote to 15+ minutes ago that kept working: what they did since, in a few bullets. Redone only after the session did more.
+        </div>
+        <div class="settings-section">NOTIFICATIONS</div>
+        <div class="settings-row">
+          <label class="settings-lbl">Webhook URL</label>
+          <input class="settings-input settings-input-wide" id="st-webhook" type="text" placeholder="https://hooks.slack.com/..." spellcheck="false">
+        </div>
+        <!-- per-event webhook toggles moved to the notification center above;
+             kept hidden so saveSettings()/the settings bundle still round-trip them -->
+        <div class="settings-row" style="display:none">
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-done" checked> Agent done</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-error" checked> Agent error</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-stuck"> Agent stuck / session looping</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-burn"> Token burn spike</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-digest"> Weekly digest</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-waiting"> Waiting too long</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-cost"> Cost spike</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-budget"> Budget exceeded</label>
+          <label class="settings-toggle"><input type="checkbox" id="st-wh-ratelimit"> Plan limit (5h / weekly)</label>
+        </div>
+        <div class="settings-row" style="justify-content:flex-end">
+          <button class="adp-btn" onclick="testWebhook()" style="padding:4px 14px;font-size:9px">TEST WEBHOOK</button>
+          <span id="st-wh-status" style="font-size:9px;font-family:var(--font2);color:var(--t3);margin-left:8px"></span>
+        </div>
+        <div class="settings-row" style="gap:10px">
+          <label class="settings-lbl">Quiet hours</label>
+          <input class="settings-input" id="st-quiet-start" type="time" style="width:auto" title="No sound/toast/webhook from this time...">
+          <span style="color:var(--t3);font-size:11px">to</span>
+          <input class="settings-input" id="st-quiet-end" type="time" style="width:auto" title="...until this time (overnight windows like 22:00-07:00 are fine)">
+        </div>
+        <div class="settings-row" style="align-items:flex-start">
+          <label class="settings-lbl" style="padding-top:6px">Muted projects</label>
+          <textarea class="settings-input settings-input-wide" id="st-muted-projects" rows="2" spellcheck="false"
+            placeholder="AOC, PHANTOM AI"
+            title="Comma-separated project names -- never notify for these, regardless of quiet hours."
+            style="font-family:var(--font2);font-size:11px;resize:vertical"></textarea>
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl">Dead man's snitch URL</label>
+          <input class="settings-input settings-input-wide" id="st-snitch-url" type="text" spellcheck="false"
+            placeholder="https://hc-ping.com/..."
+            title="AOC pings this URL every 10 min. Works with healthchecks.io / Cronitor / UptimeRobot-style 'ping-or-alert' services -- if the pings ever stop (machine off, AOC dead), THAT service notifies you, since nothing on this machine can once it's the thing that's down.">
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl">Digest cadence</label>
+          <select class="settings-input" id="st-digest-cadence" title="How often the cost/activity digest (native toast + optional webhook) is sent">
+            <option value="weekly">Weekly (Monday 9am)</option>
+            <option value="daily">Daily (9am)</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div class="settings-row" style="justify-content:flex-end">
+          <button class="adp-btn" onclick="_snitchPingNow()" style="padding:4px 14px;font-size:9px">PING NOW</button>
+          <span id="st-snitch-status" style="font-size:9px;font-family:var(--font2);color:var(--t3);margin-left:8px"></span>
+        </div>
+
+        </div>
+
+        <div class="settings-pane" data-pane="look" style="display:none">
+        <div class="settings-section">APPEARANCE</div>
+        <div class="settings-row" style="gap:8px;flex-wrap:wrap">
+          <label class="settings-lbl">Accent color</label>
+          <div style="display:flex;gap:6px">
+            <button class="accent-swatch" data-accent="signal" style="--sc:rgba(91,155,224,1)"  onclick="setAccent('signal')" title="Signal blue (default)"></button>
+            <button class="accent-swatch" data-accent="cyan"   style="--sc:rgba(var(--c-rgb),1)"   onclick="setAccent('cyan')"></button>
+            <button class="accent-swatch" data-accent="purple" style="--sc:rgba(140,80,255,1)"  onclick="setAccent('purple')"></button>
+            <button class="accent-swatch" data-accent="green"  style="--sc:rgba(76,194,133,1)"   onclick="setAccent('green')"></button>
+            <button class="accent-swatch" data-accent="orange" style="--sc:rgba(224,161,58,1)"  onclick="setAccent('orange')"></button>
+            <button class="accent-swatch" data-accent="pink"   style="--sc:rgba(255,80,180,1)"  onclick="setAccent('pink')"></button>
+          </div>
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl">Card density</label>
+          <select class="settings-input" id="st-density" style="padding:4px 8px">
+            <option value="normal">Normal</option>
+            <option value="compact">Compact</option>
+            <option value="comfortable">Comfortable</option>
+          </select>
+        </div>
+
+        </div>
+
+        <div class="settings-pane" data-pane="access" style="display:none">
+        <div class="settings-section">NETWORK ACCESS</div>
+        <div id="auth-panel" style="display:flex;flex-direction:column;gap:8px">
+          <div style="font-size:10px;font-family:var(--font2);color:var(--t3)" id="auth-status-lbl">Loading...</div>
+          <div id="auth-url-row" style="display:none;flex-direction:column;gap:5px">
+            <div style="display:flex;align-items:center;gap:6px">
+              <input id="auth-url-input" readonly style="flex:1;background:rgba(var(--c-rgb),.05);border:1px solid rgba(var(--c-rgb),.15);border-radius:6px;color:var(--c);font-family:var(--font2);font-size:9px;padding:5px 8px;outline:none;cursor:pointer" onclick="this.select()" title="Click to select all">
+              <button class="adp-btn" onclick="_authCopyUrl()" style="white-space:nowrap">COPY URL</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span style="font-size:9px;font-family:var(--font2);color:var(--t3)">TOKEN:</span>
+              <code id="auth-token-display" style="font-size:9px;font-family:var(--font2);color:rgba(var(--c-rgb),.8);word-break:break-all"></code>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="adp-btn" id="auth-gen-btn" onclick="_authGenerate()" style="background:rgba(var(--c-rgb),.1);border-color:rgba(var(--c-rgb),.3);color:var(--c)">⚡ GENERATE TOKEN</button>
+            <button class="adp-btn" id="auth-del-btn" onclick="_authDisable()" style="display:none;background:rgba(239,106,87,.07);border-color:rgba(239,106,87,.25);color:var(--r)">✕ DISABLE</button>
+          </div>
+          <div id="auth-note" style="font-size:9px;color:var(--t3);font-family:var(--font2);line-height:1.6"></div>
+        </div>
+
+        </div>
+
+        <div class="settings-pane" data-pane="tunnel" style="display:none">
+        <div class="settings-section">REMOTE ACCESS</div>
+        <div id="tunnel-panel" style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;gap:6px" id="tunnel-provider-row">
+            <button class="adp-btn" id="tunnel-provider-cf" onclick="_tunnelSetProvider('cloudflare')" style="flex:1;background:rgba(var(--c-rgb),.18)">CLOUDFLARE</button>
+            <button class="adp-btn" id="tunnel-provider-ngrok" onclick="_tunnelSetProvider('ngrok')" style="flex:1">NGROK</button>
+          </div>
+          <div id="tunnel-desc-cf" style="font-size:10px;font-family:var(--font2);color:var(--t3);line-height:1.55">
+            Creates a public HTTPS URL without port forwarding.<br>
+            Requires <code style="color:var(--c)">cloudflared.exe</code> (downloaded automatically, ~30 MB).
+          </div>
+          <div id="tunnel-desc-ngrok" style="display:none;font-size:10px;font-family:var(--font2);color:var(--t3);line-height:1.55">
+            Requires an ngrok account and authtoken (free) —
+            <a href="https://dashboard.ngrok.com/get-started/your-authtoken" target="_blank" style="color:var(--c)">dashboard.ngrok.com/get-started/your-authtoken</a>.
+          </div>
+          <div id="tunnel-ngrok-missing" style="display:none;font-size:10px;font-family:var(--font2);color:var(--o);line-height:1.55">
+            <code style="color:var(--o)">ngrok.exe</code> not found — install via <code style="color:var(--o)">winget install Ngrok.Ngrok</code> or add it to PATH.
+          </div>
+          <div id="tunnel-ngrok-auth-row" style="display:none;flex-direction:column;gap:5px">
+            <div style="display:flex;align-items:center;gap:6px">
+              <input id="tunnel-ngrok-token-input" type="password" placeholder="ngrok authtoken" style="flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:6px;color:var(--t1);font-family:var(--font2);font-size:9px;padding:5px 8px;outline:none">
+              <button class="adp-btn" onclick="_tunnelSaveNgrokToken()" style="white-space:nowrap">SAVE TOKEN</button>
+            </div>
+            <div id="tunnel-ngrok-auth-msg" style="font-size:9px;font-family:var(--font2)"></div>
+          </div>
+          <div id="tunnel-status-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span id="tunnel-status-lbl" style="font-size:10px;font-family:var(--font2);color:var(--t3)">Status: OFF</span>
+            <button class="adp-btn" id="tunnel-start-btn" onclick="_tunnelStart()" style="background:rgba(var(--c-rgb),.1);border-color:rgba(var(--c-rgb),.3);color:var(--c)">▶ START TUNNEL</button>
+            <button class="adp-btn" id="tunnel-stop-btn" onclick="_tunnelStop()" style="display:none;background:rgba(239,106,87,.07);border-color:rgba(239,106,87,.25);color:var(--r)">■ STOP</button>
+          </div>
+          <div id="tunnel-error-detail" style="display:none;font-size:9px;font-family:var(--font2);color:var(--r);word-break:break-word"></div>
+          <div id="tunnel-url-row" style="display:none;flex-direction:column;gap:5px">
+            <div style="display:flex;align-items:center;gap:6px">
+              <input id="tunnel-url-input" readonly style="flex:1;background:rgba(var(--c-rgb),.05);border:1px solid rgba(var(--c-rgb),.15);border-radius:6px;color:var(--c);font-family:var(--font2);font-size:9px;padding:5px 8px;outline:none;cursor:pointer" onclick="this.select()" title="Click to select">
+              <button class="adp-btn" onclick="_tunnelCopyUrl()" style="white-space:nowrap">COPY</button>
+            </div>
+            <div style="font-size:9px;color:var(--t3);font-family:var(--font2)">
+              Token: <code id="tunnel-token-note" style="color:rgba(var(--c-rgb),.7)"></code>
+            </div>
+          </div>
+          <div id="tunnel-dl-row" style="display:none;flex-direction:column;gap:4px">
+            <div style="font-size:9px;font-family:var(--font2);color:var(--t3)" id="tunnel-dl-lbl">Downloading cloudflared...</div>
+            <div style="height:3px;background:rgba(255,255,255,.08);border-radius:999px;overflow:hidden">
+              <div id="tunnel-dl-bar" style="height:100%;width:0%;background:rgba(var(--c-rgb),.7);border-radius:999px;transition:width .3s"></div>
+            </div>
+          </div>
+        </div>
+
+        </div>
+
+        <div class="settings-pane" data-pane="remote" style="display:none">
+        <div class="settings-section">REMOTE MACHINES</div>
+        <div style="font-size:9px;font-family:var(--font2);color:var(--t3);line-height:1.5;margin-bottom:6px">
+          Shows sessions and agents from other machines running AOC (same LAN). The target machine needs a generated token (REMOTE ACCESS above) even for pure LAN access — without a token it refuses even a LAN request. View-only: Force Stop only ever works on this machine.
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl">This machine</label>
+          <input class="settings-input" id="st-local-machine-name" type="text" placeholder="e.g. Desktop" style="max-width:160px">
+        </div>
+        <div id="remote-machines-list" style="display:flex;flex-direction:column;gap:6px;margin:4px 0"></div>
+        <button class="adp-btn" id="btn-add-remote-machine" onclick="_addRemoteMachineRow()" style="align-self:flex-start;font-size:9px;padding:3px 12px">+ ADD MACHINE</button>
+        </div>
+
+        <div class="settings-pane" data-pane="people" style="display:none"><div id="people-area"></div></div>
+        <div class="settings-pane" data-pane="license" style="display:none">
+        <div class="settings-section">LICENSE</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span id="license-tier-badge" style="font-family:var(--font2);font-size:10px;letter-spacing:.08em;padding:3px 10px;border-radius:20px"></span>
+          <span id="license-email-note" style="font-size:9px;font-family:var(--font2);color:var(--t3)"></span>
+        </div>
+        <div style="font-size:9px;font-family:var(--font2);color:var(--t3);line-height:1.5;margin-bottom:10px">
+          Free covers every live view, local History &amp; Analytics, native toast notifications, backups, and the terminal grid.
+          Pro unlocks Remote Machines, the remote-access tunnel, webhook delivery, per-project monthly budgets, and CSV exports.
+        </div>
+        <div id="license-active-row" style="display:none;align-items:center;gap:8px;margin-bottom:10px">
+          <button class="adp-btn" onclick="_deactivateLicense()" style="color:var(--r)">DEACTIVATE</button>
+        </div>
+        <div id="license-inactive-row" style="display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;gap:6px">
+            <input id="license-key-input" class="settings-input" type="text" placeholder="AOC-PRO-..." style="flex:1;font-family:var(--font2)">
+            <button class="adp-btn" onclick="_activateLicense()" style="white-space:nowrap">ACTIVATE</button>
+          </div>
+          <a href="#" onclick="return false" id="license-buy-link" style="font-size:9px;font-family:var(--font2);color:var(--c);text-decoration:underline;text-decoration-style:dotted;align-self:flex-start">Buy Pro →</a>
+        </div>
+        <div id="license-msg" style="font-size:9px;font-family:var(--font2);margin-top:8px"></div>
+        </div>
+
+        <div class="settings-pane" data-pane="infra" style="display:none">
+        <div class="settings-section">INFRASTRUCTURE HEALTH</div>
+        <div style="font-size:9px;font-family:var(--font2);color:var(--t3);line-height:1.5;margin-bottom:6px">
+          watchdog.py restarts monitor.py when it hangs; sentinel.py watches over watchdog.py. This panel shows their live status without needing to check the log files by hand.
+          For this process's own uptime/memory/history.db size/backups see
+          <a href="#" onclick="closeSettings();setView('diag');return false" style="color:var(--c);text-decoration:underline;text-decoration-style:dotted">DIAG →</a>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span id="infra-wd-dot" style="width:7px;height:7px;border-radius:50%;flex-shrink:0"></span>
+            <span style="font-family:var(--font2);font-size:10px;letter-spacing:.06em;color:var(--t2)">WATCHDOG</span>
+            <span id="infra-wd-status" style="font-family:var(--font2);font-size:10px;margin-left:auto"></span>
+          </div>
+          <div id="infra-wd-detail" style="font-size:9px;color:var(--t3);font-family:var(--font2)"></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span id="infra-sn-dot" style="width:7px;height:7px;border-radius:50%;flex-shrink:0"></span>
+            <span style="font-family:var(--font2);font-size:10px;letter-spacing:.06em;color:var(--t2)">SENTINEL</span>
+            <span id="infra-sn-status" style="font-family:var(--font2);font-size:10px;margin-left:auto"></span>
+          </div>
+          <div id="infra-sn-detail" style="font-size:9px;color:var(--t3);font-family:var(--font2)"></div>
+        </div>
+        <div style="font-size:9px;color:var(--t3);font-family:var(--font2);margin-bottom:8px">Monitor running: <span id="infra-uptime"></span></div>
+        <div class="settings-row">
+          <label class="settings-lbl">Backup retention (days)</label>
+          <input class="settings-input" id="st-backup-retention" type="number" min="1" max="365" step="1" title="history.db snapshots older than this are auto-deleted every hour. Corrupt backups are always kept for inspection regardless of age.">
+        </div>
+        <div id="infra-backup-summary" style="font-size:9px;color:var(--t3);font-family:var(--font2)"></div>
+        <div class="settings-row">
+          <label class="settings-lbl">Agent retention (hours)</label>
+          <input class="settings-input" id="st-agent-retention" type="number" min="1" max="23" step="1" title="Completed/errored subagents older than this are auto-cleared every ~15min, keeping TIMELINE/SUMMARY/GRAPH/HEAT/TREE showing recent activity instead of growing forever. Capped under 24h since completion times are stored as time-of-day only (no date).">
+        </div>
+        <div id="infra-agent-retention-summary" style="font-size:9px;color:var(--t3);font-family:var(--font2)"></div>
+        <div class="settings-row">
+          <label class="settings-lbl" title="How often an agent's start was only ever caught by the transcript fallback scanner instead of Claude Code's own PreToolUse hook, and whether that correlates with more sessions running at once">Hook reliability</label>
+          <span id="infra-hook-reliability" style="font-size:9px;color:var(--t3);font-family:var(--font2)">—</span>
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl" title="Every webhook event AOC actually dispatched, from logs/alert_audit.log">Alerts fired (7d)</label>
+          <span id="infra-alert-audit" style="font-size:9px;color:var(--t3);font-family:var(--font2)">—</span>
+        </div>
+        <div class="settings-row">
+          <label class="settings-lbl" title="Every Force Stop call, successful or refused, from logs/kill_audit.log">Force stops (7d)</label>
+          <span id="infra-kill-audit" style="font-size:9px;color:var(--t3);font-family:var(--font2)">—</span>
+        </div>
+        </div>
+
+        <div style="margin-top:auto;padding-top:16px;display:flex;gap:8px;align-items:center">
+          <button class="adp-btn" onclick="exportAllSettings()" title="Download every setting on this page as one JSON file" style="padding:5px 12px;font-size:10px;color:var(--t3)">EXPORT</button>
+          <button class="adp-btn" onclick="triggerImportSettings()" title="Load settings from a previously exported JSON file (reloads the page to apply)" style="padding:5px 12px;font-size:10px;color:var(--t3)">IMPORT</button>
+          <input type="file" id="settings-import-input" accept=".json" style="display:none" onchange="importAllSettings(this)">
+          <div style="flex:1"></div>
+          <button class="adp-btn" onclick="saveSettings()" style="padding:5px 18px;font-size:10px;background:rgba(var(--c-rgb),.12);border-color:rgba(var(--c-rgb),.35);color:var(--c)">SAVE</button>
+          <button class="adp-btn" onclick="closeSettings()" style="padding:5px 12px;font-size:10px;color:var(--t3)">CANCEL</button>
+        </div>
+        <div id="st-saved-msg" style="display:none;font-size:10px;font-family:var(--font2);color:var(--g);text-align:right;margin-top:6px;letter-spacing:.07em">✓ Settings saved</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AGENT DETAIL PANEL -->
+  <div class="agent-detail-overlay" id="agent-detail-overlay" role="dialog" aria-modal="true" aria-label="Agent Detail" onclick="if(event.target===this)closeAgentDetail()">
+    <div class="agent-detail-panel">
+      <div class="adp-hdr" id="adp-hdr"></div>
+      <div class="adp-tabs" role="tablist">
+        <div class="adp-tab active" id="adpt-log"   role="tab" aria-selected="true"  tabindex="0" onclick="setAdpTab('log')">LOG</div>
+        <div class="adp-tab"        id="adpt-tasks" role="tab" aria-selected="false" tabindex="0" onclick="setAdpTab('tasks')">TASKS</div>
+        <div class="adp-tab"        id="adpt-files" role="tab" aria-selected="false" tabindex="0" onclick="setAdpTab('files')">FILES</div>
+      </div>
+      <div class="adp-body" id="adp-body"></div>
+    </div>
+  </div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

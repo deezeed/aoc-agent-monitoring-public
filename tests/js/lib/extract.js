@@ -9,9 +9,26 @@ const fs = require('fs');
 const path = require('path');
 
 const MONITOR_PATH = path.join(__dirname, '..', '..', '..', 'monitor.py');
+const WEB_DIR = path.join(__dirname, '..', '..', '..', 'web');
+const WEB_JS_DIR = path.join(WEB_DIR, 'js');
+const SERVER_DIR = path.join(__dirname, '..', '..', '..', 'server');
+
+/* The dashboard (web/js/NN_*.js, web/index.html, web/app.css -- monitor.py
+ * inlines them into one page at startup) followed by monitor.py and its
+ * server/NN_*.py parts (one program, exec()d in that order), so a test can
+ * check both the frontend and the route it calls. Web files come first: a
+ * Python docstring mentioning "function foo(" must never shadow the real JS
+ * function. */
+/* web/js/NN_*.js in page order (monitor.py joins them into one <script>). */
+function webJsParts() {
+  return fs.readdirSync(WEB_JS_DIR).filter(n => n.endsWith('.js')).sort().map(n => path.join(WEB_JS_DIR, n));
+}
 
 function readMonitorSource() {
-  return fs.readFileSync(MONITOR_PATH, 'utf8');
+  const parts = fs.readdirSync(SERVER_DIR).filter(n => n.endsWith('.py')).sort()
+    .map(n => path.join(SERVER_DIR, n));
+  return webJsParts().concat(['index.html', 'app.css'].map(f => path.join(WEB_DIR, f)), [MONITOR_PATH], parts)
+    .map(p => fs.readFileSync(p, 'utf8')).join('\n');
 }
 
 function extractFunction(src, name) {
@@ -38,4 +55,4 @@ function extractFunctions(names) {
   return names.map(name => extractFunction(src, name)).join('\n\n');
 }
 
-module.exports = { readMonitorSource, extractFunction, extractFunctions, MONITOR_PATH };
+module.exports = { readMonitorSource, extractFunction, extractFunctions, webJsParts, MONITOR_PATH, WEB_DIR };

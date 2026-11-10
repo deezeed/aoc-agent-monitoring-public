@@ -7,7 +7,7 @@ import sys, os, json, tempfile, threading, time, shutil
 
 sys.path.insert(0, os.path.dirname(__file__))
 from lib.extract import exec_functions
-from lib.check import Checker
+from lib.check import Checker, wait_until
 
 c = Checker()
 data = tempfile.mkdtemp(prefix="aoc_recap_")
@@ -177,7 +177,10 @@ if os.name == "nt":
     seen = []
     th = threading.Thread(target=lambda: seen.append(rh("Summarize", "héllo wörld")))
     th.start()
-    time.sleep(0.6)
+    # the pid is registered once Popen returns and held until the fake (which
+    # sleeps 1.5 s) exits -- wait for it rather than guessing 0.6 s, which a
+    # loaded machine's cmd.exe + python startup can overrun
+    wait_until(lambda: pids or not th.is_alive(), 30)
     during = set(pids)
     th.join(30)
     c.check("run: stdin passed (utf-8), args right, cost parsed", seen and seen[0] == ("- got 11 chars", 0.0042))

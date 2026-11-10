@@ -14,9 +14,35 @@ MONITOR_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "monito
 MONITOR_PATH = os.path.normpath(MONITOR_PATH)
 
 
+SERVER_DIR = os.path.normpath(os.path.join(os.path.dirname(MONITOR_PATH), "server"))
+
+
+def server_parts() -> list:
+    """server/NN_*.py in the order monitor.py exec()s them."""
+    return [os.path.join(SERVER_DIR, n) for n in sorted(os.listdir(SERVER_DIR)) if n.endswith(".py")]
+
+
 def read_monitor_source() -> str:
-    with open(MONITOR_PATH, encoding="utf-8") as f:
-        return f.read()
+    """monitor.py's whole program: its loader followed by every server/ part
+    in load order -- one namespace at runtime, so one source here."""
+    return "\n".join(read_source(p) for p in [MONITOR_PATH] + server_parts())
+
+
+WEB_DIR = os.path.normpath(os.path.join(os.path.dirname(MONITOR_PATH), "web"))
+
+
+def web_js_parts() -> list:
+    """web/js/NN_*.js in page order (joined into one <script> at startup)."""
+    js_dir = os.path.join(WEB_DIR, "js")
+    return [os.path.join(js_dir, n) for n in sorted(os.listdir(js_dir)) if n.endswith(".js")]
+
+
+def read_web_source() -> str:
+    """The dashboard monitor.py serves: web/index.html, app.css and the
+    web/js/ parts (inlined into one page at startup), for checks on the
+    frontend."""
+    return "\n".join(read_source(p) for p in [os.path.join(WEB_DIR, f) for f in ("index.html", "app.css")]
+                     + web_js_parts())
 
 
 def read_source(path: str) -> str:
@@ -36,7 +62,7 @@ def extract_functions(names, src=None, path=None) -> dict:
     tree = ast.parse(src)
     found = {}
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in names:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
             found[node.name] = ast.get_source_segment(src, node)
         elif isinstance(node, ast.Assign):
             for target in node.targets:

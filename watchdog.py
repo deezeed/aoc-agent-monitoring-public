@@ -16,6 +16,11 @@ import urllib.request
 
 AOC_DIR        = os.path.dirname(os.path.abspath(__file__))
 MONITOR        = os.path.join(AOC_DIR, "monitor.py")
+# the dashboard monitor.py inlines at startup (index.html, app.css, js/NN_*.js)
+# -- an edit there needs a reload too
+WEB_DIR        = os.path.join(AOC_DIR, "web")
+# monitor.py exec()s server/NN_*.py at startup -- the actual server code
+SERVER_DIR     = os.path.join(AOC_DIR, "server")
 LOG_FILE       = os.path.join(AOC_DIR, "watchdog.log")
 PID_FILE       = os.path.join(AOC_DIR, "watchdog.pid")
 STATUS_URL     = "http://127.0.0.1:5151/status"
@@ -172,6 +177,42 @@ def _code_stamp(path: str = MONITOR):
         return None
 
 
+def _server_parts(server_dir: str = None) -> list:
+    """server/*.py, sorted (the order monitor.py loads them in)."""
+    server_dir = server_dir or SERVER_DIR
+    try:
+        return [os.path.join(server_dir, n) for n in sorted(os.listdir(server_dir)) if n.endswith(".py")]
+    except OSError:
+        return []
+
+
+def _web_files(web_dir: str = None) -> list:
+    """index.html, app.css and every web/js/*.js part, sorted (page order)."""
+    web_dir = web_dir or WEB_DIR
+    js_dir = os.path.join(web_dir, "js")
+    try:
+        js = [os.path.join(js_dir, n) for n in sorted(os.listdir(js_dir)) if n.endswith(".js")]
+    except OSError:
+        js = []
+    return [os.path.join(web_dir, n) for n in ("index.html", "app.css")] + js
+
+
+def _monitor_stamp():
+    """Stamps of monitor.py, its server/ parts and web/ files: what a running
+    monitor was started from (a missing file is None and an added or removed
+    part changes the names, so both still count as a change)."""
+    return tuple((os.path.basename(p), _code_stamp(p)) for p in [MONITOR, *_server_parts(), *_web_files()])
+
+
+def _monitor_compiles() -> str:
+    """"" if monitor.py and every server/ part compile, else the first error."""
+    for p in [MONITOR, *_server_parts()]:
+        err = _compiles(p)
+        if err:
+            return f"{os.path.basename(p)}: {err}"
+    return ""
+
+
 def _reload_step(running, pending, cur, now: float):
     """Pure. running = stamp of the code the monitor was started with,
     pending = (stamp, first seen) of a change waiting to settle, cur = the
@@ -195,6 +236,36 @@ def _compiles(path: str = MONITOR) -> str:
         return ""
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
+
+
+def _uncommitted(path: str = MONITOR, *more: str):
+    """True if `path` (or any of `more`, same checkout) has uncommitted
+    edits in a git checkout (a dev tree), False if it's clean or this isn't
+    a checkout (an installed release), None if git couldn't tell. A dev tree
+    reloads only after a commit: on
+    11-03 every save of a half-done edit restarted the live monitor every
+    2-3 minutes (and once killed a running hook repair)."""
+    root = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(os.path.join(root, ".git")) and not os.path.isfile(os.path.join(root, ".git")):
+        return False
+    try:
+        r = subprocess.run(["git", "-C", root, "status", "--porcelain", "--", os.path.basename(path),
+                            *[os.path.relpath(m, root) for m in more]],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return None
+    return bool(r.stdout.strip()) if r.returncode == 0 else None
+
+
+def _reload_blocker(compile_err: str, dirty) -> str:
+    """Pure: why a settled code change must not be loaded yet ("" = go).
+    git not answering (None) doesn't block -- the old behaviour."""
+    if compile_err:
+        return compile_err
+    if dirty:
+        return "uncommitted edits (dev checkout -- reloads after the commit)"
+    return ""
 
 
 def _restart_ok():
@@ -244,14 +315,18 @@ def _is_python_process(pid: int) -> bool:
         return True  # can't verify — fall back to the original (conservative) assumption
 
 
-def _acquire_lock() -> bool:
-    """Return True if this process is the sole watchdog, False if another is running."""
+def _acquire_lock(quiet: bool = False) -> bool:
+    """Return True if this process is the sole watchdog, False if another is
+    running. quiet = launched by sentinel.py's every-15-min revive attempt:
+    finding the watchdog alive is the expected outcome there (sentinel.log
+    records it), so it isn't logged as if a second watchdog had started."""
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE) as f:
                 old_pid = int(f.read().strip())
             if old_pid != os.getpid() and _is_python_process(old_pid):
-                _log(f"Another watchdog appears to be running (PID {old_pid}) — exiting")
+                if not quiet:
+                    _log(f"Another watchdog appears to be running (PID {old_pid}) — exiting")
                 return False  # another watchdog is alive
         except Exception as exc:
             _log(f"Could not read/parse PID file — assuming stale, continuing: {exc}")
@@ -271,7 +346,7 @@ def _release_lock() -> None:
 
 
 def main() -> None:
-    if sys.platform == "win32" and not _acquire_lock():
+    if sys.platform == "win32" and not _acquire_lock(quiet="--from-sentinel" in sys.argv):
         # Another watchdog instance is already running — exit silently
         return
 
@@ -282,7 +357,7 @@ def main() -> None:
     fails = 0
     backoff = 10
     # code reload: what the running monitor / this watchdog were started from
-    running_stamp, pending, reload_note = _code_stamp(), None, None
+    running_stamp, pending, reload_note = _monitor_stamp(), None, None
     self_stamp, self_pending = _code_stamp(os.path.abspath(__file__)), None
 
     if not _alive():
@@ -303,9 +378,9 @@ def main() -> None:
                     _log("Monitor recovered — back online")
                     backoff = 10
                 fails = 0
-                action, pending = _reload_step(running_stamp, pending, _code_stamp(), time.time())
+                action, pending = _reload_step(running_stamp, pending, _monitor_stamp(), time.time())
                 if action == "ready":
-                    err = _compiles()
+                    err = _reload_blocker(_monitor_compiles(), _uncommitted(MONITOR, SERVER_DIR, WEB_DIR))
                     pid, blockers = (None, None) if err else _restart_ok()
                     why = err or ("monitor did not answer /restart_ok" if blockers is None else "; ".join(blockers))
                     if why:
@@ -322,7 +397,8 @@ def main() -> None:
                         _log(f"Monitor reloaded (PID {proc.pid})" if proc else "Monitor failed to start after reload")
                 # this watchdog's own code: hand over to a fresh copy of itself
                 action, self_pending = _reload_step(self_stamp, self_pending, _code_stamp(os.path.abspath(__file__)), time.time())
-                if action == "ready" and not _compiles(os.path.abspath(__file__)):
+                if action == "ready" and not _reload_blocker(_compiles(os.path.abspath(__file__)),
+                                                             _uncommitted(os.path.abspath(__file__))):
                     _log("watchdog.py changed — starting the new watchdog and exiting")
                     _release_lock()
                     subprocess.Popen([PYTHONW, os.path.abspath(__file__)], cwd=AOC_DIR,
