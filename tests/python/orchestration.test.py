@@ -24,7 +24,7 @@ base_g = {"os": os, "json": json, "re": re, "time": time, "sqlite3": sqlite3, "s
           "threading": threading, "_NO_WINDOW": NO_WINDOW, "AOC_DATA_DIR": data_dir,
           "_log_bg_error": lambda where, e: print("bg error", where, e), "_own_claude_pids": set(),
           "_is_claude_pid_alive": lambda pid: False, "_snapshot_processes": lambda: [], "_find_claude_exe": lambda: "claude.exe",
-          "_load_json_file": lambda path, default=None: default}
+          "_load_json_file": lambda path, default=None: default, "DB_FILE": os.path.join(data_dir, "history.db")}
 wt = exec_functions(["_wt_git", "_wt_err", "_wt_remove", "_wt_repo", "_wt_conflicts", "_parse_porcelain_z"],
                     dict(base_g))
 src_names = [n for n in names if n != "_orch_lock"]
@@ -299,11 +299,25 @@ c.check("supervisor finished -> review with its report", v["run"]["state"] == "r
 m = v["metrics"]
 c.check("metrics of the run: costs split, 1 retry, success", m["cost_coordination"] == 0.35 and m["retries"] == 1
         and m["done"] == 3 and m["human_interventions"] == 2)
+# links: an agent's session once History has it; the run's commits before and after the merge
+c.check("no history DB: no History link", not any(t["in_history"] for t in v["tasks"]))
+hconn = sqlite3.connect(g["DB_FILE"])
+hconn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, project TEXT)")
+hconn.execute("INSERT INTO sessions (id) VALUES ('sess-api-1')")
+hconn.commit(); hconn.close()
+hs = {t["id"]: t["in_history"] for t in O["_orch_get"](rid)["tasks"]}
+c.check("a task whose agent session History has is linked; the others not", hs == {"api": True, "ui": False, "qa": False})
+cm = O["_orch_commits"](rid)
+c.check("run commits before the merge: each developer's own commit, from its branch",
+        cm["ok"] and sorted(x["task"] for x in cm["commits"]) == ["api", "ui"] and all(len(x["sha"]) == 40 for x in cm["commits"]))
 r = O["_orch_action"]("merge", {"id": rid})
 c.check("merge: both developer branches into main", r["ok"] and set(r["merged"]) == {"api", "ui"})
 c.check("main has both files, worktrees + branches cleaned up",
         os.path.exists(os.path.join(repo, "api.txt")) and os.path.exists(os.path.join(repo, "ui.txt"))
         and "aoc/orch" not in git("branch", cwd=repo).stdout and O["_orch_get"](rid)["run"]["state"] == "merged")
+cm2 = O["_orch_commits"](rid)
+c.check("run commits after the merge (branches gone): found through AOC's merges, same commits, same tasks",
+        sorted((x["task"], x["sha"]) for x in cm2["commits"]) == sorted((x["task"], x["sha"]) for x in cm["commits"]))
 
 # second run: a conflict at merge time, a supervisor retry, cancel/discard
 open(os.path.join(repo, "app.txt"), "w").write("v1\n")
@@ -335,6 +349,26 @@ c.check("merge stops at a conflict and names it; nothing half-merged",
 r = O["_orch_action"]("discard", {"id": rid})
 c.check("discard cleans the remaining branches", r["ok"] and "aoc/orch" not in git("branch", cwd=repo).stdout)
 c.check("worktree list clean", git("worktree", "list", cwd=repo).stdout.count("\n") == 1)
+
+# found live: two workstreams edited the same lines -> a later task's inputs conflict. The error said only
+# "merge failed" and the review retried that task twice into the same conflict
+base_sha = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+for b, text in (("cx-one", "alpha\n"), ("cx-two", "beta\n")):
+    git("checkout", "-q", "-b", b, base_sha, cwd=repo)
+    open(os.path.join(repo, "app.txt"), "w").write(text)
+    git("commit", "-qam", b, cwd=repo)
+git("checkout", "-q", "main", cwd=repo)
+cx_tasks = [T("one", state="done", branch="cx-one", commits=1), T("two", state="done", branch="cx-two", commits=1),
+            T("check", role="qa", deps=["one", "two"])]
+br_, path_, err_ = O["_orch_prepare_worktree"]({"id": "rcx", "repo": repo, "base_sha": base_sha}, cx_tasks[2], cx_tasks)
+c.check("inputs that conflict: the error names the tasks and files, says a re-run won't help",
+        br_ is None and "'two' conflicts with 'one' in app.txt" in err_ and "same conflict" in err_)
+c.check("... and leaves no worktree or branch behind", not os.path.exists(os.path.join(repo, ".claude", "worktrees", "aoc-orch-rcx-check-1"))
+        and "orch-rcx" not in git("branch", cwd=repo).stdout)
+sp_cx = O["_orch_supervise_prompt"]({"goal": "g", "budget_usd": 5}, [dict(cx_tasks[2], state="failed", error=err_)], False)
+c.check("the review is told retrying a conflicted task can't help", "retrying that task can't help" in sp_cx
+        and "retrying that task" not in O["_orch_supervise_prompt"]({"goal": "g", "budget_usd": 5}, cx_tasks, False))
+git("branch", "-D", "cx-one", "cx-two", cwd=repo)
 
 shutil.rmtree(repo, ignore_errors=True)
 
@@ -497,6 +531,45 @@ c.check("approve_teams: the team plan waits for you", docs["state"] == "running"
 r = O["_orch_action"]("cancel", {"id": rid})
 c.check("cancel the run -> its team is cancelled, branches gone",
         r["ok"] and O["_orch_get"](docs["child_id"])["run"]["state"] == "cancelled" and "aoc/orch" not in git("branch", cwd=repo).stdout)
+
+# found live: the plan's usage limit hit mid-run -- every team task failed (retried at once, in vain), the
+# team's review failed too, and the workstream was still reported done with nothing on its branch
+LIMIT = "You've hit your session limit · resets 6:20pm (Europe/Bratislava)"
+c.check("usage limit recognised and explained", O["_orch_limit_hit"](LIMIT) and O["_orch_limit_hit"]("Claude AI usage limit reached|1700000000")
+        and not O["_orch_limit_hit"]("stopped at its budget limit") and "after the reset" in O["_orch_explain_error"](LIMIT))
+lcalls = []
+
+
+def lspawn(argv, cwd, stdin_text, base):
+    run_dir, kind = os.path.basename(os.path.dirname(base)), os.path.basename(base).rsplit("-", 1)[0]
+    if re.search(r"-lim-t\d+$", run_dir) and kind != "plan":
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        lcalls.append(kind)
+        with open(base + ".out", "w", encoding="utf-8") as f:   # what claude -p answered live (HTTP 429)
+            f.write(json.dumps({"type": "result", "subtype": "success", "is_error": True, "total_cost_usd": 0, "result": LIMIT}))
+        return 5
+    return hspawn(argv, cwd, stdin_text, base)
+
+
+H.update({"top:plan": [plan_of({"id": "lim", "role": "manager", "title": "Limited"})],
+          "lim:plan": [plan_of({"id": "work", "role": "developer", "title": "Work"})],
+          "top:supervise": [finish("nothing was delivered")]})
+r = O["_orch_create"]({"goal": "Do the limited work please", "cwd": repo, "mode": "hierarchical"}, exe="claude.exe", spawn=lspawn)
+rid = r["id"]
+hkw["spawn"] = lspawn
+tick(); O["_orch_action"]("approve", {"id": rid}); tick(10)
+hkw["spawn"] = hspawn
+v = O["_orch_get"](rid)
+lim = v["tasks"][0]
+work = O["_orch_get"](f"{rid}-lim-t1")["tasks"][0]
+c.check("usage limit: the agent is not retried, its error says to wait for the reset",
+        work["state"] == "failed" and work["attempt"] == 1 and lcalls.count("work") == 1 and "after the reset" in work["error"])
+c.check("a team that finished none of its tasks fails its workstream (not 'done'), no retry at the limit",
+        lim["state"] == "failed" and lim["attempt"] == 1 and "finished none of its tasks" in lim["error"]
+        and O["_orch_get"](f"{rid}-lim-t1")["run"]["state"] == "discarded" and v["metrics"]["success_rate"] == 0.0)
+O["_orch_action"]("discard", {"id": rid})
+c.check("and nothing is left behind", "aoc/orch" not in git("branch", cwd=repo).stdout
+        and git("worktree", "list", cwd=repo).stdout.count("\n") == 1)
 shutil.rmtree(repo, ignore_errors=True)
 
 # ── agent library: your own agents, MCP servers, skills, a run's team ──
@@ -792,6 +865,8 @@ etick(T0 + 3, 2)
 ev_run = O["_orch_get"](rid)
 c.check("the entity approved its plan itself (not a human approval)",
         any(x["kind"] == "approved" and not x["human"] and "approved by entity" in x["message"] for x in ev_run["events"]))
+c.check("an entity's run isn't counted as your action (found live: '1 of your actions')",
+        ev_run["metrics"]["human_interventions"] == 0)
 etick(T0 + 4, 5)
 e = O["_orch_entities_list"]()["entities"][0]
 c.check("results wait for you: entity waiting_you, no new scout", O["_orch_get"](rid)["run"]["state"] == "review"
@@ -825,6 +900,19 @@ O["_orch_entity_save"](dict(base_ent))
 O["_orch_entity_action"]("run", {"id": "store-watch"})
 conn = O["_orch_connect"](); O["_orch_entity_tick"](conn, "store-watch", T0 + 6 + 64 * 60, **dict(ekw, limits={"windows": [{"label": "weekly", "pct": 95}]})); conn.commit(); conn.close()
 c.check("plan limits nearly used up -> it waits", "weekly plan limit is at 95" in O["_orch_entities_list"]()["entities"][0]["note"])
+# found live: paused while its scout was thinking -> the scout's goal still became a run (and was approved)
+O["_orch_entity_action"]("pause", {"id": "store-watch", "paused": False})
+O["_orch_entity_action"]("run", {"id": "store-watch"})
+scout_answers.append({"action": "run", "goal": "Write another store health report to health.md", "reason": "x", "mode": "flat"})
+n_runs = len(O["_orch_entities_list"]()["entities"][0]["runs"])
+conn = O["_orch_connect"](); O["_orch_entity_tick"](conn, "store-watch", T0 + 6 + 65 * 60, **ekw); conn.commit(); conn.close()
+c.check("(its scout is thinking)", O["_orch_entities_list"]()["entities"][0]["state"] == "scouting")
+O["_orch_entity_action"]("pause", {"id": "store-watch", "paused": True})
+etick(T0 + 6 + 66 * 60, 2)
+e = O["_orch_entities_list"]()["entities"][0]
+c.check("pause stops its scout: no run starts, the scout's cost still counts",
+        len(e["runs"]) == n_runs and e["state"] == "paused"
+        and any(x["kind"] == "scout_stopped" and x["cost_usd"] == 0.05 for x in e["events"]))
 c.check("forget clears its memory", O["_orch_entity_action"]("forget", {"id": "store-watch"})["ok"]
         and O["_orch_entities_list"]()["entities"][0]["memory"] == [])
 c.check("delete", O["_orch_entity_action"]("delete", {"id": "store-watch"})["ok"] and O["_orch_entities_list"]()["entities"] == [])
@@ -910,6 +998,10 @@ c.check("attention: your plan, results to review, a gate, a team plan you approv
 c.check("attention: not an entity's plan (it approves its own), not an auto-approved team plan, not a team's review",
         not any(i["run_id"] in ("en", "ch2", "chr") for i in items))
 c.check("attention: the gate names the agent", items[-1]["detail"] == "Shop Poster" and items[-1]["task_id"] == "post")
+aconn.execute("UPDATE runs SET goal=? WHERE id='ch'", ("Docs for partners\n\nDONE WHEN: pages exist\n\nOVERALL GOAL: portal",))
+c.check("attention: a team plan's title is its workstream, not the context from the run above",
+        next(i for i in O["_orch_attention_items"](aconn) if i["run_id"] == "ch")["title"] == "Docs for partners")
+aconn.execute("UPDATE runs SET goal='Goal ch' WHERE id='ch'")
 sent = []
 nfile = tempfile.mkdtemp()
 g["ORCH_NOTIFIED_FILE"] = os.path.join(nfile, "n.json")
@@ -1148,4 +1240,210 @@ sp_ = []
 O["_orch_spawn"](["x"], rd, "line1\nline2", os.path.join(rd, "sp"), popen=lambda *a, **k: sp_.append(1) or type("P", (), {"pid": 7})())
 c.check("the prompt file is written byte for byte (\\n, not \\r\\n)", open(os.path.join(rd, "sp.in"), "rb").read() == b"line1\nline2")
 shutil.rmtree(rd, ignore_errors=True)
+
+# ── scheduled runs: later + repeating (fake clock; nothing billed) ──
+vs = O["_orch_validate_schedule"]
+c.check("schedule: weekdays need HH:MM; every N h clamped; an unknown type is the first allowed",
+        vs({"type": "weekdays", "at": "7:5"}, ("daily", "weekdays", "every"))[1] == "on weekdays at HH:MM"
+        and vs({"type": "every", "hours": 0.1}, ("daily", "every"))[0] == {"type": "every", "hours": 0.5}
+        and vs({"type": "manual"}, ("daily", "every"))[1] == "daily at HH:MM"
+        and vs({"type": "weekdays", "at": "07:30"}, ("manual", "weekdays"))[0] == {"type": "weekdays", "at": "07:30"})
+c.check("entity: weekdays accepted too", O["_orch_validate_entity"](dict(base_ent, schedule={"type": "weekdays", "at": "06:00"}))[0]["schedule"]
+        == {"type": "weekdays", "at": "06:00"})
+# a Monday 09:00 local, found from today (no fixed date: it holds in any timezone)
+lt = time.localtime()
+mon = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - lt.tm_wday + 7, 9, 0, 0, 0, 0, -1))
+wd = {"type": "weekdays", "at": "09:00"}
+prev, nxt = O["_orch_slots"](wd, mon + 3600)
+c.check("weekdays: Monday 10:00 -> last slot Monday 09:00, next Tuesday 09:00",
+        prev == mon and time.localtime(nxt).tm_wday == 1 and time.localtime(nxt).tm_hour == 9 and 0 < nxt - mon < 2 * 86400)
+sat = mon + 5 * 86400 + 3600
+prev, nxt = O["_orch_slots"](wd, sat)
+c.check("weekdays: Saturday -> last slot Friday, next Monday",
+        time.localtime(prev).tm_wday == 4 and time.localtime(prev).tm_hour == 9 and time.localtime(nxt).tm_wday == 0
+        and nxt > sat and nxt - sat < 3 * 86400)
+dsched = {"schedule": {"type": "daily", "at": "09:00"}}
+c.check("daily: missed slots while AOC was off (3 days) -> due once at startup, even before today's slot",
+        due(dsched, {"last_scout": mon - 3 * 86400 + 60}, None, mon - 3600)[0] is True)
+c.check("daily: after that firing (counted from now) the old slots don't fire again; next = today's slot",
+        due(dsched, {"last_scout": mon - 3600}, None, mon - 3500)[:1] == (False,)
+        and due(dsched, {"last_scout": mon - 3600}, None, mon - 3500)[2] == mon)
+c.check("weekdays: Friday's slot missed over the weekend -> once on Monday morning; not on Sunday after it fired",
+        due({"schedule": wd}, {"last_scout": mon - 4 * 86400}, None, mon - 3600)[0] is True
+        and not due({"schedule": wd}, {"last_scout": mon - 2 * 86400}, None, mon - 3600)[0])
+c.check("every N h: missed several times -> due once", due({"schedule": {"type": "every", "hours": 2}}, {"last_scout": mon - 10 * 3600}, None, mon)[0]
+        and not due({"schedule": {"type": "every", "hours": 2}}, {"last_scout": mon}, None, mon + 60)[0])
+
+vr = O["_orch_validate_repeat"]
+rbase = {"goal": "Update the dependencies and run the tests", "cwd": "C:\\x" if os.name == "nt" else "/x",
+         "schedule": {"type": "daily", "at": "02:00"}, "budget_usd": 3}
+rc_, err = vr(rbase)
+c.check("repeat: defaults (caps that grow from the run budget, plans wait for you)", err is None and rc_["budget_day"] == 10
+        and rc_["budget_month"] == 100 and rc_["auto_approve"] is False and rc_["schedule"] == {"type": "daily", "at": "02:00"})
+c.check("repeat: refused -- a short goal, no folder, caps that don't grow, bad time",
+        "goal" in vr(dict(rbase, goal="x"))[1] and "folder" in vr(dict(rbase, cwd="rel"))[1]
+        and "grow" in vr(dict(rbase, budget_day=2))[1] and "HH:MM" in vr(dict(rbase, schedule={"type": "daily", "at": "24:00"}))[1])
+c.check("repeat: a workspace instead of a folder", vr(dict(rbase, cwd="", workspace="Nightly Ops"))[0]["workspace"] == "nightly-ops")
+blk = O["_orch_schedule_block"]
+cfg_ = dict(rc_, budget_usd=3, budget_day=10, budget_month=20)
+c.check("skip: the last run still works (or waits for its plan OK) -> no overlap",
+        "still running" in blk(cfg_, {"id": "r1", "state": "running"}, (0, 0), "api", {})
+        and "still plan ready" in blk(cfg_, {"id": "r1", "state": "plan_ready"}, (0, 0), "api", {})
+        and blk(cfg_, {"id": "r1", "state": "review"}, (0, 0), "api", {}) == "")
+c.check("skip: a run that would cross today's / this month's cap",
+        "today's budget: $7.50 of $10.00" in blk(cfg_, None, (7.5, 7.5), "api", {}) and "this month's budget" in blk(cfg_, None, (0, 18), "api", {})
+        and blk(cfg_, None, (7, 17), "api", {}) == "")
+hot = {"windows": [{"label": "5h", "pct": 95}]}
+c.check("skip: plan limits nearly used up -- only when runs are on your subscription",
+        "5h plan limit is at 95" in blk(cfg_, None, (0, 0), "subscription", hot) and blk(cfg_, None, (0, 0), "api", hot) == "")
+
+srepo = os.path.realpath(tempfile.mkdtemp())
+git("init", "-q", "-b", "main", cwd=srepo); git("config", "user.email", "t@t", cwd=srepo); git("config", "user.name", "t", cwd=srepo)
+open(os.path.join(srepo, "a.txt"), "w").write("a\n"); git("add", "-A", cwd=srepo); git("commit", "-qm", "init", cwd=srepo)
+sc_calls = []
+
+
+def sspawn(argv, cwd, stdin_text, base, env=None):
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    kind = os.path.basename(base).rsplit("-", 1)[0]
+    sc_calls.append((kind, cwd))
+    if kind == "plan":
+        answer(base, plan_of({"id": "deps", "role": "developer", "title": "Deps"}), cost=0.2)
+    elif kind == "supervise":
+        answer(base, finish("done"))
+    else:
+        open(os.path.join(cwd, "deps.txt"), "w").write("ok\n")
+        answer(base, done(result="wrote deps.txt"), cost=0.5)
+    return 21
+
+
+skw = dict(exe="claude.exe", spawn=sspawn, git=None)
+
+# run later
+S0 = mon - 86400 * 7 + 8 * 3600   # a Monday 17:00, a week before `mon`
+c.check("later: a start time in the past refused", "future" in O["_orch_create"](
+    {"goal": "Upgrade the build tooling", "cwd": srepo, "start_at": S0 - 60}, now=S0, **skw)["error"])
+rl = O["_orch_create"]({"goal": "Upgrade the build tooling", "cwd": srepo, "start_at": S0 + 3600}, now=S0, **skw)
+lv = O["_orch_get"](rl["id"])
+c.check("later: the run waits as 'scheduled' with its start time; no planner yet",
+        rl["ok"] and rl["scheduled"] and lv["run"]["state"] == "scheduled" and lv["run"]["start_at"] == S0 + 3600 and not sc_calls
+        and any(e["kind"] == "scheduled" for e in lv["events"]))
+rnow = O["_orch_create"]({"goal": "Fix the typo in the readme", "cwd": srepo}, now=S0 + 1, **skw).get("id")
+c.check("later: it doesn't hold the repo -- a run now still starts there", bool(rnow))
+conn = O["_orch_connect"](); O["_orch_start_due"](conn, rl["id"], S0 + 3600, **skw); conn.commit(); conn.close()
+lv = O["_orch_get"](rl["id"])
+c.check("later: its time came while the repo is busy -> it waits, says why once, keeps trying",
+        lv["run"]["state"] == "scheduled" and "another orchestration in progress" in lv["run"]["error"]
+        and sum(1 for e in lv["events"] if e["kind"] == "waiting") == 1)
+conn = O["_orch_connect"](); O["_orch_start_due"](conn, rl["id"], S0 + 3700, **skw); conn.commit(); conn.close()
+c.check("later: still busy -> not said twice", sum(1 for e in O["_orch_get"](rl["id"])["events"] if e["kind"] == "waiting") == 1)
+O["_orch_action"]("cancel", {"id": rnow})
+n_plans = sum(1 for k, _ in sc_calls if k == "plan")
+conn = O["_orch_connect"](); O["_orch_start_due"](conn, rl["id"], S0 + 7200, **skw); conn.commit(); conn.close()
+lv = O["_orch_get"](rl["id"])
+c.check("later: the repo is free -> it plans now (time counted from its real start), once",
+        lv["run"]["state"] == "planning" and lv["run"]["created"] == S0 + 7200 and lv["run"]["error"] == ""
+        and sum(1 for k, _ in sc_calls if k == "plan") == n_plans + 1)
+conn = O["_orch_connect"](); O["_orch_start_due"](conn, rl["id"], S0 + 7300, **skw); conn.commit(); conn.close()
+c.check("later: started once -- a second tick does nothing", sum(1 for k, _ in sc_calls if k == "plan") == n_plans + 1)
+O["_orch_action"]("cancel", {"id": rl["id"]})
+rl2 = O["_orch_create"]({"goal": "Upgrade the build tooling again", "cwd": srepo, "start_at": time.time() + 86400}, **skw)["id"]
+c.check("later: start now (by you, before its time)", O["_orch_action"]("start", {"id": rl2}, **skw)["ok"]
+        and O["_orch_get"](rl2)["run"]["state"] == "planning"
+        and any(e["kind"] == "started" and e["human"] for e in O["_orch_get"](rl2)["events"]))
+c.check("later: start now refused once it runs", not O["_orch_action"]("start", {"id": rl2}, **skw)["ok"])
+O["_orch_action"]("cancel", {"id": rl2})
+rl3 = O["_orch_create"]({"goal": "Upgrade the build tooling once more", "cwd": srepo, "start_at": time.time() + 86400}, **skw)["id"]
+c.check("later: cancelled before it started -> cancelled, nothing ran", O["_orch_action"]("cancel", {"id": rl3})["ok"]
+        and O["_orch_get"](rl3)["run"]["state"] == "cancelled" and "before it started" in O["_orch_get"](rl3)["events"][-1]["message"])
+
+# repeat: daily at 02:00, made on a Monday 17:00
+def at2(days):   # 02:00 local, `days` after S0's day (mktime: DST-proof)
+    t = time.localtime(S0)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday + days, 2, 0, 0, 0, 0, -1))
+
+
+two = at2(1)   # Tuesday 02:00
+rs = O["_orch_schedule_save"](dict(rbase, cwd=srepo, budget_day=5, budget_month=50), now=S0)
+sid = rs.get("id")
+c.check("schedule saved: no slot before it existed fires; first run next 02:00", rs["ok"] and rs["next_due"] == two)
+
+
+def stick(now):
+    conn = O["_orch_connect"]()
+    O["_orch_schedule_tick"](conn, sid, now, limits={}, **skw)
+    for (rid_,) in conn.execute("SELECT id FROM runs WHERE state IN ('planning','running','supervising') AND schedule_id=?",
+                                (sid,)).fetchall():
+        O["_orch_step"](conn, rid_, now, exe="claude.exe", spawn=sspawn, alive=lambda pid: False, kill=lambda pid: None)
+    conn.commit(); conn.close()
+    return O["_orch_schedules_list"](now)["schedules"][0]
+
+
+s = stick(S0 + 60)
+c.check("not due yet: nothing starts", not s["runs"] and s["next_due"] == two)
+s = stick(two + 30)
+r1 = s["runs"][0]["id"] if s["runs"] else ""
+rv1 = O["_orch_get"](r1)["run"] if r1 else {}
+c.check("due: an ordinary run linked to the schedule (its goal, repo, budget), the firing logged",
+        bool(r1) and rv1["schedule_id"] == sid and rv1["budget_usd"] == 3 and rv1["goal"] == rbase["goal"]
+        and s["last_result"] == "started run " + r1 and s["events"][-1]["kind"] == "fired" and s["next_due"] == at2(2))
+c.check("its plan waits for you (no auto-approve)", O["_orch_get"](r1)["run"]["state"] == "plan_ready")
+s = stick(at2(2) + 30)
+c.check("next day the last run still waits for its plan OK -> that firing is skipped and logged",
+        len(s["runs"]) == 1 and s["last_result"].startswith("skipped: its last run") and s["events"][-1]["kind"] == "skipped"
+        and s["next_due"] == at2(3))
+O["_orch_action"]("cancel", {"id": r1})
+# AOC off for 3 days: one firing at startup, not three
+s = stick(two + 5 * 86400 + 4 * 3600)
+c.check("missed 3 slots while AOC was off -> one run at startup", len(s["runs"]) == 2 and s["events"][-1]["kind"] == "fired")
+r2 = s["runs"][0]["id"]
+O["_orch_action"]("cancel", {"id": r2})
+s = stick(two + 5 * 86400 + 4 * 3600 + 60)
+c.check("... and not again right after", len(s["runs"]) == 2)
+c.check("pause", O["_orch_schedule_action"]("pause", {"id": sid}, now=two + 5 * 86400 + 5 * 3600)["ok"])
+s = stick(two + 7 * 86400 + 60)
+c.check("paused: its slots don't fire, no next run shown", len(s["runs"]) == 2 and s["paused"] and s["next_due"] is None)
+O["_orch_schedule_action"]("pause", {"id": sid, "paused": False}, now=two + 7 * 86400 + 3600)
+s = stick(two + 7 * 86400 + 3700)
+c.check("resumed: the slots it was paused through don't fire; it counts from now", len(s["runs"]) == 2
+        and not s["paused"] and s["next_due"] == at2(9))
+# budget: auto-approved runs that spend; the day's cap stops the next firing
+conn = O["_orch_connect"]()
+conn.execute("UPDATE schedules SET data=? WHERE id=?", (json.dumps(dict(json.loads(conn.execute(
+    "SELECT data FROM schedules WHERE id=?", (sid,)).fetchone()[0]), auto_approve=True, budget_day=3.5,
+    schedule={"type": "every", "hours": 1})), sid))
+conn.commit(); conn.close()
+T1 = two + 8 * 86400 + 60
+for k in range(6):
+    s = stick(T1 + k)
+r3 = s["runs"][0]["id"]
+ev3 = O["_orch_get"](r3)
+c.check("auto-approve: the schedule approved its run's plan (not a human); the run went on to review",
+        any(x["kind"] == "approved" and not x["human"] and "approved by its schedule" in x["message"] for x in ev3["events"])
+        and ev3["run"]["state"] == "review")
+O["_orch_action"]("discard", {"id": r3})
+s = stick(T1 + 3600 + 10)
+c.check("cap: today's spend + one more run would cross the day's cap -> skipped, says why",
+        s["last_result"].startswith("skipped: today's budget") and len(s["runs"]) == 3 and s["spend_day"] > 0.5)
+c.check("delete: the schedule goes, its runs stay", O["_orch_schedule_action"]("delete", {"id": sid})["ok"]
+        and O["_orch_schedules_list"]()["schedules"] == [] and O["_orch_get"](r3)["run"]["schedule_id"] == sid)
+c.check("unknown schedule", not O["_orch_schedule_action"]("pause", {"id": "nope"})["ok"])
+shutil.rmtree(srepo, ignore_errors=True)
+
+# an old orchestration.db (before scheduled runs) gets the new columns and tables
+olddb = os.path.join(tempfile.mkdtemp(), "old.db")
+oc = sqlite3.connect(olddb)
+oc.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, created REAL, updated REAL, goal TEXT, repo TEXT, base TEXT, base_sha TEXT, "
+           "state TEXT, model TEXT, max_parallel INTEGER, budget_usd REAL, plan_summary TEXT, single_agent INTEGER DEFAULT 0, "
+           "report TEXT DEFAULT '', error TEXT DEFAULT '', rounds INTEGER DEFAULT 0, job_kind TEXT DEFAULT '', job_pid INTEGER, "
+           "job_base TEXT DEFAULT '', job_started REAL, finished REAL)")
+oc.execute("INSERT INTO runs (id, goal, state) VALUES ('old', 'an old run', 'merged')")
+oc.commit(); oc.close()
+oc = O["_orch_connect"](olddb)
+cols = {r[1] for r in oc.execute("PRAGMA table_info(runs)")}
+tabs = {r[0] for r in oc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+c.check("migration: start_at + schedule_id added, schedules tables made, old rows kept",
+        {"start_at", "schedule_id"} <= cols and {"schedules", "schedule_events"} <= tabs
+        and oc.execute("SELECT schedule_id FROM runs WHERE id='old'").fetchone()[0] == "")
+oc.close()
 c.finish()

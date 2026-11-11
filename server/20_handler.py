@@ -595,7 +595,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode(), no_cache=True)
         elif path_no_qs == "/voice/settings":
             self._serve(200, "application/json", json.dumps(_voice_settings()).encode(), no_cache=True)
-        elif path_no_qs in ("/orch/runs", "/orch/run", "/orch/agents", "/orch/catalog", "/orch/workspaces", "/orch/entities", "/orch/settings", "/orch/stats", "/orch/compare"):
+        elif path_no_qs in ("/orch/runs", "/orch/run", "/orch/agents", "/orch/catalog", "/orch/workspaces", "/orch/entities", "/orch/settings", "/orch/stats", "/orch/compare",
+                            "/orch/schedules", "/orch/commits"):
             from urllib.parse import urlparse, parse_qs
             try:
                 if path_no_qs == "/orch/agents":
@@ -608,6 +609,10 @@ class Handler(BaseHTTPRequestHandler):
                     reply = _orch_settings()
                 elif path_no_qs == "/orch/entities":
                     reply = _orch_entities_list()
+                elif path_no_qs == "/orch/schedules":
+                    reply = _orch_schedules_list()
+                elif path_no_qs == "/orch/commits":
+                    reply = _orch_commits((parse_qs(urlparse(self.path).query).get("id") or [""])[0])
                 elif path_no_qs == "/orch/workspaces":
                     reply = _orch_workspaces()
                 elif path_no_qs == "/orch/catalog":
@@ -1234,7 +1239,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path_no_qs in ("/orch/create", "/orch/plan", "/orch/approve", "/orch/cancel", "/orch/merge", "/orch/discard", "/orch/gate",
                             "/orch/baseline", "/orch/judge",
                             "/orch/agent_save", "/orch/agent_delete", "/orch/entity_save", "/orch/entity_run",
-                            "/orch/entity_pause", "/orch/entity_forget", "/orch/entity_delete", "/orch/settings"):
+                            "/orch/entity_pause", "/orch/entity_forget", "/orch/entity_delete", "/orch/settings",
+                            "/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete"):
             # starts paid agents, creates/merges/deletes git branches: this PC, or the owner / a member
             # through the tunnel (their own token; viewers never get here -- _authorize)
             if not (self._is_direct_loopback() or self._user["role"] in ("owner", "member")):
@@ -1258,6 +1264,10 @@ class Handler(BaseHTTPRequestHandler):
                     reply = _orch_settings_save(data)
                 elif act == "entity_save":
                     reply = _orch_entity_save(data)
+                elif act == "schedule_save":
+                    reply = _orch_schedule_save(data)
+                elif act.startswith("schedule_"):
+                    reply = _orch_schedule_action(act[len("schedule_"):], data)
                 elif act.startswith("entity_"):
                     reply = _orch_entity_action(act[len("entity_"):], data)
                 else:

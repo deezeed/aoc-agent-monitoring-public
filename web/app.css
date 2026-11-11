@@ -2467,7 +2467,7 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
 .or-new summary { cursor:pointer;list-style:none; }
 .or-new form { display:flex;flex-direction:column;gap:6px;margin-top:8px; }
 .or-new textarea, .or-edit textarea { width:100%;box-sizing:border-box;font-family:var(--font2);font-size:12px; }
-#or-cwd { width:100%;box-sizing:border-box; }
+#or-cwd, #or-ws { width:100%;box-sizing:border-box; }
 .or-grid { display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:12px;align-items:start; }
 .or-grid > .or-detail:only-child { grid-column:1 / -1; }
 .or-run { display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:100%;text-align:left;background:none;border:1px solid transparent;border-radius:5px;padding:7px 8px;margin:0 0 4px;cursor:pointer;color:var(--t); }
@@ -2563,13 +2563,18 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
 .or-ent-team { display:flex;gap:4px;flex-wrap:wrap; } .or-ent-team .or-chip { text-transform:none;letter-spacing:0;font-size:9px; }
 .or-ent-buds { display:flex;gap:10px;flex-wrap:wrap;align-items:center; }
 .or-bud { position:relative;min-width:120px;font-size:10px;color:var(--t2);padding-bottom:4px; }
-.or-bud i { position:absolute;left:0;bottom:0;height:3px;border-radius:2px;background:var(--g); } .or-bud i.hi { background:var(--o); }
-.or-bud::after { content:'';position:absolute;left:0;right:0;bottom:0;height:3px;border-radius:2px;background:var(--border);z-index:-1; }
+.or-bud i { position:absolute;left:0;bottom:0;height:3px;border-radius:2px;background:var(--g);z-index:1; } .or-bud i.hi { background:var(--o); }
+/* the track: under the bar, not under the card (z-index:-1 hid it behind an opaque light-theme card) */
+.or-bud::after { content:'';position:absolute;left:0;right:0;bottom:0;height:3px;border-radius:2px;background:var(--border);z-index:0; }
 .or-ent-runs { display:flex;flex-direction:column;gap:3px; }
 .or-ent-run { text-align:left;background:none;border:none;color:var(--t2);font-size:11px;cursor:pointer;padding:2px 0;display:flex;gap:6px;align-items:center;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis; }
 .or-ent-run:hover { color:var(--t); }
 .or-ent .or-log summary .adp-btn { font-size:9px;padding:1px 8px;margin-left:8px; }
-.or-en-cwd { flex:1;min-width:200px; }
+/* grows on its row, wraps to its own on a phone (#orch-area's min-width:0 used to squeeze it to a few letters) */
+#orch-area .or-en-cwd { flex:1 1 200px; }
+.or-sch { border-left-color:var(--c); } .or-sch-paused { border-left-color:var(--t3);opacity:.75; }
+.or-sch .or-actions { align-items:center; }
+.or-commits-t td { padding:3px 6px;font-size:11px;vertical-align:middle; } .or-commits-t .cc-subj { word-break:break-word; }
 @media (max-width: 600px) { .or-ent-grid { grid-template-columns:1fr; } }
 .or-top { display:flex; }
 .or-billing { font-size:11px;color:var(--t2);display:flex;align-items:center;gap:6px; }
@@ -2588,7 +2593,7 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
 /* ── Voice assistant (web/js/20_voice.js) ── */
 .vo-panel { position:fixed;right:16px;bottom:16px;width:380px;max-width:calc(100vw - 32px);max-height:min(560px, calc(100vh - 100px));z-index:900;
   display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:10px;background:var(--bay);border:1px solid var(--c);box-shadow:0 10px 40px rgba(0,0,0,.45);box-sizing:border-box; }
-body.light .vo-panel { background:#f6f9fb; }
+body.light .vo-panel { background:var(--bay); }
 .vo-h { display:flex;align-items:center;gap:8px;color:var(--t); }
 .vo-off p { font-size:12px;color:var(--t2);line-height:1.45;margin:4px 0 8px; }
 .vo-log { flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;min-height:60px; }
@@ -2600,7 +2605,7 @@ body.light .vo-panel { background:#f6f9fb; }
 .vo-in { display:flex;gap:8px;align-items:center; } .vo-in input { flex:1;min-width:0; }
 .vo-mic { width:44px;height:44px;border-radius:50%;border:1px solid var(--c);background:rgba(var(--c-rgb),.12);color:var(--t);font-size:18px;cursor:pointer;flex:none; }
 .vo-mic.live { background:var(--r);border-color:var(--r);color:#fff;animation:vo-pulse 1.2s infinite; }
-@keyframes vo-pulse { 0%,100% { box-shadow:0 0 0 0 rgba(239,106,87,.5); } 50% { box-shadow:0 0 0 8px rgba(239,106,87,0); } }
+@keyframes vo-pulse { 0%,100% { box-shadow:0 0 0 0 color-mix(in srgb, var(--r) 50%, transparent); } 50% { box-shadow:0 0 0 8px transparent; } }
 .vo-set { display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:10px; } .vo-set .settings-input { width:auto;font-size:10px; }
 #btn-voice.vo-live { color:var(--r); }
 .vo-panel { background:var(--console);backdrop-filter:blur(12px); }
@@ -2617,7 +2622,7 @@ body.light .vo-panel { background:#f6f9fb; }
 .pe-inv { margin-top:10px;flex-wrap:wrap; } .pe-inv .settings-input { width:auto; }
 .pe-link { display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;margin-top:8px; } .pe-link input { flex:1;min-width:200px; }
 .pe-strip { position:sticky;top:0;z-index:950;padding:5px 12px;font:600 11px var(--font2);text-align:center;background:rgba(var(--c-rgb),.18);color:var(--t); }
-.pe-strip.pe-viewer { background:rgba(224,161,58,.22); }
+.pe-strip.pe-viewer { background:color-mix(in srgb, var(--o) 22%, transparent); }
 
 /* ── Shared sessions (web/js/22_shared.js) ── */
 .sh-panel { right:16px;left:auto; }

@@ -20,4 +20,5 @@ const bar = _shBarHtml({ name: 'Pair', people: [{ name: 'Marco Rossi', role: 'me
 c.check('bar: who is there, who is typing, watching-only', bar.includes('>MR<') && bar.includes('Marco is typing') && bar.includes('watching') && bar.includes('_shLeave()'));
 c.check('bar: ended', _shBarHtml({ name: 'P', people: [], typing: '', me: { can_type: true }, ended: true }).includes('ended')
   && !_shBarHtml({ name: 'P', people: [], typing: '', me: { can_type: true }, ended: false }).includes('watching'));
+c.check('start form: the folder example shows single backslashes', own.includes('placeholder="folder, e.g. C:\\path\\to\\project"'));
 c.finish();

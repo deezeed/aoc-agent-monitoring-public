@@ -125,7 +125,12 @@ e4["clients"][fast] = owner
 e4["clients"][stuck] = {"id": "eva", "name": "Eva", "role": "viewer"}
 for i in range(S["_SharedOut"].LIMIT + 5):
     S["_shared_broadcast"](e4, b"x")
-time.sleep(0.3)
+    if i % 64 == 63:
+        time.sleep(0.002)   # the real pty reader blocks on each read; lets the writers run (CI flake)
+for _ in range(100):
+    if len(fast.frames) == S["_SharedOut"].LIMIT + 5 and stuck not in e4["clients"]:
+        break
+    time.sleep(0.05)
 c.check("a stalled client: the others still get everything", len(fast.frames) == S["_SharedOut"].LIMIT + 5)
 c.check("... and once it's too far behind it is dropped (its socket shut)", stuck not in e4["clients"] and stuck.shut)
 S["_shared_stop"]({"id": r4["id"]})

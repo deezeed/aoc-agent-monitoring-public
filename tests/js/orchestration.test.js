@@ -18,7 +18,8 @@ for (const v of ['_OR_PLAN_FIELDS', '_OR_TASK_BUDGET']) {
   (0, eval)(m[0]);   // indirect eval: the var(s) on that line become globals
 }
 for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_fmtDurShort', '_orChip', '_orMoney', '_orFormHtml', '_orRunsHtml',
-  '_orMetricsHtml', '_orCompareHtml', '_orTaskHtml', '_orGoalHtml', '_orPickSet', '_orStatsHtml', '_orInboxHtml', '_orBillingHtml', '_orRulesHtml', '_orScheduleText', '_orWhen', '_orBudgetBar', '_orEntityCardHtml', '_orEntityDraftOf', '_orEntityEditorHtml', '_orEntitiesHtml', '_orFormDefaults', '_orTeamOf', '_orClipText', '_orAgentCardHtml', '_orAgentEditorHtml', '_orAgentsHtml', '_orAgentDraftOf', '_orDraftFrom', '_orSlug', '_orDraftAdd', '_orDraftRemove', '_orDraftMove', '_orDraftRename', '_orPlanCheck', '_orPlanEditorHtml', '_orDetailHtml', '_orHtml', '_orConfirmText']) eval(extractFunction(src, f));
+  '_orMetricsHtml', '_orCompareHtml', '_orTaskHtml', '_orGoalHtml', '_orPickSet', '_orStatsHtml', '_orInboxHtml', '_orBillingHtml', '_orRulesHtml', '_orScheduleText', '_orWhen', '_orBudgetBar', '_orEntityCardHtml', '_orEntityDraftOf', '_orEntityEditorHtml', '_orEntitiesHtml', '_orFormDefaults', '_orTeamOf', '_orClipText', '_orAgentCardHtml', '_orAgentEditorHtml', '_orAgentsHtml', '_orAgentDraftOf', '_orDraftFrom', '_orSlug', '_orDraftAdd', '_orDraftRemove', '_orDraftMove', '_orDraftRename', '_orPlanCheck', '_orPlanEditorHtml', '_orDetailHtml', '_orHtml', '_orConfirmText',
+  '_orLocalInput', '_orWhenBody', '_orWhenHtml', '_orRepeatCardHtml', '_orLaterCardHtml', '_orScheduledHtml', '_orCommitsHtml']) eval(extractFunction(src, f));
 const c = new Checker();
 global._orState = { pick: null };
 
@@ -217,6 +218,8 @@ c.check('entity editor: mission, workspace offered, team checked, budgets, daily
   eed.includes('Keep the store healthy</textarea>') && eed.includes('<option value="store-watch">') && /checked[^>]*_orEntityTeam\(&quot;shop&quot;/.test(eed)
   && eed.includes('$ per month') && eed.includes('type="time" value="08:00"') && eed.includes('min later') && eed.includes('start paused'));
 c.check('entity editor: a repo entity asks for the folder', _orEntityEditorHtml(Object.assign(_orEntityDraftOf(null), { where: 'repo' }), lib, []).includes('or-en-cwd'));
+c.check('entity editor: the repo example shows single backslashes; the workspace field gets the wide input', _orEntityEditorHtml(Object.assign(_orEntityDraftOf(null), { where: 'repo' }), lib, []).includes('placeholder="C:\\path\\to\\repo"')
+  && /class="settings-input or-en-cwd" list="or-en-wss"/.test(_orEntityEditorHtml(_orEntityDraftOf(null), lib, [])));
 c.check('entities section: count, + New entity (or the editor)', _orEntitiesHtml([ent], null, lib, []).includes('Entities · 1')
   && _orEntitiesHtml([ent], null, lib, []).includes('+ New entity') && !_orEntitiesHtml([], nd, lib, []).includes('+ New entity'));
 c.check('billing picker: current choice, no-key note only when it matters',
@@ -296,4 +299,70 @@ c.check('rules card: an unsaved change -> Save on', !_orRulesHtml({ rules: 'a' }
 c.check('rules card: no settings yet -> nothing', _orRulesHtml(null, null) === '');
 c.check('cancel / discard confirm: the other version stays', _orConfirmText('cancel', Object.assign(view('running'), { baseline: '1107-1200-solo' })).includes('run 1107-1200-solo) stays')
   && _orConfirmText('discard', sv).includes('run 1107-1200) stays') && !_orConfirmText('discard', view('review')).includes('stays'));
+
+// ── when: now / later / repeat ──
+const nowMs = new Date(2026, 10, 11, 9, 7).getTime();
+c.check('later: the start time for the input is local and rounded up to a quarter hour',
+  _orLocalInput(nowMs) === '2026-11-11T09:15' && _orLocalInput(new Date(2026, 11, 31, 23, 50).getTime()) === '2027-01-01T00:00');
+c.check('when now: nothing added to the run', JSON.stringify(_orWhenBody(Object.assign(_orFormDefaults(), {}), nowMs)) === '{}');
+const lb = _orWhenBody(Object.assign(_orFormDefaults(), { when: 'later', at: '2026-11-11T10:30' }), nowMs);
+c.check('later: start_at in epoch seconds of that local time', lb.start_at === new Date(2026, 10, 11, 10, 30).getTime() / 1000 && !lb.error);
+c.check('later: a past or missing time refused', _orWhenBody(Object.assign(_orFormDefaults(), { when: 'later', at: '2026-11-11T09:00' }), nowMs).error === 'pick a start time in the future'
+  && _orWhenBody(Object.assign(_orFormDefaults(), { when: 'later', at: '' }), nowMs).error === 'pick a start time');
+const rb = _orWhenBody(Object.assign(_orFormDefaults(), { when: 'repeat', rtype: 'weekdays', rat: '07:45', bday: 12, bmonth: 150, auto: true }), nowMs);
+c.check('repeat: the clock, the caps and whether it approves its own plans',
+  JSON.stringify(rb) === JSON.stringify({ schedule: { type: 'weekdays', at: '07:45' }, budget_day: 12, budget_month: 150, auto_approve: true })
+  && JSON.stringify(_orWhenBody(Object.assign(_orFormDefaults(), { when: 'repeat', rtype: 'every', rhours: 6 }), nowMs).schedule) === '{"type":"every","hours":6}');
+const fNow = _orFormHtml([], true, _orFormDefaults(), [], []);
+const fLater = _orFormHtml([], true, Object.assign(_orFormDefaults(), { when: 'later', at: '2026-11-11T10:30' }), [], []);
+const fRep = _orFormHtml([], true, Object.assign(_orFormDefaults(), { when: 'repeat', rtype: 'every', auto: true }), [], []);
+c.check('form: When row; Plan it now, a start time later, a clock + caps to repeat',
+  fNow.includes('or-when') && fNow.includes('>Plan it<') && !fNow.includes('datetime-local')
+  && fLater.includes('type="datetime-local"') && fLater.includes('value="2026-11-11T10:30"') && fLater.includes('>Schedule it<')
+  && fRep.includes('or-bday') && fRep.includes('or-bmonth') && fRep.includes('hours') && fRep.includes('>Save the schedule<')
+  && fRep.includes('Each run approves its own plan') && fNow.includes('Nothing runs before you approve the plan'));
+c.check('schedule in words: weekdays', _orScheduleText({ schedule: { type: 'weekdays', at: '07:45' } }) === 'on weekdays at 07:45');
+const sch = { id: 's1111-090000', paused: false, next_due: 1e9, last_result: 'skipped: its last run (r1) is still running',
+  spend_day: 2, spend_month: 9, created: 1, config: { goal: 'Nightly <deps> check', cwd: 'C:\\r\\shop', workspace: '', budget_usd: 3,
+    budget_day: 10, budget_month: 100, schedule: { type: 'daily', at: '02:00' }, auto_approve: true },
+  runs: [{ id: 'r1', goal: 'g', state: 'running', created: 1 }], events: [{ ts: 1, kind: 'skipped', message: 'its <last> run', user: '' }] };
+const sc = _orRepeatCardHtml(sch);
+c.check('repeat card: clock, escaped goal, folder, caps, next run, last result as a warning, last run, pause / delete, log',
+  sc.includes('daily at 02:00') && sc.includes('Nightly &lt;deps&gt; check') && sc.includes('shop') && sc.includes('today $2.00 / $10.00')
+  && sc.includes('Next run:') && sc.includes('or-warn">Last: skipped') && sc.includes('last run r1') && sc.includes('approves its plans')
+  && sc.includes('_orScheduleAct(\'pause\',&quot;s1111-090000&quot;,true)') && sc.includes('>Delete<') && sc.includes('its &lt;last&gt; run'));
+const scp = _orRepeatCardHtml(Object.assign({}, sch, { paused: true, last_result: 'started run r2', runs: [] }));
+c.check('repeat card paused: Resume, no next run, a plain last result', scp.includes('>Resume<') && scp.includes('_orScheduleAct(\'pause\',&quot;s1111-090000&quot;,false)')
+  && !scp.includes('Next run:') && scp.includes('or-note">Last: started run r2'));
+const later = { id: '1111-0900', goal: 'Upgrade <x>', repo: 'C:\\r\\shop', state: 'scheduled', start_at: 2e9, tasks: 0, metrics };
+const sh = _orScheduledHtml([later, { id: 'r', goal: 'g', repo: 'x', state: 'merged', tasks: 1, metrics }], [sch]);
+c.check('Scheduled: runs for later (start now / cancel) and repeating runs; nothing scheduled -> no card',
+  sh.includes('Scheduled · 2') && sh.includes('Upgrade &lt;x&gt;') && sh.includes('_orLaterAct(\'start\',&quot;1111-0900&quot;)')
+  && sh.includes('_orLaterAct(\'cancel\',&quot;1111-0900&quot;)') && sh.includes('Nightly') && _orScheduledHtml([], []) === ''
+  && _orScheduledHtml([{ state: 'merged' }], []) === '');
+c.check('runs list: a run for later shows its start time; a repeat run is marked', _orRunsHtml([later], '').includes('starts ')
+  && _orRunsHtml([Object.assign({}, later, { state: 'running', schedule_id: 's1' })], '').includes('>repeat<'));
+const schedView = Object.assign(view('running'), { tasks: [] });
+schedView.run = Object.assign({}, schedView.run, { state: 'scheduled', start_at: 2e9, error: 'waiting: this repo has <another> one' });
+const sd = _orDetailHtml(schedView, false);
+c.check('a run for later: start now / cancel, when it starts, why it waits (escaped)', sd.includes('Start now') && sd.includes('_orLaterAct(\'cancel\'')
+  && sd.includes('Starts ') && sd.includes('waiting: this repo has &lt;another&gt; one') && !sd.includes('Cancel run'));
+c.check('whole view: the Scheduled card above the form', _orHtml({ runs: [later], sel: '', view: null, dirs: [], editing: false, err: '', formOpen: null, schedules: [] }).includes('Scheduled · 1'));
+
+// ── links: History session, commits ──
+c.check('task card: a History link only when History has the session',
+  _orTaskHtml(task('api', { in_history: true })).includes('_jumpToSessionHistory(&quot;abcdef123456&quot;)')
+  && !_orTaskHtml(task('api')).includes('_jumpToSessionHistory')
+  && !_orTaskHtml(task('m', { role: 'manager', in_history: true })).includes('_jumpToSessionHistory'));
+const mv = view('merged');
+mv.tasks[0].in_history = true;
+const cm0 = _orDetailHtml(mv, false, null, false, null);
+c.check('run commits: offered once there are commits, loaded when opened', cm0.includes('Commits (2) · merged into main') && cm0.includes('Loading…')
+  && !_orDetailHtml(view('running'), false).includes('Commits ('));
+const cm = _orCommitsHtml({ run: mv.run.id, commits: [{ sha: 'abcdef1234567890', subject: 'Add <api>', task: 'api', when: 1 },
+  { sha: '1234567aaaa', subject: '', task: 'ui', when: 2 }] }, mv);
+c.check('run commits: short sha, escaped subject, task, the session link when History has it',
+  cm.includes('>abcdef1<') && cm.includes('Add &lt;api&gt;') && cm.includes('<code>api</code>') && (cm.match(/_jumpToSessionHistory/g) || []).length === 1
+  && cm.includes('(no message)'));
+c.check('run commits: none found said so', _orCommitsHtml({ run: mv.run.id, commits: [] }, mv).includes('No commits found'));
 c.finish();

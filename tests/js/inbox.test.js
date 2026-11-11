@@ -53,5 +53,14 @@ const reply = _inboxHtml(_inboxItems({ sessions_list: [S('rp', { waiting_on_you:
 c.check('reply ask reused', reply.includes('_replyOpen(') && reply.includes('Claude asks'));
 const empty = _inboxHtml([], now);
 c.check('empty state', empty.includes('All clear') && empty.includes('Nothing needs you right now.') && !empty.includes('ib-item'));
+// orchestration items: under the header, counted in it; with nothing else waiting it is not "All clear"
+eval(src.match(/var _OR_ATTN=\{[\s\S]*?\};/)[0]);
+eval(extractFunction(src, '_orInboxHtml'));
+const orch = [{ key: 'plan:R1', kind: 'plan', run_id: 'R1', task_id: '', title: 'Add <export>', detail: '', entity: '' }];
+const oh = _inboxHtml([], now, [], [], orch);
+c.check('orchestration only: counted, block under the header, no "All clear"', oh.includes('1 thing needs you') && !oh.includes('All clear')
+  && !oh.includes('Nothing needs you') && oh.indexOf('ib-head') < oh.indexOf('or-inbox') && oh.includes('Add &lt;export&gt;'));
+c.check('orchestration + sessions: both counted', _inboxHtml(items, now, [], [], orch).includes(`${items.length + 1} things need you`));
+c.check('renderInbox passes orch_attention into the Inbox', src.includes('_bgDead(_bgAgents), sr.orch_attention)'));
 c.check('page has Inbox nav, area, hotkey, palette', ['id="vt-inbox"', 'id="inbox-area"', 'id="mnav-inbox"', "case 'J': setView('inbox')", "['inbox','Inbox']"].every(x => src.includes(x)));
 c.finish();

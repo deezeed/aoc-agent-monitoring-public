@@ -13,7 +13,7 @@ function _shListHtml(list, isOwner, dirs, err){
       ${s.alive?`<button class="adp-btn ln-go" onclick="_shJoin(${jsq(s.id)},${jsq(s.name)})">Open</button>`:'<span class="or-note">ended</span>'}
       ${isOwner?`<button class="adp-btn" onclick="_shStop(${jsq(s.id)},${jsq(s.name)})">End</button>`:''}</div>`).join('');
   const form=isOwner?`<form class="sh-start" onsubmit="event.preventDefault();_shStart(this)">
-      <input name="cwd" class="settings-input" list="sh-dirs" placeholder="folder, e.g. C:\\\\path\\\\to\\\\project" required>
+      <input name="cwd" class="settings-input" list="sh-dirs" placeholder="folder, e.g. C:\\path\\to\\project" required>
       <datalist id="sh-dirs">${(dirs||[]).map(d=>`<option value="${escHtml(d.path)}"></option>`).join('')}</datalist>
       <input name="name" class="settings-input" placeholder="name (optional)">
       <select name="kind" class="settings-input"><option value="claude">Claude Code</option><option value="shell">Shell</option></select>

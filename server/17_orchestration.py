@@ -57,7 +57,7 @@ _ORCH_ROLE_BRIEF = {
           "what passes and what fails, precisely. Answer status 'failed' if the criteria are not met.",
 }
 _ORCH_MODELS = ("haiku", "sonnet", "opus")
-_ORCH_STATES = ("planning", "plan_ready", "running", "supervising", "review", "merged", "discarded", "cancelled", "failed")
+_ORCH_STATES = ("scheduled", "planning", "plan_ready", "running", "supervising", "review", "merged", "discarded", "cancelled", "failed")
 _ORCH_ACTIVE = ("planning", "running", "supervising")
 _ORCH_MAX_TASKS = 8              # in the first plan
 _ORCH_MAX_TASKS_TOTAL = 12       # incl. what the supervisor adds
@@ -73,6 +73,7 @@ _ORCH_MANAGER_TIMEOUT_S = 6 * 3600
 _ORCH_MODES = ("flat", "hierarchical")
 _ORCH_RUN_BUDGET = (0.5, 50.0)   # $ per run, clamped
 _ORCH_PLANNER_BUDGET = 1.0
+_ORCH_LATER_MAX_DAYS = 60        # a run for later starts within this
 _orch_lock = threading.RLock()
 
 _ORCH_RESULT_SCHEMA = {
@@ -330,11 +331,20 @@ def _orch_proc_env(agent=None, billing=None):
     return {"env": _orch_subscription_env()}, _orch_mcp_deny(agent or {}, _orch_catalog_cache["mcp"]), True
 
 
+def _orch_limit_hit(err):
+    """Pure: does this error say the Claude plan's usage limit is used up?
+    ("You've hit your session limit · resets 6:20pm", "... usage limit reached")"""
+    return bool(re.search(r"hit your (\w+ )?limit|usage limit reached", str(err or ""), re.I))
+
+
 def _orch_explain_error(err):
     """Pure: an API error -> what to do about it."""
     if "credit balance is too low" in str(err).lower():
         return (str(err) + " -- the API key's account has no credit left. Add credit, or switch Orchestrate's "
                 "billing to your Claude subscription.")
+    if _orch_limit_hit(err) and "plan's usage limit" not in str(err):
+        return (str(err) + " -- your Claude plan's usage limit is used up; trying again before it resets "
+                "can't work. Start the run again after the reset.")
     return str(err)
 
 
@@ -409,6 +419,12 @@ def _orch_connect(path=None):
         CREATE TABLE IF NOT EXISTS entity_events (
             entity_id TEXT, ts REAL, kind TEXT, message TEXT DEFAULT '', cost_usd REAL DEFAULT 0, run_id TEXT DEFAULT '');
         CREATE INDEX IF NOT EXISTS entity_events_e ON entity_events(entity_id, ts);
+        CREATE TABLE IF NOT EXISTS schedules (
+            id TEXT PRIMARY KEY, data TEXT, paused INTEGER DEFAULT 0, last_fire REAL, next_due REAL,
+            last_run TEXT DEFAULT '', last_result TEXT DEFAULT '', created REAL, updated REAL);
+        CREATE TABLE IF NOT EXISTS schedule_events (
+            schedule_id TEXT, ts REAL, kind TEXT, message TEXT DEFAULT '', run_id TEXT DEFAULT '', user TEXT DEFAULT '');
+        CREATE INDEX IF NOT EXISTS schedule_events_s ON schedule_events(schedule_id, ts);
     """)
     # columns added after the first release (CREATE TABLE IF NOT EXISTS doesn't add them)
     have = {t: {r[1] for r in conn.execute(f"PRAGMA table_info({t})")} for t in ("runs", "tasks", "events", "entity_events")}
@@ -418,7 +434,8 @@ def _orch_connect(path=None):
                              ("tasks", "agent", "TEXT DEFAULT ''"), ("runs", "kind", "TEXT DEFAULT 'repo'"),
                              ("runs", "entity_id", "TEXT DEFAULT ''"), ("tasks", "approved", "INTEGER DEFAULT 0"),
                              ("events", "user", "TEXT DEFAULT ''"), ("entity_events", "user", "TEXT DEFAULT ''"),
-                             ("runs", "baseline_of", "TEXT DEFAULT ''"), ("runs", "verdict", "TEXT DEFAULT ''")):
+                             ("runs", "baseline_of", "TEXT DEFAULT ''"), ("runs", "verdict", "TEXT DEFAULT ''"),
+                             ("runs", "start_at", "REAL"), ("runs", "schedule_id", "TEXT DEFAULT ''")):
         if col not in have[table]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return conn
@@ -884,6 +901,11 @@ def _orch_supervise_prompt(run, tasks, last_round):
               "- fail: the goal cannot be reached; explain in 'report'.",
               "Use empty lists / empty report for the fields your action does not need. Do not add work that the "
               "goal did not ask for."]
+    if any("hits the same conflict" in str(t.get("error") or "") for t in tasks):
+        lines.append("A task above failed because the work of its inputs conflicts (they changed the same lines): "
+                     "retrying that task can't help. Retry one of the conflicting tasks with feedback to build its "
+                     "change so it can't collide, or finish and tell the reader which tasks conflict -- at merge time "
+                     "they can keep one of them.")
     if last_round:
         lines.append("This is the LAST review round: you must answer finish or fail.")
     return "\n".join(lines)
@@ -969,11 +991,12 @@ def _orch_view(run, tasks, events, now=None, children=None, parent=None, team_co
     return {"run": {k: run.get(k) for k in ("id", "created", "updated", "goal", "repo", "base", "state", "model",
                                              "max_parallel", "budget_usd", "plan_summary", "single_agent", "report",
                                              "error", "rounds", "finished", "mode", "approve_teams", "parent_id",
-                                             "parent_task", "team", "kind", "entity_id", "baseline_of", "verdict")},
+                                             "parent_task", "team", "kind", "entity_id", "baseline_of", "verdict", "start_at",
+                                             "schedule_id")},
             "tasks": [dict({k: t.get(k) for k in ("id", "role", "title", "instructions", "done_criteria", "depends_on",
                                                    "model", "budget_usd", "state", "attempt", "feedback", "branch",
                                                    "started", "finished", "cost_usd", "turns", "session_id", "output",
-                                                   "error", "commits", "child_id", "agent", "live_session")},
+                                                   "error", "commits", "child_id", "agent", "live_session", "in_history")},
                            team=(children or {}).get(t["id"])) for t in tasks],
             "waves": _orch_waves(tasks),
             "events": [dict(e) for e in events][-200:],
@@ -1125,6 +1148,7 @@ def _orch_prepare_worktree(run, task, tasks, git=None):
     while frontier:
         need |= frontier
         frontier = {d for f in frontier for d in by_id[f]["depends_on"]} - need
+    merged = []
     for tid in order:
         d = by_id[tid]
         if tid not in need or not d.get("commits") or not d.get("branch"):
@@ -1132,9 +1156,18 @@ def _orch_prepare_worktree(run, task, tasks, git=None):
         rc, _, er = git(["merge", "--no-ff", "--no-edit", "-m", f"Input from {tid}: {d['title']}", d["branch"]],
                         path, timeout=120)
         if rc != 0:
+            # found live: two workstreams edited the same lines of cli.py -> "merge failed" and nothing more
+            # (git names the conflict on stdout), and the review retried the task twice into the same wall
+            rc_u, unmerged, _ = git(["diff", "--name-only", "--diff-filter=U"], path)
+            files = [f for f in unmerged.splitlines() if f.strip()] if rc_u == 0 else []
             git(["merge", "--abort"], path)
             _wt_remove(run["repo"], path, branch, git)
+            if files:
+                return None, None, (f"the work of '{tid}' conflicts with " + (", ".join(f"'{m}'" for m in merged) or "its other inputs")
+                                    + " in " + ", ".join(files[:5]) + " -- they changed the same lines; "
+                                    "running this task again hits the same conflict")
             return None, None, f"the work of '{tid}' conflicts with the other inputs: " + _wt_err(er, "merge failed")
+        merged.append(tid)
     return branch, path, None
 
 
@@ -1261,8 +1294,10 @@ def _orch_poll_task(conn, run, task, tasks, now, alive=None, read=None, kill=Non
         _orch_set_task(conn, run["id"], task["id"], state="done", error="", **fields)
         _orch_event(conn, run["id"], "task_done", (res["data"] or {}).get("summary", ""), task["id"], res["cost"], now=now)
         return
-    why = err or f"the agent answered '{status}': " + _orch_clip((res["data"] or {}).get("summary"), 400)
-    if task["attempt"] < _ORCH_MAX_ATTEMPTS and status != "blocked":
+    why = _orch_explain_error(err) if err else \
+        f"the agent answered '{status}': " + _orch_clip((res["data"] or {}).get("summary"), 400)
+    # found live: at the plan's usage limit every attempt fails at once -- a retry only burns the attempt
+    if task["attempt"] < _ORCH_MAX_ATTEMPTS and status != "blocked" and not _orch_limit_hit(err):
         fb = (task.get("feedback") + "\n" if task.get("feedback") else "") + "Previous attempt: " + why
         # approved=0: your OK was for one run of a sensitive agent -- the next attempt asks again
         _orch_set_task(conn, run["id"], task["id"], state="pending", error=why, feedback=fb[:3000], approved=0, **fields)
@@ -1444,7 +1479,13 @@ def _orch_poll_manager(conn, run, task, tasks, now, git=None):
                       error="the workstream took too long", finished=now)
         child, ctasks = _orch_load(conn, child["id"])
         spent = round(_orch_spent(conn, child["id"]), 6)   # + the budgets of what was just killed
-    if child["state"] == "review" and not child.get("error"):
+    team_failed = [t for t in ctasks if t["state"] in ("failed", "blocked")]
+    if child["state"] == "review" and not child.get("error") and not any(t["state"] == "done" for t in ctasks):
+        # found live: every team task failed (usage limit) and its review failed too -- the workstream was
+        # still reported done, with nothing on its branch
+        why = "its team finished none of its tasks" + \
+            (" (" + _orch_clip(team_failed[0].get("error"), 400) + ")" if team_failed and team_failed[0].get("error") else "")
+    elif child["state"] == "review" and not child.get("error"):
         merged, err = _orch_integrate(child, ctasks, task["branch"], git)
         if not err:
             # merged into the workstream branch, not into the checked-out base: -d would refuse
@@ -1469,7 +1510,7 @@ def _orch_poll_manager(conn, run, task, tasks, now, git=None):
         git(["branch", "-D", task["branch"]], run["repo"])
     by_you = child["state"] == "cancelled" and not child.get("error")
     fields = {"finished": now, "cost_usd": spent, "branch": "", "commits": 0, "error": why}
-    if task["attempt"] < _ORCH_MAX_ATTEMPTS and not by_you:
+    if task["attempt"] < _ORCH_MAX_ATTEMPTS and not by_you and not _orch_limit_hit(why):
         fb = (task.get("feedback") + "\n" if task.get("feedback") else "") + "Previous attempt: " + why
         _orch_set_task(conn, run["id"], task["id"], state="pending", feedback=fb[:3000], **fields)
         _orch_event(conn, run["id"], "task_retry", why, task["id"], now=now)
@@ -1692,6 +1733,15 @@ def _orch_tick(now=None):
                     # undo what the step half-wrote: the next run's commit would otherwise save it
                     conn.rollback()
                     _log_bg_error("orchestration step", e)
+            # runs whose start time has come (also one missed while AOC was off: it starts now, once)
+            for (rid,) in conn.execute("SELECT id FROM runs WHERE state='scheduled' AND start_at <= ?",
+                                       (now or time.time(),)).fetchall():
+                try:
+                    _orch_start_due(conn, rid, now)
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    _log_bg_error("orchestration scheduled run", e)
             limits = None
             for (eid,) in conn.execute("SELECT id FROM entities").fetchall():
                 try:
@@ -1702,6 +1752,15 @@ def _orch_tick(now=None):
                 except Exception as e:
                     conn.rollback()
                     _log_bg_error("orchestration entity", e)
+            for (sid,) in conn.execute("SELECT id FROM schedules").fetchall():
+                try:
+                    if limits is None:
+                        limits = _rate_limits_snapshot() or {}
+                    _orch_schedule_tick(conn, sid, now, limits=limits)
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    _log_bg_error("orchestration schedule", e)
             try:
                 _orch_attention_refresh(conn)
             except Exception as e:
@@ -1803,8 +1862,10 @@ def _orch_attention_items(conn):
         elif r["state"] == "review" and not r["parent_id"]:
             kind = "review"
         if kind:
+            # a team's goal is its workstream, then the context from the run above (DONE WHEN: ...): the title is the workstream
+            goal = (r["goal"] or "").split("\n\nDONE WHEN:")[0] if r["parent_id"] else r["goal"]
             items.append({"key": f"{kind}:{r['id']}", "kind": kind, "run_id": r["id"], "task_id": "",
-                          "title": _orch_clip(r["goal"], 160), "detail": r.get("parent_task") or "",
+                          "title": _orch_clip(goal, 160), "detail": r.get("parent_task") or "",
                           "entity": r.get("entity_id") or "", "since": r["updated"]})
     # only a run still going: a gate left on a stopped one can't be answered (and would nag forever)
     for t in conn.execute("SELECT t.run_id, t.id, t.title, t.agent, r.goal, r.updated, r.entity_id FROM tasks t "
@@ -1927,8 +1988,8 @@ def _orch_workspaces(root=None):
 # ── Entities: an autonomous team with a mission ───────────────────────────
 # An entity = a mission, where it works (a repo or a workspace), a team of
 # agents, an orchestrator, budgets (per run / day / month) and when it acts
-# (by hand, every N hours, daily at HH:MM; "loop" = again after each run,
-# after a cooldown). When it's due and its budget and your plan limits
+# (by hand, every N hours, daily or on weekdays at HH:MM; "loop" = again
+# after each run, after a cooldown). When it's due and its budget and your plan limits
 # allow, a scout (`claude -p`, read-only tools in its folder) reads the
 # mission, the entity's memory and its recent runs and either names the next
 # concrete goal or says there's nothing to do now. A goal becomes an ordinary
@@ -1956,6 +2017,38 @@ _ORCH_SCOUT_SCHEMA = {
 _ORCH_RUN_ACTIVE = ("planning", "plan_ready", "running", "supervising", "review")
 
 
+def _orch_validate_schedule(sched, types):
+    """Pure: when something acts (an entity, a repeating run) -> ({type,
+    hours | at}, None) or (None, error). An unknown type is types[0]."""
+    sched = sched if isinstance(sched, dict) else {}
+    stype = sched.get("type") if sched.get("type") in types else types[0]
+    out = {"type": stype}
+    if stype == "every":
+        try:
+            out["hours"] = min(max(float(sched.get("hours")), 0.5), 24 * 7)
+        except (TypeError, ValueError):
+            return None, "every how many hours?"
+    if stype in ("daily", "weekdays"):
+        at = str(sched.get("at") or "")
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
+            return None, ("daily" if stype == "daily" else "on weekdays") + " at HH:MM"
+        out["at"] = at
+    return out, None
+
+
+def _orch_slots(s, now):
+    """Pure: a daily / weekdays schedule -> (its last slot at or before now,
+    None if none in the last week; its next slot after now), local time."""
+    hh, mm = (int(x) for x in s["at"].split(":"))
+    lt = time.localtime(now)
+
+    def slot(d):   # d days from today (mktime folds day 0 / 32 into the month around it, and finds DST)
+        return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + d, hh, mm, 0, 0, 0, -1))
+    ok = (lambda t: time.localtime(t).tm_wday < 5) if s.get("type") == "weekdays" else (lambda t: True)
+    prev = next((t for t in (slot(-d) for d in range(8)) if t <= now and ok(t)), None)
+    return prev, next(t for t in (slot(d) for d in range(8)) if t > now and ok(t))
+
+
 def _orch_validate_entity(data):
     """Pure: POST /orch/entity_save body -> (entity config, None) or (None, error)."""
     if not isinstance(data, dict):
@@ -1977,19 +2070,9 @@ def _orch_validate_entity(data):
     model = str(data.get("model") or "opus").strip().lower()
     if model not in _ORCH_MODELS:
         return None, "unknown model"
-    sched = data.get("schedule") if isinstance(data.get("schedule"), dict) else {}
-    stype = sched.get("type") if sched.get("type") in ("manual", "every", "daily") else "manual"
-    out_sched = {"type": stype}
-    if stype == "every":
-        try:
-            out_sched["hours"] = min(max(float(sched.get("hours")), 0.5), 24 * 7)
-        except (TypeError, ValueError):
-            return None, "every how many hours?"
-    if stype == "daily":
-        at = str(sched.get("at") or "")
-        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
-            return None, "daily at HH:MM"
-        out_sched["at"] = at
+    out_sched, err = _orch_validate_schedule(data.get("schedule"), ("manual", "every", "daily", "weekdays"))
+    if err:
+        return None, err
     try:
         par = min(max(int(data.get("max_parallel") or 2), 1), _ORCH_MAX_PARALLEL)
         cooldown = min(max(int(data.get("cooldown_min") or 10), 1), 24 * 60)
@@ -2029,13 +2112,14 @@ def _orch_entity_due(cfg, ent, last_end, now):
         if now >= at:
             return True, f"every {s['hours']:g} h", None
         nexts.append(at)
-    elif s.get("type") == "daily":
-        hh, mm = (int(x) for x in s["at"].split(":"))
+    elif s.get("type") in ("daily", "weekdays"):
+        prev, nxt = _orch_slots(s, now)
         lt = time.localtime(now)
-        slot = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
-        if now >= slot and last_scout < slot:
-            return True, f"daily at {s['at']}", None
-        nexts.append(slot if now < slot else slot + 86400)
+        day0 = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        # slots missed while AOC was off: the newest fires once, not one per slot; never acted yet: today's only
+        if prev is not None and last_scout < prev and (last_scout or prev >= day0):
+            return True, ("daily" if s["type"] == "daily" else "weekdays") + f" at {s['at']}", None
+        nexts.append(nxt)
     return False, "", (min(nexts) if nexts else None)
 
 
@@ -2123,15 +2207,21 @@ def _orch_entity_set(conn, eid, now=None, **fields):
     conn.execute(f"UPDATE entities SET {', '.join(k + '=?' for k in fields)} WHERE id=?", (*fields.values(), eid))
 
 
-def _orch_entity_costs(conn, eid):
-    """[(epoch, $)]: its runs (whole cost, incl. their teams) and its scouts."""
+def _orch_runs_costs(conn, col, key):
+    """[(epoch, $)]: the whole cost (incl. their teams) of the runs whose
+    `col` (entity_id / schedule_id) is key."""
     out = []
-    for (rid,) in conn.execute("SELECT id FROM runs WHERE entity_id=?", (eid,)).fetchall():
+    for (rid,) in conn.execute(f"SELECT id FROM runs WHERE {col}=?", (key,)).fetchall():
         run, tasks = _orch_load(conn, rid)
         events = [dict(e) for e in conn.execute("SELECT * FROM events WHERE run_id=?", (rid,))]
         out.append((run["created"], _orch_metrics(run, tasks, events, team_coordination=_orch_team_coordination(conn, rid))["cost_total"]))
-    out += [(t, c) for t, c in conn.execute("SELECT ts, cost_usd FROM entity_events WHERE entity_id=? AND cost_usd>0", (eid,))]
     return out
+
+
+def _orch_entity_costs(conn, eid):
+    """[(epoch, $)]: its runs (whole cost, incl. their teams) and its scouts."""
+    return _orch_runs_costs(conn, "entity_id", eid) + \
+        [(t, c) for t, c in conn.execute("SELECT ts, cost_usd FROM entity_events WHERE entity_id=? AND cost_usd>0", (eid,))]
 
 
 def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, read=None, kill=None, git=None, limits=None):
@@ -2264,9 +2354,37 @@ def _orch_new_id(now):
     return time.strftime("%m%d-%H%M%S", time.localtime(now))
 
 
+def _orch_plan_start(conn, rid, exe, now, spawn=None, git=None):
+    """The orchestrator starts writing a run's plan (the run is 'planning')."""
+    run, _ = _orch_load(conn, rid)
+    agents = _orch_team(run, _orch_library(conn))
+    listing, notes = _orch_repo_context(run["repo"], git)
+    _orch_start_llm(conn, run, "plan", _orch_plan_prompt(run["goal"], run["repo"], run["base"], listing, notes, run["mode"],
+                                                        run["budget_usd"], agents, run["kind"]),
+                    _orch_schema(_ORCH_PLAN_SCHEMA, run["mode"] == "hierarchical", [a["id"] for a in agents]),
+                    exe, now, spawn, read_tools=True)
+
+
+def _orch_start_at(value, now):
+    """Pure: the start time of a run for later (epoch seconds) -> (epoch or
+    None = now, error)."""
+    if value in (None, ""):
+        return None, None
+    try:
+        at = float(value)
+    except (TypeError, ValueError):
+        return None, "when should it start?"
+    if at <= now:
+        return None, "pick a start time in the future"
+    if at > now + _ORCH_LATER_MAX_DAYS * 86400:
+        return None, f"pick a start time within {_ORCH_LATER_MAX_DAYS} days"
+    return at, None
+
+
 def _orch_create(data, now=None, exe=None, spawn=None, git=None, conn=None):
     """POST /orch/create {goal, cwd, model?, max_parallel?, budget_usd?, mode?,
-    approve_teams?} -> {ok, id}."""
+    approve_teams?, start_at?} -> {ok, id}. With start_at (epoch) the run
+    waits as 'scheduled' and starts planning then (_orch_start_due)."""
     now = now or time.time()
     if not isinstance(data, dict):
         return {"ok": False, "error": "bad request"}
@@ -2296,10 +2414,13 @@ def _orch_create(data, now=None, exe=None, spawn=None, git=None, conn=None):
     mode = str(data.get("mode") or "flat").strip().lower()
     if mode not in _ORCH_MODES:
         return {"ok": False, "error": "unknown mode"}
+    start_at, err = _orch_start_at(data.get("start_at"), now)
+    if err:
+        return {"ok": False, "error": err}
     exe = exe or _find_claude_exe()
     if not exe:
         return {"ok": False, "error": "Claude Code (claude) not found on this PC"}
-    if not _orch_proc_env()[2]:
+    if start_at is None and not _orch_proc_env()[2]:
         return {"ok": False, "error": "AOC is still listing your MCP servers (needed to run on your subscription) "
                                       "-- try again in a minute"}
     facts, err = _wt_repo(folder, git)
@@ -2309,8 +2430,10 @@ def _orch_create(data, now=None, exe=None, spawn=None, git=None, conn=None):
     with _orch_lock:
         conn = conn or _orch_connect()
         try:
-            if conn.execute("SELECT COUNT(*) FROM runs WHERE state IN ('planning','plan_ready','running','supervising') "
-                            "AND repo=? AND COALESCE(parent_id,'')=''", (facts["repo"],)).fetchone()[0]:
+            # a run for later doesn't hold the repo: whether it is free is checked when it starts
+            if start_at is None and conn.execute(
+                    "SELECT COUNT(*) FROM runs WHERE state IN ('planning','plan_ready','running','supervising') "
+                    "AND repo=? AND COALESCE(parent_id,'')=''", (facts["repo"],)).fetchone()[0]:
                 return {"ok": False, "error": "this repo already has an orchestration in progress -- finish or cancel it first"}
             lib = _orch_library(conn)
             team = [str(a) for a in (data.get("team") or []) if str(a) in lib]
@@ -2320,24 +2443,62 @@ def _orch_create(data, now=None, exe=None, spawn=None, git=None, conn=None):
             while conn.execute("SELECT 1 FROM runs WHERE id=?", (rid,)).fetchone():
                 rid += "x"
             conn.execute("""INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model,
-                            max_parallel, budget_usd, mode, approve_teams, team, kind, entity_id)
-                            VALUES (?,?,?,?,?,?,?,'planning',?,?,?,?,?,?,?,?)""",
-                         (rid, now, now, goal, facts["repo"], facts["base"], facts["base_sha"], model, par, budget, mode,
+                            max_parallel, budget_usd, mode, approve_teams, team, kind, entity_id, start_at, schedule_id)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         (rid, now, now, goal, facts["repo"], facts["base"], facts["base_sha"],
+                          "planning" if start_at is None else "scheduled", model, par, budget, mode,
                           1 if data.get("approve_teams") is True else 0, json.dumps(team), kind,
-                          re.sub(r"[^a-z0-9-]", "", str(data.get("entity_id") or ""))[:32]))
-            _orch_event(conn, rid, "created", goal[:500], human=True, now=now)
-            run, _ = _orch_load(conn, rid)
-            agents = _orch_team(run, lib)
-            listing, notes = _orch_repo_context(facts["repo"], git)
-            _orch_start_llm(conn, run, "plan", _orch_plan_prompt(goal, facts["repo"], facts["base"], listing, notes, mode,
-                                                                budget, agents, kind),
-                            _orch_schema(_ORCH_PLAN_SCHEMA, mode == "hierarchical", [a["id"] for a in agents]),
-                            exe, now, spawn, read_tools=True)
+                          re.sub(r"[^a-z0-9-]", "", str(data.get("entity_id") or ""))[:32], start_at,
+                          re.sub(r"[^a-z0-9-]", "", str(data.get("schedule_id") or ""))[:32]))
+            # a scheduled or entity run is started by AOC, not by you (found live: it showed "1 of your actions")
+            _orch_event(conn, rid, "created", goal[:500], human=not (data.get("schedule_id") or data.get("entity_id")),
+                        now=now)
+            if start_at is None:
+                _orch_plan_start(conn, rid, exe, now, spawn, git)
+            else:
+                _orch_event(conn, rid, "scheduled", "starts " + time.strftime("%Y-%m-%d %H:%M", time.localtime(start_at)),
+                            human=True, now=now)
             conn.commit()
         finally:
             if own:
                 conn.close()
-    return {"ok": True, "id": rid}
+    return {"ok": True, "id": rid, "scheduled": start_at is not None}
+
+
+def _orch_start_scheduled(conn, run, now, exe=None, spawn=None, git=None):
+    """A run for later starts planning, on the repo as it is now (its branch
+    and last commit). -> '' or why it can't start yet."""
+    exe = exe or _find_claude_exe()
+    if not exe:
+        return "Claude Code (claude) not found on this PC"
+    if not _orch_proc_env()[2]:
+        return "AOC is still listing your MCP servers"
+    if conn.execute("SELECT COUNT(*) FROM runs WHERE state IN ('planning','plan_ready','running','supervising') "
+                    "AND repo=? AND COALESCE(parent_id,'')=''", (run["repo"],)).fetchone()[0]:
+        return "this repo has another orchestration in progress -- it starts once that one is done"
+    facts, err = _wt_repo(run["repo"], git)
+    if err:
+        return err
+    # created = when it really started: its time and its day's spend count from here
+    _orch_set_run(conn, run["id"], now=now, state="planning", created=now, base=facts["base"], base_sha=facts["base_sha"],
+                  error="")
+    _orch_event(conn, run["id"], "started", "the start time came" if (run.get("start_at") or 0) <= now
+                else "started early by you", human=(run.get("start_at") or 0) > now, now=now)
+    _orch_plan_start(conn, run["id"], exe, now, spawn, git)
+    return ""
+
+
+def _orch_start_due(conn, rid, now=None, exe=None, spawn=None, git=None):
+    """Tick: a run whose start time has come starts; if it can't yet, it
+    says why once and tries again next tick."""
+    now = now or time.time()
+    run, _ = _orch_load(conn, rid)
+    if not run or run["state"] != "scheduled":
+        return
+    why = _orch_start_scheduled(conn, run, now, exe, spawn, git)
+    if why and run.get("error") != "waiting: " + why:
+        _orch_set_run(conn, rid, now=now, error="waiting: " + why)
+        _orch_event(conn, rid, "waiting", why, now=now)
 
 
 def _orch_edit_plan(conn, rid, data, now):
@@ -2498,8 +2659,8 @@ def _orch_team_coordination(conn, rid):
                               (rid,)).fetchone()[0])
 
 
-def _orch_action(action, data, now=None, git=None):
-    """POST /orch/<plan|approve|cancel|merge|discard> {id, ...}."""
+def _orch_action(action, data, now=None, git=None, exe=None, spawn=None):
+    """POST /orch/<plan|approve|cancel|merge|discard|start> {id, ...}."""
     now = now or time.time()
     rid = str((data or {}).get("id") or "")
     with _orch_lock:
@@ -2515,6 +2676,18 @@ def _orch_action(action, data, now=None, git=None):
                     return {"ok": False, "error": "there is no plan waiting for approval"}
                 _orch_set_run(conn, rid, now=now, state="running")
                 _orch_event(conn, rid, "approved", f"plan approved: {len(tasks)} task(s)", human=True, now=now)
+                reply = {"ok": True}
+            elif action == "start":
+                if run["state"] != "scheduled":
+                    return {"ok": False, "error": "this run isn't waiting for its start time"}
+                why = _orch_start_scheduled(conn, run, now, exe, spawn, git)
+                if why:
+                    return {"ok": False, "error": why}
+                reply = {"ok": True}
+            elif action == "cancel" and run["state"] == "scheduled":
+                # nothing started yet: no process, no worktree
+                _orch_set_run(conn, rid, now=now, state="cancelled", finished=now)
+                _orch_event(conn, rid, "cancelled", "cancelled by you before it started", human=True, now=now)
                 reply = {"ok": True}
             elif action == "cancel":
                 if run["state"] not in ("planning", "plan_ready", "running", "supervising"):
@@ -2862,7 +3035,17 @@ def _orch_entity_action(action, data, now=None):
                 _orch_entity_event(conn, eid, "run_now", "you asked it to look for work now", now=now)
             elif action == "pause":
                 on = (data or {}).get("paused") is not False
-                _orch_entity_set(conn, eid, now=now, paused=1 if on else 0, state="paused" if on else "idle")
+                fields = {"paused": 1 if on else 0, "state": "paused" if on else "idle"}
+                if on and (ent.get("job_pid") or ent.get("job_base")):
+                    # found live: a scout still thinking when you paused went on to start (and approve) a run
+                    killed = _orch_stop(ent.get("job_pid"), ent.get("job_started"))
+                    cost = _ORCH_ENTITY_SCOUT_BUDGET if killed else \
+                        (_orch_parse(_orch_read_out(ent["job_base"]))["cost"] if ent.get("job_base") else 0.0)
+                    _orch_entity_event(conn, eid, "scout_stopped", "paused while its scout was thinking -- no run is started"
+                                       + (" (stopped before it answered: its budget is counted)" if killed else ""),
+                                       cost, now=now)
+                    fields.update(job_pid=None, job_base="", job_started=None, last_scout=now, run_now=0, note="")
+                _orch_entity_set(conn, eid, now=now, **fields)
                 _orch_entity_event(conn, eid, "paused" if on else "resumed", "", now=now)
             elif action == "forget":
                 _orch_entity_set(conn, eid, now=now, memory="[]")
@@ -2874,6 +3057,241 @@ def _orch_entity_action(action, data, now=None):
                 _orch_stop(ent.get("job_pid"), ent.get("job_started"))
                 conn.execute("DELETE FROM entities WHERE id=?", (eid,))
                 conn.execute("DELETE FROM entity_events WHERE entity_id=?", (eid,))
+            else:
+                return {"ok": False, "error": "unknown action"}
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+
+
+# ── Repeating runs: one goal on a clock ───────────────────────────────────
+# A schedule = what a run is asked for (goal, where, team, orchestrator,
+# budget ...) + when (daily or on weekdays at HH:MM, every N hours -- the
+# entities' clock, _orch_entity_due) + caps per day / month. When it's due
+# it starts an ordinary run (schedule_id = it). A firing is skipped, and
+# logged, while its last run is still going (no overlap), when the caps
+# would be crossed, or -- on your subscription -- while your plan limits are
+# nearly used up; the next one comes on time. A slot missed while AOC was
+# off fires once at startup, not once per slot. Its plans wait for your OK
+# unless you let the schedule approve them (within its run budget).
+_ORCH_SCHEDULE_TYPES = ("daily", "weekdays", "every")
+
+
+def _orch_validate_repeat(data):
+    """Pure: POST /orch/schedule_save body -> (config, None) or (None, error).
+    The run's own fields are checked again by _orch_create at each firing."""
+    if not isinstance(data, dict):
+        return None, "bad request"
+    goal = str(data.get("goal") or "").strip()
+    if len(goal) < 10:
+        return None, "describe the goal (a sentence or more)"
+    if len(goal) > 8000:
+        return None, "goal too long (8,000 characters max)"
+    ws = _orch_workspace_slug(data.get("workspace"))
+    cwd = "" if ws else str(data.get("cwd") or "").strip().strip('"')
+    if not ws and not (cwd and os.path.isabs(cwd)):
+        return None, "pick an existing folder (full path)"
+    model = str(data.get("model") or "opus").strip().lower()
+    if model not in _ORCH_MODELS:
+        return None, "unknown model"
+    mode = str(data.get("mode") or "flat").strip().lower()
+    if mode not in _ORCH_MODES:
+        return None, "unknown mode"
+    sched, err = _orch_validate_schedule(data.get("schedule"), _ORCH_SCHEDULE_TYPES)
+    if err:
+        return None, err
+    try:
+        par = min(max(int(data.get("max_parallel") or 3), 1), _ORCH_MAX_PARALLEL)
+    except (TypeError, ValueError):
+        return None, "bad number"
+    b_run = _orch_clamp(data.get("budget_usd"), _ORCH_RUN_BUDGET, 5.0)
+    b_day = _orch_clamp(data.get("budget_day"), _ORCH_ENTITY_BUDGET_DAY, max(10.0, b_run))
+    b_month = _orch_clamp(data.get("budget_month"), _ORCH_ENTITY_BUDGET_MONTH, max(100.0, b_day))
+    if b_run > b_day or b_day > b_month:
+        return None, "budgets must grow: per run <= per day <= per month"
+    return {"goal": goal, "cwd": cwd, "workspace": ws, "model": model, "max_parallel": par, "budget_usd": b_run,
+            "mode": mode, "approve_teams": mode == "hierarchical" and data.get("approve_teams") is True,
+            "team": [str(a) for a in (data.get("team") or [])][:20], "schedule": sched,
+            "budget_day": b_day, "budget_month": b_month, "auto_approve": data.get("auto_approve") is True}, None
+
+
+def _orch_schedule_load(conn, sid):
+    r = conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+    if not r:
+        return None, None
+    try:
+        return dict(r), json.loads(r["data"])
+    except (ValueError, TypeError):
+        return None, None
+
+
+def _orch_schedule_set(conn, sid, now=None, **fields):
+    fields["updated"] = now or time.time()
+    conn.execute(f"UPDATE schedules SET {', '.join(k + '=?' for k in fields)} WHERE id=?", (*fields.values(), sid))
+
+
+def _orch_schedule_event(conn, sid, kind, message="", run_id="", now=None):
+    conn.execute("INSERT INTO schedule_events (schedule_id, ts, kind, message, run_id, user) VALUES (?,?,?,?,?,?)",
+                 (sid, now or time.time(), kind, str(message)[:2000], run_id, _orch_who()))
+
+
+def _orch_schedule_next(sch, cfg, now):
+    """Pure: -> (due now?, why, next firing or None). It counts from its last
+    firing -- or from when it was made: a slot before that never fires."""
+    if sch.get("paused"):
+        return False, "", None
+    return _orch_entity_due({"schedule": cfg["schedule"]}, {"last_scout": sch.get("last_fire") or sch.get("created") or 0},
+                            None, now)
+
+
+def _orch_schedule_block(cfg, last, spend, billing, limits):
+    """Pure: why this firing is skipped ('' = it may start). last = its last
+    run {id, state} or None, spend = ($ today, $ this month)."""
+    if last and last["state"] in _ORCH_ACTIVE + ("plan_ready",):
+        return f"its last run ({last['id']}) is still {last['state'].replace('_', ' ')}"
+    if spend[0] + cfg["budget_usd"] > cfg["budget_day"]:
+        return f"today's budget: ${spend[0]:.2f} of ${cfg['budget_day']:.2f} spent"
+    if spend[1] + cfg["budget_usd"] > cfg["budget_month"]:
+        return f"this month's budget: ${spend[1]:.2f} of ${cfg['budget_month']:.2f} spent"
+    if billing == "subscription":
+        return _orch_limits_block(limits)
+    return ""
+
+
+def _orch_schedule_tick(conn, sid, now=None, exe=None, spawn=None, git=None, limits=None):
+    """One step of one schedule: approve its run's plan if you let it, and
+    fire when it's due (or skip that firing and say why)."""
+    now = now or time.time()
+    sch, cfg = _orch_schedule_load(conn, sid)
+    if not sch:
+        return
+    r = conn.execute("SELECT id, state FROM runs WHERE schedule_id=? ORDER BY created DESC LIMIT 1", (sid,)).fetchone()
+    last = dict(r) if r else None
+    if last and last["state"] == "plan_ready" and cfg.get("auto_approve"):
+        n = conn.execute("SELECT COUNT(*) FROM tasks WHERE run_id=?", (last["id"],)).fetchone()[0]
+        _orch_set_run(conn, last["id"], now=now, state="running")
+        _orch_event(conn, last["id"], "approved", f"plan approved by its schedule (within its ${cfg['budget_usd']:.2f} "
+                    f"per run): {n} task(s)", now=now)
+        last["state"] = "running"
+    due, why, next_due = _orch_schedule_next(sch, cfg, now)
+    if not due:
+        if sch.get("next_due") != next_due:
+            _orch_schedule_set(conn, sid, now=now, next_due=next_due)
+        return
+    block = _orch_schedule_block(cfg, last, _orch_entity_spend(_orch_runs_costs(conn, "schedule_id", sid), now),
+                                 _orch_settings()["billing"], limits if limits is not None else _rate_limits_snapshot())
+    if block:
+        _orch_schedule_event(conn, sid, "skipped", block, now=now)
+        _orch_schedule_set(conn, sid, now=now, last_fire=now, last_result="skipped: " + block,
+                           next_due=_orch_schedule_next(dict(sch, last_fire=now), cfg, now)[2])
+        return
+    if not _orch_proc_env()[2]:
+        return   # the MCP server list isn't known yet (scanning): fire next tick
+    body = {k: cfg[k] for k in ("goal", "model", "max_parallel", "budget_usd", "mode", "approve_teams", "team")}
+    body.update({"workspace": cfg["workspace"]} if cfg.get("workspace") else {"cwd": cfg["cwd"]}, schedule_id=sid)
+    res = _orch_create(body, now=now, exe=exe, spawn=spawn, git=git, conn=conn)
+    nxt = _orch_schedule_next(dict(sch, last_fire=now), cfg, now)[2]
+    if not res.get("ok"):
+        _orch_schedule_event(conn, sid, "failed", res.get("error", ""), now=now)
+        _orch_schedule_set(conn, sid, now=now, last_fire=now, last_result="could not start: " + str(res.get("error"))[:300],
+                           next_due=nxt)
+        return
+    _orch_schedule_event(conn, sid, "fired", why, run_id=res["id"], now=now)
+    _orch_schedule_set(conn, sid, now=now, last_fire=now, last_run=res["id"], last_result="started run " + res["id"],
+                       next_due=nxt)
+
+
+def _orch_schedule_view(sch, cfg, runs, events, costs, now=None):
+    """Pure: one schedule for the dashboard."""
+    now = now or time.time()
+    spend = _orch_entity_spend(costs, now)
+    return {"id": sch["id"], "config": cfg, "paused": bool(sch.get("paused")), "next_due": _orch_schedule_next(sch, cfg, now)[2],
+            "last_fire": sch.get("last_fire"), "last_result": sch.get("last_result") or "", "created": sch.get("created"),
+            "spend_day": spend[0], "spend_month": spend[1],
+            "runs": [{"id": r["id"], "goal": r["goal"][:200], "state": r["state"], "created": r["created"]} for r in runs[:10]],
+            "events": [dict(e) for e in events][-30:]}
+
+
+def _orch_schedules_list(now=None):
+    """GET /orch/schedules."""
+    if not os.path.exists(ORCH_DB):
+        return {"ok": True, "schedules": []}
+    conn = _orch_connect()
+    try:
+        out = []
+        for (sid,) in conn.execute("SELECT id FROM schedules ORDER BY created").fetchall():
+            sch, cfg = _orch_schedule_load(conn, sid)
+            if not sch:
+                continue
+            runs = [dict(r) for r in conn.execute("SELECT id, state, goal, created FROM runs WHERE schedule_id=? "
+                                                   "ORDER BY created DESC", (sid,))]
+            events = [dict(e) for e in conn.execute("SELECT * FROM schedule_events WHERE schedule_id=? ORDER BY ts", (sid,))]
+            out.append(_orch_schedule_view(sch, cfg, runs, events, _orch_runs_costs(conn, "schedule_id", sid), now))
+        return {"ok": True, "schedules": out}
+    finally:
+        conn.close()
+
+
+def _orch_schedule_save(data, now=None, git=None):
+    """POST /orch/schedule_save {goal, cwd | workspace, ..., schedule,
+    budget_day?, budget_month?, auto_approve?} -> {ok, id}. A new one."""
+    now = now or time.time()
+    cfg, err = _orch_validate_repeat(data)
+    if err:
+        return {"ok": False, "error": err}
+    if cfg["cwd"]:
+        if not os.path.isdir(cfg["cwd"]):
+            return {"ok": False, "error": "pick an existing folder (full path)"}
+        _, err = _wt_repo(cfg["cwd"], git)
+        if err:
+            return {"ok": False, "error": err}
+    with _orch_lock:
+        conn = _orch_connect()
+        try:
+            lib = _orch_library(conn)
+            team = [a for a in cfg["team"] if a in lib]
+            if cfg["team"] and not team:
+                return {"ok": False, "error": "none of the chosen agents exist any more"}
+            cfg["team"] = team
+            sid = "s" + _orch_new_id(now)
+            while conn.execute("SELECT 1 FROM schedules WHERE id=?", (sid,)).fetchone():
+                sid += "x"
+            conn.execute("INSERT INTO schedules (id, data, created, updated) VALUES (?,?,?,?)",
+                         (sid, json.dumps(cfg, ensure_ascii=False), now, now))
+            sch, _ = _orch_schedule_load(conn, sid)
+            nxt = _orch_schedule_next(sch, cfg, now)[2]
+            _orch_schedule_set(conn, sid, now=now, next_due=nxt)
+            _orch_schedule_event(conn, sid, "created", "first run " + time.strftime("%Y-%m-%d %H:%M", time.localtime(nxt)),
+                                 now=now)
+            conn.commit()
+        finally:
+            conn.close()
+    return {"ok": True, "id": sid, "next_due": nxt}
+
+
+def _orch_schedule_action(action, data, now=None):
+    """POST /orch/schedule_<pause|delete> {id, paused?}. Its runs stay."""
+    now = now or time.time()
+    sid = str((data or {}).get("id") or "")
+    with _orch_lock:
+        conn = _orch_connect()
+        try:
+            sch, cfg = _orch_schedule_load(conn, sid)
+            if not sch:
+                return {"ok": False, "error": "unknown schedule"}
+            if action == "pause":
+                on = (data or {}).get("paused") is not False
+                if on:
+                    _orch_schedule_set(conn, sid, now=now, paused=1, next_due=None)
+                else:
+                    # resumed: slots it was paused through don't fire -- it counts from now
+                    nxt = _orch_schedule_next(dict(sch, paused=0, last_fire=now), cfg, now)[2]
+                    _orch_schedule_set(conn, sid, now=now, paused=0, last_fire=now, next_due=nxt)
+                _orch_schedule_event(conn, sid, "paused" if on else "resumed", "", now=now)
+            elif action == "delete":
+                conn.execute("DELETE FROM schedules WHERE id=?", (sid,))
+                conn.execute("DELETE FROM schedule_events WHERE schedule_id=?", (sid,))
             else:
                 return {"ok": False, "error": "unknown action"}
             conn.commit()
@@ -2897,6 +3315,7 @@ def _orch_list(limit=30):
             out.append({"id": rid, "goal": run["goal"][:300], "repo": run["repo"], "state": run["state"],
                         "created": run["created"], "tasks": len(tasks), "mode": run.get("mode") or "flat",
                         "entity_id": run.get("entity_id") or "", "baseline_of": run.get("baseline_of") or "",
+                        "start_at": run.get("start_at"), "schedule_id": run.get("schedule_id") or "",
                         "running": sum(1 for t in tasks if t["state"] == "running"),
                         "needs_you": run["state"] in ("plan_ready", "review") or any(c["state"] == "plan_ready" for c in teams),
                         "metrics": _orch_metrics(run, tasks, events, team_coordination=_orch_team_coordination(conn, rid))})
@@ -2966,6 +3385,72 @@ def _orch_live_session(path, base=None):
     return os.path.splitext(os.path.basename(max(files, key=os.path.getmtime)))[0] if files else ""
 
 
+def _orch_in_history(sids, path=None):
+    """Which of these Claude Code sessions History has: the transcript
+    scanner saves each agent's session there under its own id."""
+    sids, path = sorted({str(s) for s in sids if s}), path or DB_FILE
+    if not sids or not os.path.exists(path):
+        return set()
+    try:
+        c = sqlite3.connect(path, timeout=5)
+        try:
+            return {r[0] for r in c.execute(f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(sids))})", sids)}
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return set()
+
+
+def _orch_run_commits(run, tasks, git=None, limit=200):
+    """The commits a run's agents made -> [{sha, subject, when, task}].
+    Before the merge: each task's own commits on its branch (not the base's,
+    not its inputs'). After it: what each merge AOC made into the base
+    brought in (the branches are gone by then)."""
+    git = git or _wt_git
+    fmt = "--format=%H%x1f%ct%x1f%s"
+    out, seen = [], set()
+
+    def add(text, tid):
+        for line in (text or "").splitlines():
+            p = line.split("\x1f")
+            if len(p) == 3 and p[0] not in seen:
+                seen.add(p[0])
+                out.append({"sha": p[0], "when": int(p[1]) if p[1].isdigit() else None, "subject": p[2], "task": tid})
+    if run["state"] == "merged":
+        rc, merges, _ = git(["log", "--merges", "--fixed-strings", f"--grep=(AOC orchestration {run['id']})",
+                             "--format=%H%x1f%s", run["base_sha"] + ".." + run["base"]], run["repo"])
+        names = re.compile(r"^Merge aoc/orch-" + re.escape(run["id"]) + r"-(.+)-\d+: ")
+        for line in (merges if rc == 0 else "").splitlines():
+            sha, _, subj = line.partition("\x1f")
+            m = names.match(subj)
+            rc, text, _ = git(["log", "--no-merges", fmt, sha + "^1.." + sha + "^2"], run["repo"])
+            add(text if rc == 0 else "", m.group(1) if m else "")
+    else:
+        inputs = [t["branch"] for t in tasks if t.get("branch") and t.get("commits")]
+        for t in tasks:
+            if t.get("branch") and t.get("commits"):
+                rc, text, _ = git(["log", "--no-merges", fmt, t["branch"], "^" + run["base_sha"],
+                                   *["^" + b for b in inputs if b != t["branch"]]], run["repo"])
+                add(text if rc == 0 else "", t["id"])
+    return sorted(out, key=lambda x: x["when"] or 0)[-limit:]
+
+
+def _orch_commits(rid, git=None):
+    """GET /orch/commits?id= -> {ok, commits, base}."""
+    if not os.path.exists(ORCH_DB):
+        return {"ok": False, "error": "unknown run"}
+    conn = _orch_connect()
+    try:
+        run, tasks = _orch_load(conn, rid)
+    finally:
+        conn.close()
+    if not run:
+        return {"ok": False, "error": "unknown run"}
+    if run["state"] in ("scheduled", "discarded", "cancelled") or not run.get("base_sha"):
+        return {"ok": True, "commits": [], "base": run.get("base") or ""}
+    return {"ok": True, "commits": _orch_run_commits(run, tasks, git), "base": run["base"]}
+
+
 def _orch_get(rid):
     """GET /orch/run?id="""
     if not os.path.exists(ORCH_DB):
@@ -2979,6 +3464,9 @@ def _orch_get(rid):
         for t in tasks:
             if t["state"] == "running" and t.get("path") and t["role"] != "manager":
                 t["live_session"] = _orch_live_session(t["path"])
+        known = _orch_in_history([t.get("session_id") or t.get("live_session") for t in tasks])
+        for t in tasks:
+            t["in_history"] = (t.get("session_id") or t.get("live_session") or "") in known
         children = {}
         for t in tasks:
             child, ctasks = _orch_load(conn, t.get("child_id") or "")

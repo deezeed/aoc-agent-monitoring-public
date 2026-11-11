@@ -38,6 +38,10 @@ c.check("member: may read, but not the owner's token", ok("member", "GET", "/sta
 c.check("viewer: reads, may ask the voice assistant, changes nothing", ok("viewer", "GET", "/orch/runs") and ok("viewer", "POST", "/voice/ask")
         and not any(ok("viewer", m, p) for m, p in (("POST", "/orch/approve"), ("POST", "/permission/decide"), ("DELETE", "/remove"),
                                                     ("POST", "/notes"))))
+c.check("scheduled runs: members schedule / start / pause / delete; viewers only read the list and commits",
+        all(ok("member", "POST", p) for p in ("/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete"))
+        and ok("viewer", "GET", "/orch/schedules") and ok("viewer", "GET", "/orch/commits")
+        and not any(ok("viewer", "POST", p) for p in ("/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete")))
 c.check("unknown role: nothing", not ok("hacker", "POST", "/notes"))
 c.check("the private shell (/terminal/ws, a GET websocket) is the owner's only -- found in review",
         ok("owner", "GET", "/terminal/ws") and not ok("member", "GET", "/terminal/ws") and not ok("viewer", "GET", "/terminal/ws"))
