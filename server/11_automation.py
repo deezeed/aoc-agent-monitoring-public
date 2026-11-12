@@ -1305,7 +1305,7 @@ def _danger_open(hook, hits, now) -> str:
     with _status_cond:
         _status_version[0] += 1
         _status_cond.notify_all()
-    name = _push_session_name(sid)
+    name = _push_session_name(sid, hook.get("cwd"))
     try:
         _push_notify(f"⚠ {name}: dangerous command", f"{why} -- {cmd[:160]}", tag="perm-" + rid, urgent=True)
     except Exception as e:

@@ -38,10 +38,11 @@ c.check("member: may read, but not the owner's token", ok("member", "GET", "/sta
 c.check("viewer: reads, may ask the voice assistant, changes nothing", ok("viewer", "GET", "/orch/runs") and ok("viewer", "POST", "/voice/ask")
         and not any(ok("viewer", m, p) for m, p in (("POST", "/orch/approve"), ("POST", "/permission/decide"), ("DELETE", "/remove"),
                                                     ("POST", "/notes"))))
-c.check("scheduled runs: members schedule / start / pause / delete; viewers only read the list and commits",
-        all(ok("member", "POST", p) for p in ("/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete"))
+SCHED_POSTS = ("/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete", "/orch/schedule_run")
+c.check("scheduled runs: members schedule / edit / start / run now / pause / delete; viewers only read the list and commits",
+        all(ok("member", "POST", p) for p in SCHED_POSTS)
         and ok("viewer", "GET", "/orch/schedules") and ok("viewer", "GET", "/orch/commits")
-        and not any(ok("viewer", "POST", p) for p in ("/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete")))
+        and not any(ok("viewer", "POST", p) for p in SCHED_POSTS))
 c.check("unknown role: nothing", not ok("hacker", "POST", "/notes"))
 c.check("the private shell (/terminal/ws, a GET websocket) is the owner's only -- found in review",
         ok("owner", "GET", "/terminal/ws") and not ok("member", "GET", "/terminal/ws") and not ok("viewer", "GET", "/terminal/ws"))
@@ -116,6 +117,10 @@ c.check("handler: /join is open (the invite is the key), the rest needs a token"
         h.index('if self.path.split("?")[0] == "/join":') < h.index("if not self._check_auth():"))
 c.check("handler: orchestration for the owner / members, also through the tunnel",
         'self._is_direct_loopback() or self._user["role"] in ("owner", "member")' in h)
+_orch_routes = h[h.index('elif path_no_qs in ("/orch/create"'):]
+_orch_routes = _orch_routes[:_orch_routes.index("):")]
+c.check("handler: run now on a schedule sits behind the same owner / member check as the other orchestration POSTs",
+        all(p in _orch_routes for p in SCHED_POSTS))
 
 # tokenless owner from this PC -- but not for a web page the owner happens to visit
 t = lambda host="127.0.0.1:5151", origin=None, site=None, mode=None, method="GET", path="/status": \

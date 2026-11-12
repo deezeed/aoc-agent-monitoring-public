@@ -64,6 +64,13 @@ async function seed(base) {
       { id: 'smoke-a2', unit: 'DB', name: 'Migrations', status: 'done', tasks: [{ name: 'schema', status: 'done' }] },
       { id: 'smoke-a3', unit: 'ER', name: 'Payment webhook', status: 'error', error: 'TypeError: cannot read "id"', tasks: [] }] });
   await post({ session_id: 'smoke-s2', cwd: 'C:\\proj\\memebot', session_active: true, display_name: 'Memebot', waiting_on_you: true, agents: [] });
+  // a repeating run (paused: it never fires here), so Orchestrate shows a schedule card and its edit form
+  const orch = (path, body) => fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+  const s = await orch('/orch/schedule_save', { goal: 'Weekly report on the <shop> orders, with a long goal to wrap on a phone',
+    workspace: 'smoke-ws', schedule: { type: 'weekdays', at: '03:00' }, budget_usd: 2, budget_day: 5, budget_month: 50 });
+  if (!s.ok) throw new Error('seed schedule: ' + s.error);
+  await orch('/orch/schedule_pause', { id: s.id, paused: true });
+  return s.id;
 }
 
 let monitor, chrome, data, profile;
@@ -77,7 +84,7 @@ try {
   monitor = spawn(process.env.PYTHON || 'python', [join(ROOT, 'monitor.py'), '--headless'], {
     cwd: ROOT, stdio: 'ignore', env: { ...process.env, AOC_PORT: String(port), AOC_DATA_DIR: data } });
   await waitFor(async () => (await fetch(base + '/status')).ok, 120000, 'monitor /status');
-  await seed(base);
+  const schedId = await seed(base);
 
   const cdpPort = await freePort();
   profile = mkdtempSync(join(tmpdir(), 'aoc-smoke-chrome-'));
@@ -146,6 +153,14 @@ try {
     for (const v of VIEWS) {
       await ev(`setView(${JSON.stringify(v)})`); await sleep(1500);
       await check(`${v} ${w} ${theme}`);
+      if (v === 'orch') {   // the schedule's Edit opens the form filled in; Cancel puts it back
+        const card = await ev(`!!document.querySelector('.or-sch') && document.body.innerHTML.includes('_orScheduleRun(')`);
+        if (!card) problems.push(`orch ${w} ${theme}: no schedule card with Run now`);
+        await ev(`_orScheduleEdit(${JSON.stringify(schedId)})`); await sleep(500);
+        if (!await ev(`!!document.querySelector('.or-new-ed[open]')`)) problems.push(`orch ${w} ${theme}: Edit did not open the form`);
+        await check(`orch:edit ${w} ${theme}`);
+        await ev(`_orScheduleEditCancel()`);
+      }
     }
     const panes = await ev(`[...document.querySelectorAll('.settings-tab')].map(t=>t.dataset.pane)`) || [];
     if (!panes.length) problems.push(`settings ${w} ${theme}: no tabs found`);

@@ -24,7 +24,8 @@ base_g = {"os": os, "json": json, "re": re, "time": time, "sqlite3": sqlite3, "s
           "threading": threading, "_NO_WINDOW": NO_WINDOW, "AOC_DATA_DIR": data_dir,
           "_log_bg_error": lambda where, e: print("bg error", where, e), "_own_claude_pids": set(),
           "_is_claude_pid_alive": lambda pid: False, "_snapshot_processes": lambda: [], "_find_claude_exe": lambda: "claude.exe",
-          "_load_json_file": lambda path, default=None: default, "DB_FILE": os.path.join(data_dir, "history.db")}
+          "_load_json_file": lambda path, default=None: default, "DB_FILE": os.path.join(data_dir, "history.db"),
+          "PORT": 5199}
 wt = exec_functions(["_wt_git", "_wt_err", "_wt_remove", "_wt_repo", "_wt_conflicts", "_parse_porcelain_z"],
                     dict(base_g))
 src_names = [n for n in names if n != "_orch_lock"]
@@ -206,9 +207,13 @@ def answer(base, so, cost=0.1, subtype="success"):
                             "num_turns": 3, "session_id": "sess-" + os.path.basename(base), "structured_output": so}))
 
 
-def fake_spawn(argv, cwd, stdin_text, base):
+marks = {}       # process kind -> (AOC_ORCH_RUN, AOC_ORCH_TASK, AOC_ORCH_PORT) it was started with
+
+
+def fake_spawn(argv, cwd, stdin_text, base, env=None):
     os.makedirs(os.path.dirname(base), exist_ok=True)
     calls.append((os.path.basename(base), cwd, stdin_text))
+    marks[os.path.basename(base).rsplit("-", 1)[0]] = tuple((env or {}).get(k) for k in ("AOC_ORCH_RUN", "AOC_ORCH_TASK", "AOC_ORCH_PORT"))
     kind = os.path.basename(base).rsplit("-", 1)[0]
     if kind == "plan":
         answer(base, {"summary": "two devs then qa", "single_agent": False, "tasks": [
@@ -296,6 +301,9 @@ c.check("qa's prompt carried its inputs' results", any("wrote api.txt" in x[2] a
 c.check("qa (no edits) keeps no branch", st["qa"]["branch"] == "" and st["qa"]["commits"] == 0)
 v = step(2)
 c.check("supervisor finished -> review with its report", v["run"]["state"] == "review" and "QA passed" in v["run"]["report"])
+c.check("every process of the run is marked as its Orchestrate worker (run, task, this AOC's port)",
+        marks.get("plan") == (rid, "plan", "5199") and marks.get("api") == (rid, "api", "5199")
+        and marks.get("qa") == (rid, "qa", "5199") and marks.get("supervise") == (rid, "supervise", "5199"))
 m = v["metrics"]
 c.check("metrics of the run: costs split, 1 retry, success", m["cost_coordination"] == 0.35 and m["retries"] == 1
         and m["done"] == 3 and m["human_interventions"] == 2)
@@ -346,9 +354,64 @@ r = O["_orch_action"]("merge", {"id": rid})
 c.check("merge stops at a conflict and names it; nothing half-merged",
         not r["ok"] and "conflict" in r["error"] and r["merged"] == ["one"]
         and git("status", "--porcelain", cwd=repo).stdout.strip() == "" and O["_orch_get"](rid)["run"]["state"] == "review")
+c.check("per-task merge state: what went in 'merged', the conflicting one 'conflict'",
+        {t["id"]: t["merge_state"] for t in O["_orch_get"](rid)["tasks"]} == {"one": "merged", "two": "conflict"})
 r = O["_orch_action"]("discard", {"id": rid})
-c.check("discard cleans the remaining branches", r["ok"] and "aoc/orch" not in git("branch", cwd=repo).stdout)
+c.check("discard refused once part of it is merged: finish instead", not r["ok"] and "finish the merge" in r["error"])
+r = O["_orch_action"]("merge", {"id": rid})
+c.check("try again without resolving: the same conflict, still in review",
+        not r["ok"] and r["conflicts"] == ["two"] and r["merged"] == ["one"] and O["_orch_get"](rid)["run"]["state"] == "review")
+r = O["_orch_action"]("merge", {"id": rid, "finish": True})
+v = O["_orch_get"](rid)
+c.check("finish with what's merged: the run is merged, the conflicting task left out, every branch cleaned",
+        r["ok"] and r["merged"] == ["one"] and r["dropped"] == ["two"] and v["run"]["state"] == "merged"
+        and "aoc/orch" not in git("branch", cwd=repo).stdout
+        and {t["id"]: t["merge_state"] for t in v["tasks"]} == {"one": "merged", "two": "left_out"})
 c.check("worktree list clean", git("worktree", "list", cwd=repo).stdout.count("\n") == 1)
+
+# found in dogfooding: a merge stopped at a conflict left the run in review with no way on. Merge the rest
+# (a dependent of the conflict waits), resolve it yourself, try again -> merged
+calls.clear()
+behaviour.clear()
+r = O["_orch_create"]({"goal": "Change app.txt and add files", "cwd": repo, "budget_usd": 10}, exe="claude.exe", spawn=fake_spawn)
+rid = r["id"]
+step()
+conn = O["_orch_connect"]()
+O["_orch_edit_plan"](conn, rid, {"tasks": [
+    dict(id=i, role="developer", title=i.title(), instructions="x", done_criteria="y", depends_on=d, model="haiku", budget_usd=1)
+    for i, d in (("one", []), ("two", []), ("three", []), ("four", ["two"]))]}, time.time())
+conn.commit(); conn.close()
+behaviour.update({"one": [write("app.txt", "uno\n")], "two": [write("app.txt", "dos\n")], "three": [write("three.txt", "3\n")],
+                  "four": [write("four.txt", "4\n")],
+                  "supervise": [{"action": "finish", "reason": "ok", "report": "done", "retry": [], "tasks": []}]})
+O["_orch_action"]("approve", {"id": rid})
+for _ in range(12):
+    if step()["run"]["state"] == "review":
+        break
+v = O["_orch_get"](rid)
+c.check("partial merge: a run of 4 tasks reaches review", v["run"]["state"] == "review")
+r = O["_orch_action"]("merge", {"id": rid})
+ms = {t["id"]: t["merge_state"] for t in O["_orch_get"](rid)["tasks"]}
+c.check("merge stops at the first conflict: the next not tried, one built on the conflict waits",
+        not r["ok"] and r["merged"] == ["one"] and r["conflicts"] == ["two"] and r["partial"]
+        and ms == {"one": "merged", "two": "conflict", "three": "", "four": "blocked"})
+r = O["_orch_action"]("merge", {"id": rid, "rest": True})
+ms = {t["id"]: t["merge_state"] for t in O["_orch_get"](rid)["tasks"]}
+c.check("merge the rest: what goes in cleanly is merged, the task built on the conflict waits",
+        not r["ok"] and r["merged"] == ["one", "three"] and r["blocked"] == ["four"]
+        and ms == {"one": "merged", "two": "conflict", "three": "merged", "four": "blocked"}
+        and os.path.exists(os.path.join(repo, "three.txt")) and not os.path.exists(os.path.join(repo, "four.txt"))
+        and O["_orch_get"](rid)["run"]["state"] == "review")
+two_branch = next(t["branch"] for t in O["_orch_get"](rid)["tasks"] if t["id"] == "two")
+git("merge", "--no-edit", two_branch, cwd=repo)   # resolved by hand
+open(os.path.join(repo, "app.txt"), "w").write("uno y dos\n")
+git("add", "-A", cwd=repo); git("commit", "-qm", "resolve two", cwd=repo)
+r = O["_orch_action"]("merge", {"id": rid})
+v = O["_orch_get"](rid)
+c.check("resolved by hand, try again: two counts as merged, four goes in, the run is merged",
+        r["ok"] and r["merged"] == ["one", "two", "three", "four"] and v["run"]["state"] == "merged" and not v["run"]["error"]
+        and open(os.path.join(repo, "app.txt")).read() == "uno y dos\n" and os.path.exists(os.path.join(repo, "four.txt"))
+        and "aoc/orch" not in git("branch", cwd=repo).stdout)
 
 # found live: two workstreams edited the same lines -> a later task's inputs conflict. The error said only
 # "merge failed" and the review retried that task twice into the same conflict
@@ -416,7 +479,7 @@ git("add", "-A", cwd=repo); git("commit", "-qm", "init", cwd=repo)
 H, hcalls = {}, []
 
 
-def hspawn(argv, cwd, stdin_text, base):
+def hspawn(argv, cwd, stdin_text, base, env=None):
     run_dir, kind = os.path.basename(os.path.dirname(base)), os.path.basename(base).rsplit("-", 1)[0]
     team = run_dir.split("-")[-2] if re.search(r"-t\d+$", run_dir) else "top"
     hcalls.append((team, kind, cwd, stdin_text, argv, os.path.exists(os.path.join(cwd, "api.txt"))))
@@ -540,7 +603,7 @@ c.check("usage limit recognised and explained", O["_orch_limit_hit"](LIMIT) and 
 lcalls = []
 
 
-def lspawn(argv, cwd, stdin_text, base):
+def lspawn(argv, cwd, stdin_text, base, env=None):
     run_dir, kind = os.path.basename(os.path.dirname(base)), os.path.basename(base).rsplit("-", 1)[0]
     if re.search(r"-lim-t\d+$", run_dir) and kind != "plan":
         os.makedirs(os.path.dirname(base), exist_ok=True)
@@ -707,7 +770,9 @@ c.check("the MCP agent ran on the subscription (no API key), with its connector 
         and look[1][look[1].index("--disallowedTools") + 1] == "mcp__claude_ai_Vercel,mcp__plugin_design_slack"
         and "Changed later" not in " ".join(look[1]))
 rep = next(x for x in tcalls if x[0] == "report")
-c.check("an agent without MCP keeps the normal environment", rep[3] is None)
+c.check("an agent without MCP keeps the normal environment, only marked as an Orchestrate worker",
+        rep[3] is not None and {k: x for k, x in rep[3].items() if not k.startswith("AOC_ORCH_")} == dict(os.environ)
+        and rep[3]["AOC_ORCH_RUN"] == rid and rep[3]["AOC_ORCH_TASK"] == "report")
 v = O["_orch_get"](rid)
 st = {t["id"]: t for t in v["tasks"]}
 c.check("the writer (Write tool) got its file committed; the analyst kept no branch",
@@ -1288,8 +1353,11 @@ blk = O["_orch_schedule_block"]
 cfg_ = dict(rc_, budget_usd=3, budget_day=10, budget_month=20)
 c.check("skip: the last run still works (or waits for its plan OK) -> no overlap",
         "still running" in blk(cfg_, {"id": "r1", "state": "running"}, (0, 0), "api", {})
-        and "still plan ready" in blk(cfg_, {"id": "r1", "state": "plan_ready"}, (0, 0), "api", {})
-        and blk(cfg_, {"id": "r1", "state": "review"}, (0, 0), "api", {}) == "")
+        and "still plan ready" in blk(cfg_, {"id": "r1", "state": "plan_ready"}, (0, 0), "api", {}))
+c.check("skip: the last run is done but waits for your merge (accept, in a workspace) -> no next one on top of it",
+        blk(cfg_, {"id": "r1", "state": "review", "kind": "repo"}, (0, 0), "api", {}) == "its last run (r1) waits for your merge"
+        and blk(cfg_, {"id": "r1", "state": "review", "kind": "workspace"}, (0, 0), "api", {}).endswith("waits for your accept")
+        and all(blk(cfg_, {"id": "r1", "state": st}, (0, 0), "api", {}) == "" for st in ("merged", "discarded", "cancelled", "failed")))
 c.check("skip: a run that would cross today's / this month's cap",
         "today's budget: $7.50 of $10.00" in blk(cfg_, None, (7.5, 7.5), "api", {}) and "this month's budget" in blk(cfg_, None, (0, 18), "api", {})
         and blk(cfg_, None, (7, 17), "api", {}) == "")
@@ -1425,6 +1493,79 @@ O["_orch_action"]("discard", {"id": r3})
 s = stick(T1 + 3600 + 10)
 c.check("cap: today's spend + one more run would cross the day's cap -> skipped, says why",
         s["last_result"].startswith("skipped: today's budget") and len(s["runs"]) == 3 and s["spend_day"] > 0.5)
+# edit: same id, runs and log; a new clock counts from now (the old one would be overdue a day later)
+nr = len(s["runs"])
+n_ev = len(s["events"])
+T2 = T1 + 86400 + 60   # the next day: today's cap is fresh
+edit = dict(rbase, id=sid, cwd="C:\\elsewhere" if os.name == "nt" else "/elsewhere",
+            goal="Update the dependencies, run the tests and the linter", schedule={"type": "every", "hours": 6},
+            model="sonnet", budget_usd=2, budget_day=8, budget_month=60, auto_approve=False)
+e1 = O["_orch_schedule_save"](edit, now=T2)
+s = O["_orch_schedules_list"](T2)["schedules"][0]
+c.check("edit: the same schedule (id, runs, log kept), its new goal / model / budgets / self-approve saved",
+        e1["ok"] and e1["id"] == sid and len(O["_orch_schedules_list"](T2)["schedules"]) == 1 and len(s["runs"]) == nr
+        and s["config"]["goal"] == edit["goal"] and s["config"]["model"] == "sonnet" and s["config"]["budget_usd"] == 2
+        and s["config"]["budget_day"] == 8 and s["config"]["budget_month"] == 60 and s["config"]["auto_approve"] is False
+        and len(s["events"]) == n_ev + 1 and any(x["kind"] == "fired" for x in s["events"]))
+c.check("edit: where it works stays (its runs are about that repo)", s["config"]["cwd"] == srepo)
+c.check("edit: a new clock counts from now -- no burst, next run in 6 h; the change is logged",
+        e1["next_due"] == T2 + 6 * 3600 and s["next_due"] == T2 + 6 * 3600 and s["events"][-1]["kind"] == "edited"
+        and "goal" in s["events"][-1]["message"] and "timing" in s["events"][-1]["message"])
+s = stick(T2 + 60)
+c.check("edit: ... and nothing fires right after it", len(s["runs"]) == nr)
+c.check("edit: nothing changed -> nothing logged", O["_orch_schedule_save"](edit, now=T2 + 70)["changed"] == []
+        and len(O["_orch_schedules_list"](T2 + 70)["schedules"][0]["events"]) == n_ev + 1)
+c.check("edit: refused when invalid (and nothing saved), unknown id",
+        "grow" in O["_orch_schedule_save"](dict(edit, budget_day=1), now=T2 + 80)["error"]
+        and O["_orch_schedules_list"](T2 + 80)["schedules"][0]["config"]["budget_day"] == 8
+        and not O["_orch_schedule_save"](dict(edit, id="nope"), now=T2 + 80)["ok"])
+
+# run now: one run, same guards, its clock doesn't move
+fire0 = s["last_fire"]
+rn = O["_orch_schedule_run_now"]({"id": sid}, now=T2 + 120, limits={}, **skw)
+s = stick(T2 + 130)
+c.check("run now: an ordinary run of the schedule starts; the clock stays (next run still in 6 h, from the edit)",
+        rn["ok"] and s["runs"][0]["id"] == rn["id"] and len(s["runs"]) == nr + 1 and s["next_due"] == T2 + 6 * 3600
+        and s["last_fire"] == fire0 and s["last_result"].endswith("(you asked)")
+        and s["events"][-1]["kind"] == "fired" and s["events"][-1]["message"] == "you asked"
+        and O["_orch_get"](rn["id"])["run"]["schedule_id"] == sid and O["_orch_get"](rn["id"])["run"]["state"] == "plan_ready")
+rn2 = O["_orch_schedule_run_now"]({"id": sid}, now=T2 + 140, limits={}, **skw)
+s = O["_orch_schedules_list"](T2 + 140)["schedules"][0]
+c.check("run now: refused while its last run waits for the plan OK -- you see why, it's logged, the clock stays",
+        not rn2["ok"] and "still plan ready" in rn2["error"] and len(s["runs"]) == nr + 1
+        and s["events"][-1]["kind"] == "skipped" and s["events"][-1]["message"].startswith("run now: ")
+        and s["next_due"] == T2 + 6 * 3600 and s["last_fire"] == fire0)
+O["_orch_schedule_save"](dict(edit, auto_approve=True), now=T2 + 150)
+s = O["_orch_schedules_list"](T2 + 150)["schedules"][0]
+c.check("edit: not the clock -> the next run stays where it was", s["next_due"] == T2 + 6 * 3600
+        and s["config"]["auto_approve"] is True and "timing" not in s["events"][-1]["message"])
+for k in range(6):
+    s = stick(T2 + 160 + k)
+c.check("its run (approved by the schedule) is done and waits for your merge", O["_orch_get"](rn["id"])["run"]["state"] == "review")
+rn3 = O["_orch_schedule_run_now"]({"id": sid}, now=T2 + 170, limits={}, **skw)
+c.check("run now: refused while the last run waits for your merge", not rn3["ok"] and "waits for your merge" in rn3["error"])
+s = stick(T2 + 6 * 3600 + 30)
+c.check("merge-waiting: the regular firing is skipped too, logged with the reason; the next one comes on its clock",
+        len(s["runs"]) == nr + 1 and s["last_result"] == "skipped: its last run (%s) waits for your merge" % rn["id"]
+        and s["events"][-1]["kind"] == "skipped" and s["next_due"] == T2 + 12 * 3600 + 30)
+O["_orch_action"]("discard", {"id": rn["id"]})
+O["_orch_schedule_save"](dict(edit, auto_approve=True, budget_usd=1, budget_day=1), now=T2 + 6 * 3600 + 40)
+rn4 = O["_orch_schedule_run_now"]({"id": sid}, now=T2 + 6 * 3600 + 50, limits={}, **skw)
+c.check("run now: refused when it would cross today's cap", not rn4["ok"] and "today's budget" in rn4["error"])
+O["_orch_schedule_save"](dict(edit, auto_approve=True, budget_usd=1, budget_day=8), now=T2 + 6 * 3600 + 60)
+setf = tempfile.mkdtemp()   # the settings dirs above are gone: billing goes to a fresh one
+g["ORCH_SETTINGS_FILE"] = os.path.join(setf, "s.json")
+O["_orch_settings_save"]({"billing": "subscription"})
+rn5 = O["_orch_schedule_run_now"]({"id": sid}, now=T2 + 6 * 3600 + 70, limits=hot, **skw)
+O["_orch_settings_save"]({"billing": "api"})
+shutil.rmtree(setf, ignore_errors=True)
+c.check("run now: refused while your plan limits are nearly used up (subscription)", not rn5["ok"] and "5h plan limit" in rn5["error"])
+c.check("run now: unknown schedule", not O["_orch_schedule_run_now"]({"id": "nope"}, limits={}, **skw)["ok"])
+c.check("run now: also while paused (only its clock is paused)",
+        O["_orch_schedule_action"]("pause", {"id": sid}, now=T2 + 6 * 3600 + 80)["ok"]
+        and O["_orch_schedule_run_now"]({"id": sid}, now=T2 + 6 * 3600 + 90, limits={}, **skw)["ok"]
+        and O["_orch_schedules_list"](T2 + 6 * 3600 + 90)["schedules"][0]["next_due"] is None)
+O["_orch_action"]("cancel", {"id": O["_orch_schedules_list"]()["schedules"][0]["runs"][0]["id"]})
 c.check("delete: the schedule goes, its runs stay", O["_orch_schedule_action"]("delete", {"id": sid})["ok"]
         and O["_orch_schedules_list"]()["schedules"] == [] and O["_orch_get"](r3)["run"]["schedule_id"] == sid)
 c.check("unknown schedule", not O["_orch_schedule_action"]("pause", {"id": "nope"})["ok"])
@@ -1446,4 +1587,106 @@ c.check("migration: start_at + schedule_id added, schedules tables made, old row
         {"start_at", "schedule_id"} <= cols and {"schedules", "schedule_events"} <= tabs
         and oc.execute("SELECT schedule_id FROM runs WHERE id='old'").fetchone()[0] == "")
 oc.close()
+# ── round 17 dogfood: what a killed process is charged, no pointless retries, names with diacritics ──
+pricing = exec_functions(["_calc_cost", "_model_pricing", "_MODEL_PRICING", "_CACHE_WRITE_1H_MULT"])
+g["_calc_cost"] = pricing["_calc_cost"]
+
+
+def asst(mid, inp, out, model="claude-opus-5", content=None):
+    return json.dumps({"type": "assistant", "uuid": "u-" + mid + str(out), "message": {
+        "id": mid, "model": model, "content": content or [{"type": "text", "text": "x"}],
+        "usage": {"input_tokens": inp, "output_tokens": out, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}})
+
+
+# Opus 5: $5 in / $25 out per Mtok. Message A repeats per content block: its last copy counts
+stream = "\n".join([json.dumps({"type": "system", "subtype": "init"}), asst("A", 100_000, 10_000),
+                    asst("A", 100_000, 20_000), json.dumps({"type": "user", "message": {"content": []}}),
+                    asst("B", 200_000, 0)])
+c.check("usage cost: each API call once (its last copy), summed -- 1.0 + 1.0",
+        abs(O["_orch_usage_cost"](stream) - 2.0) < 1e-9)
+c.check("usage cost: nothing recorded -> None", O["_orch_usage_cost"]("") is None
+        and O["_orch_usage_cost"](json.dumps({"type": "system"})) is None)
+p = O["_orch_parse"](stream)
+c.check("parse stream-json without a result line: not ok, cost = what its calls used",
+        not p["ok"] and abs(p["cost"] - 2.0) < 1e-9 and "before it answered" in p["error"])
+res_line = json.loads(ok)
+p = O["_orch_parse"](stream + "\n" + json.dumps(res_line))
+c.check("parse stream-json with a result line: its answer and its reported cost",
+        p["ok"] and p["data"]["status"] == "done" and p["cost"] == 0.12 and p["session_id"] == "s-1")
+so = {"status": "done", "summary": "via tool", "result": "r", "files_changed": [], "for_next": "", "errors": []}
+p = O["_orch_parse"]("\n".join([asst("C", 10, 10, content=[{"type": "tool_use", "name": "StructuredOutput", "input": so}]),
+                                json.dumps(dict(res_line, structured_output=None))]))
+c.check("parse stream-json: no structured_output on the result -> the StructuredOutput call's input",
+        p["ok"] and p["data"]["summary"] == "via tool")
+p = O["_orch_parse"](stream + "\n" + json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                                                    "total_cost_usd": 0.3, "result": "API Error: 500"}))
+c.check("parse stream-json error result: the error, its cost", not p["ok"] and p["cost"] == 0.3 and "500" in p["error"])
+c.check("llm argv: stream-json needs --verbose; plain json without", (lambda a, b: "stream-json" in a and "--verbose" in a
+        and "--verbose" not in b and b[b.index("--output-format") + 1] == "json")(
+    O["_orch_llm_argv"]("c", {}, "opus", 1.0, stream=True), O["_orch_llm_argv"]("c", {}, "opus", 1.0)))
+
+kd = tempfile.mkdtemp()
+with open(os.path.join(kd, "job.out"), "w", encoding="utf-8") as f:
+    f.write(stream)
+used, note = O["_orch_killed_cost"](3.0, os.path.join(kd, "job"))
+c.check("killed: charged what its output records (an estimate), not its budget", abs(used - 2.0) < 1e-9 and "estimated" in note)
+used, note = O["_orch_killed_cost"](3.0, os.path.join(kd, "nothing"))
+c.check("killed, nothing readable: its whole budget", used == 3.0 and "whole budget" in note)
+projects = os.path.join(kd, "projects")
+wt_path = os.path.join(kd, "wt")
+tdir = O["_orch_project_dir"](wt_path, projects)
+os.makedirs(tdir)
+with open(os.path.join(tdir, "s1.jsonl"), "w", encoding="utf-8") as f:
+    f.write(asst("T", 100_000, 0) + "\n")
+used, note = O["_orch_killed_cost"](3.0, os.path.join(kd, "nothing"), wt_path, time.time() - 60, projects)
+c.check("killed task with no output: its transcript in its own folder is read", abs(used - 0.5) < 1e-9 and "transcript" in note)
+used, _ = O["_orch_killed_cost"](3.0, os.path.join(kd, "nothing"), wt_path, time.time() + 600, projects)
+c.check("... but not a transcript older than the attempt", used == 3.0)
+
+nr = O["_orch_no_retry"]
+c.check("no retry: the agent says it's impossible", "can't be done" in nr("", {"summary": "This is impossible without the source"}))
+c.check("no retry: no access", nr("", {"errors": ["Permission denied to the store API"]}) == "missing access")
+c.check("no retry: Claude Code can't sign in", "sign in" in nr("Invalid API key -- please run /login"))
+c.check("no retry: unknown model", "model" in nr("API Error: 404 not_found_error model: claude-x"))
+c.check("retry: a transient sign wins over a no-retry one",
+        nr("forbidden", {"summary": "rate limit hit, try again"}) == "" and nr("permission denied (timed out)") == "")
+c.check("retry: an ordinary failure, nothing said", nr("the answer did not follow the required JSON format") == ""
+        and nr("", None) == "" and nr("", {"summary": "tests fail"}) == "")
+
+c.check("transliteration: diacritics kept as plain letters", O["_orch_workspace_slug"]("Výskum trhu") == "vyskum-trhu"
+        and O["_orch_workspace_slug"]("Ľadová ŠŤÚDIA č.2") == "ladova-studia-c-2"
+        and O["_orch_workspace_slug"]("Straße Łódź") == "strasse-lodz")
+v2, _ = O["_orch_validate_tasks"]([dict(plan[0], id="Prieskum úloh", role="research")])
+c.check("transliteration: task ids too (like the page's _orSlug)", v2[0]["id"] == "prieskum-uloh")
+
+# halt: what a killed task used is charged (an estimate); no task keeps a branch name (it's deleted)
+hdb = O["_orch_connect"](os.path.join(kd, "halt.db"))
+hdb.execute("INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model, max_parallel, budget_usd) "
+            "VALUES ('h', 0, 0, 'g', ?, 'main', 'x', 'running', 'opus', 2, 10)", (kd,))
+O["_orch_insert_tasks"](hdb, "h", [dict(plan[0], id=i, role="developer", depends_on=[], budget_usd=2.0, model="sonnet")
+                                   for i in ("busy", "blind", "fin")], 0)
+hdb.execute("UPDATE tasks SET state='running', pid=11, job_base=?, started=? WHERE id='busy'", (os.path.join(kd, "job"), time.time()))
+hdb.execute("UPDATE tasks SET state='running', pid=12, job_base=?, started=? WHERE id='blind'", (os.path.join(kd, "none"), time.time()))
+hdb.execute("UPDATE tasks SET state='done', branch='aoc/orch-h/fin', commits=1 WHERE id='fin'")
+hrun, htasks = O["_orch_load"](hdb, "h")
+real_stop = g["_orch_stop"]
+g["_orch_stop"] = lambda pid, since=None, alive=None, kill=None: bool(pid)
+try:
+    O["_orch_halt"](hdb, hrun, htasks, time.time(), git=lambda args, cwd, timeout=None: (0, "", ""))
+finally:
+    g["_orch_stop"] = real_stop
+_, htasks = O["_orch_load"](hdb, "h")
+ht = {t["id"]: t for t in htasks}
+hev = [dict(e) for e in hdb.execute("SELECT * FROM events WHERE run_id='h' AND kind='task_stopped' ORDER BY task_id")]
+c.check("halt: a killed task is charged what its output records, marked as an estimate",
+        ht["busy"]["state"] == "skipped" and abs(ht["busy"]["cost_usd"] - 2.0) < 1e-9 and ht["busy"]["cost_est"] == 1)
+c.check("halt: nothing readable -> its budget", ht["blind"]["cost_usd"] == 2.0 and ht["blind"]["cost_est"] == 1)
+c.check("halt: every task's branch name cleared (the branches are deleted)", all(t["branch"] == "" for t in htasks))
+c.check("halt: a 'task_stopped' event per killed task, its cost marked as an estimate",
+        [(e["task_id"], e["cost_est"]) for e in hev] == [("blind", 1), ("busy", 1)])
+m = O["_orch_metrics"](hrun, htasks, [dict(e) for e in hdb.execute("SELECT * FROM events WHERE run_id='h'")])
+c.check("metrics say part of the cost is an estimate", m["cost_est"] is True)
+hdb.close()
+shutil.rmtree(kd, ignore_errors=True)
+
 c.finish()

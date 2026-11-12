@@ -478,6 +478,11 @@ def _transcript_scanner_worker():
                         if session_id not in sessions:
                             sessions[session_id] = {}
                         sess = sessions[session_id]
+                        # an Orchestrate agent's transcript (its projects dir is named
+                        # after its aoc-orch-* worktree): a worker, even before a hook
+                        # reports it -- see _orch_worker_of
+                        if _orch_worker_path(encoded_proj):
+                            sess["transcript_dir"] = encoded_proj
                         # Only fill base fields if hook data is stale
                         last_seen_epoch = sess.get("last_seen_epoch", 0)
                         if now - last_seen_epoch >= 120:
@@ -501,7 +506,7 @@ def _transcript_scanner_worker():
                         # Not folded into the loop above: "val != 0" is True for a bool,
                         # since bool is an int subclass and False == 0 -- that check would
                         # silently swallow every "False" value forever.
-                        if "waiting_on_you" in stats and _transcript_woy_applies(sess, stats):
+                        if "waiting_on_you" in stats and _transcript_woy_applies(sess, stats) and not _orch_worker_of(sess):
                             _accumulate_waiting_time(sess, stats["waiting_on_you"], now)
                             if bool(stats["waiting_on_you"]) != bool(sess.get("waiting_on_you")):
                                 sess["waiting_kind"] = "turn" if stats["waiting_on_you"] else ""

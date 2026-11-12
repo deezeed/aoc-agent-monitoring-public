@@ -32,7 +32,7 @@ ns = exec_functions(
      "_danger_log_entry", "_danger_log_append", "_danger_log_read", "_danger_test"],
     {"os": os, "json": json, "re": re, "time": time, "threading": threading, "_secrets": _secrets,
      "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "_perm_lock": threading.Lock(), "_perm_requests": {},
-     "_status_cond": _Cond(), "_status_version": [0], "_push_session_name": lambda sid: "S",
+     "_status_cond": _Cond(), "_status_version": [0], "_push_session_name": lambda sid, cwd="": "S",
      "_push_notify": lambda *a, **k: 1, "_show_native_toast": lambda *a, **k: None,
      "_log_bg_error": lambda *a: errors.append(a)})
 CFG = ns["_sanitize_danger_guard"]({})

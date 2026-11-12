@@ -80,7 +80,9 @@ def _hooks_health_view() -> dict:
     last = _hooks_health.get("last_repair") or _auto_repair_load().get("last")
     return {"checks": _hooks_health["checks"], "at": _hooks_health["at"], "error": _hooks_health["error"],
             "bad": _hooks_health_bad(_hooks_health["checks"]), "last_repair": last,
-            "auto_repair": _auto_repair_load().get("enabled", True) is not False}
+            "auto_repair": _auto_repair_load().get("enabled", True) is not False,
+            # deployed hooks from before the Orchestrate worker tag (server/17)
+            "orch_hint": _orch_hooks_hint()}
 
 
 # ── auto-repair after an update ────────────────────────────────────────────

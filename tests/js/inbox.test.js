@@ -61,6 +61,7 @@ const oh = _inboxHtml([], now, [], [], orch);
 c.check('orchestration only: counted, block under the header, no "All clear"', oh.includes('1 thing needs you') && !oh.includes('All clear')
   && !oh.includes('Nothing needs you') && oh.indexOf('ib-head') < oh.indexOf('or-inbox') && oh.includes('Add &lt;export&gt;'));
 c.check('orchestration + sessions: both counted', _inboxHtml(items, now, [], [], orch).includes(`${items.length + 1} things need you`));
-c.check('renderInbox passes orch_attention into the Inbox', src.includes('_bgDead(_bgAgents), sr.orch_attention)'));
+c.check('renderInbox passes orch_attention and the workers\' held commands into the Inbox',
+  src.includes('_bgDead(_bgAgents), sr.orch_attention, sr.orch_holds)'));
 c.check('page has Inbox nav, area, hotkey, palette', ['id="vt-inbox"', 'id="inbox-area"', 'id="mnav-inbox"', "case 'J': setView('inbox')", "['inbox','Inbox']"].every(x => src.includes(x)));
 c.finish();

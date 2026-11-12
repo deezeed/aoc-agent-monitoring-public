@@ -149,7 +149,7 @@ def _perm_pending_by_session(now) -> dict:
                 out.setdefault(q["session_id"], []).append(
                     {"id": q["id"], "tool_name": q["tool_name"], "summary": q["summary"],
                      "detail": q["detail"], "age_s": int(now - q["created"]),
-                     "danger": q.get("danger") or ""})
+                     "danger": q.get("danger") or "", "cwd": q.get("cwd") or ""})
     return out
 
 
@@ -711,11 +711,17 @@ def _push_notify(title, body, tag="aoc", urgent=False, force=False, now=None) ->
     return len(subs)
 
 
-def _push_session_name(sid) -> str:
-    for s in (_own_status_payload() or {}).get("sessions_list") or []:
+def _push_session_name(sid, cwd="") -> str:
+    d = _own_status_payload() or {}
+    for s in d.get("sessions_list") or []:
         if s.get("id") == sid:
             return s.get("display_name") or s.get("project") or "A session"
-    return "A session"
+    # an Orchestrate agent (server/17_orchestration.py): named as one, not "A session"
+    for w in d.get("orch_workers") or []:
+        if w.get("id") == sid:
+            return _orch_worker_label(w)
+    slot = _orch_worker_path(cwd)
+    return _orch_worker_label({"slot": slot}) if slot else "A session"
 
 
 _SW_JS = r"""self.addEventListener('fetch', () => {});

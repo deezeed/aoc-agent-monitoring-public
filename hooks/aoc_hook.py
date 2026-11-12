@@ -22,6 +22,30 @@ MONITOR_SCRIPT = "__MONITOR_SCRIPT__"
 PYTHONW = "__PYTHONW__"
 AOC_TOKEN_FILE = os.path.join(os.path.dirname(MONITOR_SCRIPT), "aoc_token.txt")
 
+
+def _orch_worker(env=None):
+    """An agent Orchestrate started (server/17_orchestration.py,
+    _orch_worker_env) carries AOC_ORCH_RUN / AOC_ORCH_TASK and the port of
+    the AOC that started it -> ({run, task}, port or None); (None, None) for
+    your own sessions. Such a session is AOC's worker, not yours: it reports
+    to the AOC that started it (a preview's agents used to land on the live
+    5151) and says so, so that AOC keeps it out of the Inbox and alerts."""
+    env = os.environ if env is None else env
+    run = str(env.get("AOC_ORCH_RUN") or "").strip()
+    if not run:
+        return None, None
+    try:
+        port = int(str(env.get("AOC_ORCH_PORT") or "").strip())
+        port = port if 0 < port < 65536 else None
+    except ValueError:
+        port = None
+    return {"run": run[:80], "task": str(env.get("AOC_ORCH_TASK") or "").strip()[:80]}, port
+
+
+ORCH_WORKER, _ORCH_PORT = _orch_worker()
+if ORCH_WORKER and _ORCH_PORT:
+    AOC_URL = f"http://127.0.0.1:{_ORCH_PORT}"
+
 # Derived from this file's own location (wherever it actually got deployed
 # to, e.g. ~/.claude/hooks/) rather than hardcoded, so the same deployed
 # copy works regardless of which user account/home directory it's under.
@@ -93,6 +117,11 @@ def _find_claude_ancestor_pid():
 def ensure_monitor() -> bool:
     """Start AOC monitor if not running. Returns (is_running, just_started)."""
     import os
+    if ORCH_WORKER:
+        # an Orchestrate agent: the AOC that started it is running (or it is
+        # gone and the agent with it) -- never start one, least of all the
+        # live 5151 for a preview's agent
+        return True
     try:
         urllib.request.urlopen(f"{AOC_URL}/status", timeout=1)
         return True
@@ -330,6 +359,8 @@ def _dispatch_cloud_post(path: str, data: dict) -> None:
 
 def post_aoc(path: str, data: dict) -> bool:
     _rotate_log()
+    if ORCH_WORKER:
+        data = dict(data, orch=ORCH_WORKER)
     ok = False
     try:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")

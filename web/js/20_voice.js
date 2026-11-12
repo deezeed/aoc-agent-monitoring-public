@@ -28,7 +28,7 @@ function _voPanelHtml(st, supported){
       <button class="adp-btn ln-go" onclick="_voSet({enabled:true})">Turn the voice assistant on</button></div>`;
   const log=st.log.slice(-10).map(m=>`<div class="vo-m vo-${m.who}"><span>${m.who==='you'?'You':'AOC'}</span><div>${escHtml(m.text)}${(m.done||[]).length?`<div class="vo-done">${m.done.map(d=>escHtml(d)).join(' · ')}</div>`:''}</div></div>`).join('');
   const pend=st.pending?`<div class="vo-confirm"><span>${escHtml(st.pending.what.join('; '))}</span>
-      <button class="adp-btn ln-go" onclick="_voConfirm(true)">Yes</button><button class="adp-btn" onclick="_voConfirm(false)">No</button></div>`:'';
+      <span class="vo-yn"><button class="adp-btn ln-go" onclick="_voConfirm(true)">Yes</button><button class="adp-btn" onclick="_voConfirm(false)">No</button></span></div>`:'';
   const mic=supported?`<button class="vo-mic${st.listening?' live':''}" onclick="${st.listening?'_voStop()':'_voListen()'}" ${st.busy?'disabled':''} title="${st.listening?'Stop':'Speak'}">${st.listening?'■':'🎙'}</button>`:'';
   const opt=(cur,list)=>list.map(([v,l])=>`<option value="${v}"${cur===v?' selected':''}>${l}</option>`).join('');
   return head+`<div class="vo-log" id="vo-log">${log||'<div class="or-note">Try: “Čo práve robia agenti?” · “Schváľ plán.” · “Spusti entitu AI News.” · “Nastav minútku na 10 minút.”</div>'}</div>

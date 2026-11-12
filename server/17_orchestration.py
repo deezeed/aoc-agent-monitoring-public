@@ -19,9 +19,10 @@
 # Every process (planner, supervisor, agents) writes its answer to a file
 # under %LOCALAPPDATA%\AOC\orch\<run>\ and is polled by pid, so a monitor
 # reload in the middle of a run loses nothing. State, outputs, errors,
-# approvals and costs live in orchestration.db. Agents keep AOC's hooks: they
-# show up as sessions and the danger guard still holds destructive commands
-# for your OK. Mutations only from this PC (like worktrees).
+# approvals and costs live in orchestration.db. Agents keep AOC's hooks: the
+# danger guard still holds destructive commands for your OK, and their cost
+# counts, but they are marked as Orchestrate workers (_orch_worker_env) and
+# never show up as your sessions. Mutations only from this PC (like worktrees).
 #
 # Hierarchical mode: the top plan may also have *manager* tasks -- a
 # workstream (backend, frontend, docs ...) with its own goal and budget. When
@@ -166,7 +167,7 @@ def _orch_validate_agent(data):
     """Pure: POST /orch/agent_save body -> (agent, None) or (None, error)."""
     if not isinstance(data, dict):
         return None, "bad request"
-    aid = re.sub(r"[^a-z0-9-]+", "-", str(data.get("id") or data.get("name") or "").strip().lower()).strip("-")[:32]
+    aid = re.sub(r"[^a-z0-9-]+", "-", _orch_ascii(data.get("id") or data.get("name")).strip().lower()).strip("-")[:32]
     if not aid:
         return None, "give the agent a name"
     if aid in _ORCH_ROLES:
@@ -315,26 +316,211 @@ def _orch_rules_text(rules, kind):
     return "\n\n" + lead.get(kind, "House rules from the human -- they apply to every agent and come before your task:") + "\n" + rules
 
 
-def _orch_proc_env(agent=None, billing=None):
+def _orch_proc_env(agent=None, billing=None, tag=None):
     """How to start one claude process: -> (spawn kwargs, MCP deny list, ready).
     On the subscription (chosen, or the agent needs connectors) the API key
     is dropped and every MCP server it doesn't need is denied -- all of them
     together don't fit a model's context. Until AOC knows the server list it
-    isn't ready (the caller tries again next tick)."""
+    isn't ready (the caller tries again next tick). tag = (run id, task id):
+    the process is marked as an Orchestrate worker (_orch_worker_env)."""
     billing = billing or _orch_settings()["billing"]
     if billing != "subscription" and not (agent or {}).get("mcp"):
-        return {}, [], True
+        return ({"env": _orch_worker_env(os.environ, *tag)} if tag else {}), [], True
     _orch_catalog_load()
     if not _orch_catalog_cache["mcp"]:
         _orch_catalog()
         return {}, [], False
-    return {"env": _orch_subscription_env()}, _orch_mcp_deny(agent or {}, _orch_catalog_cache["mcp"]), True
+    env = _orch_subscription_env()
+    return {"env": _orch_worker_env(env, *tag) if tag else env}, _orch_mcp_deny(agent or {}, _orch_catalog_cache["mcp"]), True
+
+
+# ── Orchestrate workers: AOC's own claude processes, not your sessions ────
+# Every claude AOC starts for a run carries AOC_ORCH_RUN / AOC_ORCH_TASK and
+# the port of the AOC that started it. The hooks (hooks/aoc_hook.py) then
+# report that session to THAT AOC (a preview's agents no longer land on the
+# live 5151), tagged {"orch": {run, task}}; the server keeps it out of the
+# Inbox, the waiting alerts, toasts/pushes, Today and the session list
+# (/status -> orch_workers instead) while its cost still counts. Hooks
+# installed before this change send no tag: the session's folder gives a
+# task agent away anyway -- its worktree is <repo>/.claude/worktrees/aoc-orch-*
+# (_orch_task_names), and Claude Code keeps its transcript in a projects dir
+# named after that path (_orch_project_dir).
+ORCH_ENV_RUN = "AOC_ORCH_RUN"     # read by hooks/aoc_hook.py and hooks/aoc_permission.py
+ORCH_ENV_TASK = "AOC_ORCH_TASK"
+ORCH_ENV_PORT = "AOC_ORCH_PORT"
+_ORCH_WORKER_PATH_RE = re.compile(r"(?:[\\/]\.claude[\\/]worktrees[\\/]|--claude-worktrees-)aoc-(orch-[A-Za-z0-9_-]+)", re.I)
+
+
+def _orch_worker_env(env, run_id, task_id, port=None):
+    """Pure: a copy of env marked as one Orchestrate worker of this AOC."""
+    out = dict(env or {})
+    out[ORCH_ENV_RUN] = str(run_id or "")[:80]
+    out[ORCH_ENV_TASK] = str(task_id or "")[:80]
+    out[ORCH_ENV_PORT] = str(port or PORT)
+    return out
+
+
+def _orch_worker_path(path):
+    """Pure: the worktree slug ("orch-<run>-<task>-<attempt>") if a folder --
+    or Claude Code's projects-dir name for it -- is an Orchestrate task
+    agent's worktree, else ''."""
+    m = _ORCH_WORKER_PATH_RE.search(str(path or ""))
+    return m.group(1) if m else ""
+
+
+def _orch_worker_of(sess):
+    """Pure: {run, task, slot} when this live session is an Orchestrate
+    worker -- tagged by the hook, or (hooks not updated yet) found by its
+    folder / transcript dir -- else None."""
+    sess = sess or {}
+    tag = sess.get("orch")
+    if isinstance(tag, dict) and (tag.get("run") or tag.get("slot")):
+        return {"run": str(tag.get("run") or ""), "task": str(tag.get("task") or ""), "slot": str(tag.get("slot") or "")}
+    slot = _orch_worker_path(sess.get("cwd")) or _orch_worker_path(sess.get("transcript_dir"))
+    return {"run": "", "task": "", "slot": slot} if slot else None
+
+
+def _orch_split_workers(rows, agents=(), perms=None, own_pids=()):
+    """Pure: /status's session rows -> (yours, workers, holds, agents, foreign).
+    yours = the rows the Inbox, Today, alerts and the session list see;
+    workers = the Orchestrate agents (compact, cost kept); agents = the
+    subagent cards minus the workers'; holds = a worker's held command (the
+    danger guard) -- it does need you, so the Inbox shows it as an Orchestrate
+    item, also for a worker AOC only knows from the request's folder (a
+    preview's agent: the guard's http hook always goes to 5151); foreign =
+    running workers whose claude.exe isn't one this AOC started (the CLI
+    process count includes those)."""
+    yours, workers, holds, foreign = [], [], [], 0
+    for s in rows or []:
+        w = _orch_worker_of(s)
+        if not w:
+            yours.append(s)
+            continue
+        active = s.get("session_active") is not False
+        workers.append({"id": s.get("id"), "run": w["run"], "task": w["task"], "slot": w["slot"],
+                        "project": s.get("project", ""), "display_name": s.get("display_name", ""),
+                        "cwd": s.get("cwd", ""), "session_active": active, "model": s.get("model", ""),
+                        "estimated_cost": s.get("estimated_cost") or 0.0, "input_tokens": s.get("input_tokens") or 0,
+                        "output_tokens": s.get("output_tokens") or 0, "last_seen": s.get("last_seen", ""),
+                        "agents": sum(1 for a in agents or () if a.get("session_id") == s.get("id"))})
+        for q in s.get("perm_requests") or []:
+            holds.append(dict(q, session_id=s.get("id"), run=w["run"], task=w["task"], slot=w["slot"]))
+        if active and not (s.get("host_pid") and s.get("host_pid") in own_pids):
+            foreign += 1
+    known = {s.get("id") for s in rows or []}
+    for sid, reqs in (perms or {}).items():
+        for q in reqs if sid not in known else ():
+            slot = _orch_worker_path(q.get("cwd"))
+            if slot:
+                holds.append(dict(q, session_id=sid, run="", task="", slot=slot))
+    ids = {w["id"] for w in workers}
+    return yours, workers, holds, [a for a in agents or () if a.get("session_id") not in ids], foreign
+
+
+def _orch_worker_tag(update):
+    """Pure: the hook's {"orch": {run, task}} on an /update, cleaned -> dict or None."""
+    tag = (update or {}).get("orch")
+    if not isinstance(tag, dict) or not str(tag.get("run") or "").strip():
+        return None
+    clean = lambda v: re.sub(r"[^A-Za-z0-9_.:/-]+", "", str(v or ""))[:80]
+    return {"run": clean(tag.get("run")), "task": clean(tag.get("task"))}
+
+
+def _orch_open_in_folders(payload):
+    """Pure: /status -> every live claude for "is something still working in
+    this folder" checks (stranded worktrees): your sessions plus the
+    Orchestrate workers, which left sessions_list but still work in theirs."""
+    payload = payload or {}
+    return list(payload.get("sessions_list") or []) + list(payload.get("orch_workers") or [])
+
+
+def _orch_mark_worker(sess, update):
+    """One hook /update for a live session (Handler._post_update): keep the
+    hook's tag on it and, when it is an Orchestrate worker (tagged, or its
+    aoc-orch-* folder), drop the update's waiting_on_you -- a worker never
+    waits on you, its run does. Mutates both; -> True for a worker."""
+    tag = _orch_worker_tag(update)
+    if tag:
+        sess["orch"] = tag
+    if not _orch_worker_of(sess):
+        return False
+    update.pop("waiting_on_you", None)
+    sess.update(waiting_on_you=False, waiting_kind="", waiting_message="")
+    return True
+
+
+def _orch_worker_label(w):
+    """Pure: how a worker is named in a push / toast ("Orchestrate · <task>")."""
+    w = w or {}
+    return "Orchestrate · " + (str(w.get("task") or "") or str(w.get("slot") or "") or "agent")[:60]
+
+
+_ORCH_HOOK_MARK = "AOC_ORCH_RUN"
+
+
+def _orch_hooks_stale(deployed):
+    """Pure: the deployed hooks/aoc_hook.py text (None = not deployed) ->
+    True when it predates the Orchestrate worker tag: such hooks report a
+    planner / supervisor / scout as one of your sessions (task agents are
+    still told apart by their aoc-orch-* folder)."""
+    return deployed is not None and _ORCH_HOOK_MARK not in deployed
+
+
+def _orch_hooks_hint(path=None):
+    """The Health / Orchestrate hint: '' or what to do about hooks that
+    predate the worker tag. Only reads ~/.claude/hooks -- Repair deploys."""
+    path = path or os.path.join(os.path.expanduser("~"), ".claude", "hooks", "aoc_hook.py")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            deployed = f.read()
+    except OSError:
+        deployed = None
+    if not _orch_hooks_stale(deployed):
+        return ""
+    return "Hooks outdated -- reinstall (Health -> Repair): until then Orchestrate's planner and reviewers show up as your sessions"
 
 
 def _orch_limit_hit(err):
     """Pure: does this error say the Claude plan's usage limit is used up?
     ("You've hit your session limit · resets 6:20pm", "... usage limit reached")"""
     return bool(re.search(r"hit your (\w+ )?limit|usage limit reached", str(err or ""), re.I))
+
+
+# A failure the same attempt would hit again: the agent says the goal can't be done or it has no access, or
+# Claude Code itself refuses (login, API key, model, a flag). Explicit and narrow on purpose -- anything that
+# also reads as passing (a timeout, a rate limit, the network, "try again") is retried as before.
+_ORCH_NO_RETRY = (
+    (r"\bimpossible\b|\bnot possible\b|\bcan(?:not|'t) be (?:done|achieved|accomplished)\b",
+     "the agent says it can't be done"),
+    (r"\b(?:no|missing|without|lacks?|lacking) (?:the )?(?:access|permissions?|credentials?|api key|token|login)\b"
+     r"|\b(?:access|permission) (?:is |was )?denied\b|\bnot authori[sz]ed\b|\bunauthori[sz]ed\b|\bforbidden\b",
+     "missing access"),
+    (r"\binvalid (?:goal|task|request|instructions?)\b|\b(?:goal|task|request) (?:is|was) (?:invalid|contradictory|nonsensical)\b",
+     "the goal or task is invalid"),
+    (r"invalid api key|please run /login|not logged in|authentication_error|credit balance is too low",
+     "Claude Code can't sign in or bill"),
+    (r"\b(?:unknown|invalid|unsupported) model\b|\bmodel\b[^.\n]{0,40}\bnot found\b|not_found_error",
+     "the model isn't available"),
+    (r"\b(?:unknown|unrecognized) (?:option|argument)\b", "Claude Code refused its command line"),
+)
+# not every "API Error": a 401 / 404 is one too and fails the same way again -- only a 5xx / 429 passes
+_ORCH_TRANSIENT = (r"timed? ?out|timeout|rate.?limit|overloaded|server error|api error:? ?(?:5\d\d|429)|network|connection"
+                   r"|temporar|try again|flaky|intermittent")
+
+
+def _orch_no_retry(err, data=None):
+    """Pure: why a failed attempt is NOT worth retrying ('' = retry it as
+    usual). err = the harness's error, data = the agent's own answer (its
+    summary / result / errors are read). A transient sign anywhere wins:
+    then it is retried."""
+    text = " ".join([str(err or "")] + ([str(data.get("summary") or ""), str(data.get("result") or "")]
+                                         + [str(e) for e in (data.get("errors") or []) if e] if isinstance(data, dict) else []))
+    if not text.strip() or re.search(_ORCH_TRANSIENT, text, re.I):
+        return ""
+    for pat, why in _ORCH_NO_RETRY:
+        if re.search(pat, text, re.I):
+            return why
+    return ""
 
 
 def _orch_explain_error(err):
@@ -435,7 +621,9 @@ def _orch_connect(path=None):
                              ("runs", "entity_id", "TEXT DEFAULT ''"), ("tasks", "approved", "INTEGER DEFAULT 0"),
                              ("events", "user", "TEXT DEFAULT ''"), ("entity_events", "user", "TEXT DEFAULT ''"),
                              ("runs", "baseline_of", "TEXT DEFAULT ''"), ("runs", "verdict", "TEXT DEFAULT ''"),
-                             ("runs", "start_at", "REAL"), ("runs", "schedule_id", "TEXT DEFAULT ''")):
+                             ("runs", "start_at", "REAL"), ("runs", "schedule_id", "TEXT DEFAULT ''"),
+                             ("tasks", "cost_est", "INTEGER DEFAULT 0"), ("events", "cost_est", "INTEGER DEFAULT 0"),
+                             ("tasks", "merge_state", "TEXT DEFAULT ''")):
         if col not in have[table]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return conn
@@ -450,10 +638,12 @@ def _orch_who():
     return "" if u.get("background") else str(u.get("name") or "")
 
 
-def _orch_event(conn, run_id, kind, message="", task_id="", cost=0.0, human=False, now=None):
-    conn.execute("INSERT INTO events (run_id, ts, kind, task_id, message, cost_usd, human, user) VALUES (?,?,?,?,?,?,?,?)",
+def _orch_event(conn, run_id, kind, message="", task_id="", cost=0.0, human=False, now=None, est=False):
+    """est: the cost is an estimate (a process killed before it reported what it spent)."""
+    conn.execute("INSERT INTO events (run_id, ts, kind, task_id, message, cost_usd, human, user, cost_est) "
+                 "VALUES (?,?,?,?,?,?,?,?,?)",
                  (run_id, now or time.time(), kind, task_id, str(message)[:2000], float(cost or 0), 1 if human else 0,
-                  _orch_who() if human else ""))
+                  _orch_who() if human else "", 1 if est else 0))
 
 
 def _orch_set_run(conn, run_id, now=None, **fields):
@@ -583,11 +773,11 @@ def _orch_validate_tasks(raw, existing=(), max_new=_ORCH_MAX_TASKS, allow_manage
     for i, t in enumerate(raw):
         if not isinstance(t, dict):
             return None, f"task {i + 1} is not an object"
-        tid = re.sub(r"[^a-z0-9-]+", "-", str(t.get("id") or "").strip().lower()).strip("-")[:32] or f"t{i + 1}"
+        tid = re.sub(r"[^a-z0-9-]+", "-", _orch_ascii(t.get("id")).strip().lower()).strip("-")[:32] or f"t{i + 1}"
         if tid in taken:
             return None, f"two tasks are called '{tid}'"
         taken.add(tid)
-        role = re.sub(r"[^a-z0-9-]+", "-", str(t.get("role") or "").strip().lower()).strip("-")
+        role = re.sub(r"[^a-z0-9-]+", "-", _orch_ascii(t.get("role")).strip().lower()).strip("-")
         if role != "manager" and role not in allowed:
             return None, f"task '{tid}': '{role}' is not an agent of this run's team"
         if role == "manager" and not allow_manager:
@@ -602,7 +792,7 @@ def _orch_validate_tasks(raw, existing=(), max_new=_ORCH_MAX_TASKS, allow_manage
             return None, f"task '{tid}': depends_on must be a list"
         model = str(t.get("model") or "sonnet").strip().lower()
         out.append({"id": tid, "role": role, "title": title, "instructions": instructions, "done_criteria": criteria,
-                    "depends_on": [re.sub(r"[^a-z0-9-]+", "-", str(d).strip().lower()).strip("-") for d in deps],
+                    "depends_on": [re.sub(r"[^a-z0-9-]+", "-", _orch_ascii(d).strip().lower()).strip("-") for d in deps],
                     "model": model if model in _ORCH_MODELS else "sonnet",
                     "budget_usd": _orch_clamp(t.get("budget_usd"),
                                               _ORCH_MANAGER_BUDGET if role == "manager" else _ORCH_TASK_BUDGET,
@@ -723,12 +913,15 @@ def _orch_agent_argv(exe, task, agent=None, deny=(), rules=""):
             "--append-system-prompt", brief] + (["--disallowedTools", ",".join(deny)] if deny else [])
 
 
-def _orch_llm_argv(exe, schema, model, budget, read_tools=False, deny=()):
+def _orch_llm_argv(exe, schema, model, budget, read_tools=False, deny=(), stream=False):
     """Pure: planner / supervisor command line: no hooks (not a session of
-    yours), not saved, the plan's JSON schema; the planner may read the repo."""
+    yours), not saved, the plan's JSON schema; the planner may read the repo.
+    stream: stream-json (--verbose) -- each API call's usage is in the output
+    as it happens, so one killed before it answered can be charged what it
+    used (it keeps no transcript) instead of its whole budget."""
     argv = [exe, "-p", "--model", model, "--no-session-persistence",
-            "--settings", '{"disableAllHooks": true}', "--output-format", "json",
-            "--json-schema", json.dumps(schema), "--max-budget-usd", f"{budget:.2f}"]
+            "--settings", '{"disableAllHooks": true}', "--output-format", "stream-json" if stream else "json"] \
+        + (["--verbose"] if stream else []) + ["--json-schema", json.dumps(schema), "--max-budget-usd", f"{budget:.2f}"]
     if read_tools:
         argv += ["--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob"]
     else:
@@ -741,14 +934,51 @@ def _orch_llm_argv(exe, schema, model, budget, read_tools=False, deny=()):
 def _orch_parse(text):
     """Pure: a `claude -p --output-format json` answer -> {ok, data, cost,
     turns, session_id, error}. Garbage, an error or a missing/invalid
-    structured_output is ok=False with the reason."""
+    structured_output is ok=False with the reason. stream-json (--verbose)
+    too: its last `result` line is the answer; with none (it died or was
+    killed before it answered) the cost is what its API calls add up to.
+    A result line without structured_output takes the input of the last
+    StructuredOutput tool call (how --json-schema answers) instead."""
     out = {"ok": False, "data": None, "cost": 0.0, "turns": 0, "session_id": "", "error": ""}
     body = str(text or "")
-    start = body.find("{")
-    try:
-        d = json.loads(body[start:]) if start >= 0 else None
-    except ValueError:
-        d = None
+    d, streamed, called = None, False, None
+    for line in reversed(body.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            x = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(x, dict):
+            continue
+        if x.get("type") == "result" and d is None:
+            d = x
+            if isinstance(d.get("structured_output"), dict) or d.get("is_error"):
+                break
+            continue
+        if x.get("type") in ("system", "assistant", "user", "stream_event"):
+            streamed = True
+        if d is not None and called is None and x.get("type") == "assistant":
+            for b in reversed((x.get("message") or {}).get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "StructuredOutput" \
+                        and isinstance(b.get("input"), dict):
+                    called = b["input"]
+                    break
+        if d is not None and called is not None:
+            break
+    if isinstance(d, dict) and not isinstance(d.get("structured_output"), dict) and called is not None:
+        d = dict(d, structured_output=called)
+    if d is None and streamed:
+        out["cost"] = _orch_usage_cost(body) or 0.0
+        out["error"] = "no answer (it stopped before it answered)"
+        return out
+    if d is None:
+        start = body.find("{")
+        try:
+            d = json.loads(body[start:]) if start >= 0 else None
+        except ValueError:
+            d = None
     if not isinstance(d, dict):
         out["error"] = "no answer (" + (_orch_clip(body.strip(), 400) or "empty output") + ")"
         return out
@@ -766,6 +996,77 @@ def _orch_parse(text):
         return out
     out["ok"], out["data"] = True, so
     return out
+
+
+def _orch_usage_cost(text):
+    """Pure: the $ of the API calls a stream-json output (--verbose) or a
+    Claude Code transcript records -- what a process killed before it
+    answered had used. Each message once (it repeats per content block: the
+    last copy counts). None = not one API call recorded."""
+    last = {}
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        m = d.get("message") if isinstance(d, dict) and d.get("type") == "assistant" else None
+        if isinstance(m, dict) and isinstance(m.get("usage"), dict):
+            last[m.get("id") or d.get("uuid") or len(last)] = m
+    if not last:
+        return None
+    cost = 0.0
+    for m in last.values():
+        u = m["usage"]
+        cc = u.get("cache_creation") or {}
+        cost += _calc_cost(int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                           int(u.get("cache_creation_input_tokens") or 0), int(u.get("cache_read_input_tokens") or 0),
+                           str(m.get("model") or ""), int(cc.get("ephemeral_1h_input_tokens") or 0))
+    return round(cost, 6)
+
+
+def _orch_used(base, path=None, since=None, projects=None):
+    """What a process (its files at <base>) used -> ($, where it was read
+    from) or (None, '') when nothing can be read: its stream-json output
+    first, else the Claude Code transcript(s) of its folder `path` written
+    since it started (a task's worktree is its own: every transcript there
+    since then is this attempt's, its subagents' included)."""
+    try:
+        with open(str(base) + ".out", encoding="utf-8", errors="replace") as f:
+            used = _orch_usage_cost(f.read())
+    except OSError:
+        used = None
+    if used is not None:
+        return used, "its output"
+    if not path:
+        return None, ""
+    total, found = 0.0, False
+    for root, _dirs, files in os.walk(_orch_project_dir(path, projects)):
+        for n in files:
+            p = os.path.join(root, n)
+            try:
+                if not n.endswith(".jsonl") or (since and os.path.getmtime(p) < float(since) - 5):
+                    continue
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    c = _orch_usage_cost(f.read())
+            except OSError:
+                continue
+            if c is not None:
+                total, found = total + c, True
+    return (round(total, 6), "its transcript") if found else (None, "")
+
+
+def _orch_killed_cost(budget, base, path=None, since=None, projects=None):
+    """What to charge for a process we killed before it reported its cost
+    -> ($, note). What its output / transcript records (an estimate: the
+    call in flight when it died isn't in it); its whole budget only when
+    nothing can be read."""
+    used, where = _orch_used(base, path, since, projects) if base else (None, "")
+    if used is None:
+        return round(float(budget or 0), 6), "nothing it used could be read, so its whole budget is counted"
+    return used, f"its cost is estimated from {where}"
 
 
 def _orch_check_result(data):
@@ -982,7 +1283,9 @@ def _orch_metrics(run, tasks, events, now=None, team_coordination=0.0):
             "human_interventions": sum(1 for e in events if e["human"]),
             "avg_task_s": round(sum(lat) / len(lat), 1) if lat else None,
             "review_rounds": int(run.get("rounds") or 0),
-            "teams": sum(1 for t in tasks if t["role"] == "manager")}
+            "teams": sum(1 for t in tasks if t["role"] == "manager"),
+            # part of the cost is estimated: a process killed before it reported what it spent
+            "cost_est": any(t.get("cost_est") for t in tasks) or any(e.get("cost_est") for e in events)}
 
 
 def _orch_view(run, tasks, events, now=None, children=None, parent=None, team_coordination=0.0):
@@ -996,7 +1299,8 @@ def _orch_view(run, tasks, events, now=None, children=None, parent=None, team_co
             "tasks": [dict({k: t.get(k) for k in ("id", "role", "title", "instructions", "done_criteria", "depends_on",
                                                    "model", "budget_usd", "state", "attempt", "feedback", "branch",
                                                    "started", "finished", "cost_usd", "turns", "session_id", "output",
-                                                   "error", "commits", "child_id", "agent", "live_session", "in_history")},
+                                                   "error", "commits", "child_id", "agent", "live_session", "in_history",
+                                                   "cost_est", "merge_state")},
                            team=(children or {}).get(t["id"])) for t in tasks],
             "waves": _orch_waves(tasks),
             "events": [dict(e) for e in events][-200:],
@@ -1245,7 +1549,7 @@ def _orch_start_task(conn, run, task, tasks, exe, now, spawn=None, git=None):
     try:
         agent = _orch_task_agent(task)
         # claude.ai connectors only load without the API key: such an agent runs on your subscription
-        kw, deny, _ready = _orch_proc_env(agent)
+        kw, deny, _ready = _orch_proc_env(agent, tag=(run["id"], task["id"]))
         pid = (spawn or _orch_spawn)(_orch_agent_argv(exe, task, agent, deny, _orch_settings()["rules"]), path,
                                      _orch_task_prompt(run["goal"], task, inputs, run["base"]), base, **kw)
     except OSError as e:
@@ -1271,13 +1575,14 @@ def _orch_poll_task(conn, run, task, tasks, now, alive=None, read=None, kill=Non
         return
     # over time: killed. Gone by itself (even past the time, e.g. AOC was off): its answer is read
     timed_out = running and _orch_stop(task["pid"], task["started"], alive, kill)
-    # killed, it never reports what it spent: count its whole budget (it may well have used it)
+    # killed, it never reports what it spent: what its transcript records (its whole budget if nothing can be read)
     res = _orch_parse(read(task["job_base"])) if not timed_out else \
-        {"ok": False, "data": None, "cost": float(task["budget_usd"] or 0), "turns": 0, "session_id": "",
-         "error": "timed out"}
+        {"ok": False, "data": None, "cost": _orch_killed_cost(task["budget_usd"], task["job_base"], task.get("path"),
+                                                               task.get("started"))[0],
+         "turns": 0, "session_id": "", "error": "timed out"}
     err = res["error"] or _orch_check_result(res["data"])
     status = (res["data"] or {}).get("status") if not err else None
-    task = dict(task, cost_usd=task["cost_usd"] + res["cost"])
+    task = dict(task, cost_usd=task["cost_usd"] + res["cost"], cost_est=1 if timed_out else int(task.get("cost_est") or 0))
     commits = _orch_finish_worktree(run, task, tasks, git)
     if not err and status == "done" and not commits and _orch_agent_edits(_orch_task_agent(task)) \
             and (res["data"] or {}).get("files_changed"):
@@ -1286,7 +1591,8 @@ def _orch_poll_task(conn, run, task, tasks, now, alive=None, read=None, kill=Non
         err = ("you reported changed files (" + ", ".join(map(str, res["data"]["files_changed"][:5])) + ") but none of "
                "them is in your folder -- write with paths relative to your current folder, never a path from `pwd`")
         status = None
-    fields = {"pid": None, "finished": now, "cost_usd": task["cost_usd"], "turns": task["turns"] + res["turns"],
+    fields = {"pid": None, "finished": now, "cost_usd": task["cost_usd"], "cost_est": task["cost_est"],
+              "turns": task["turns"] + res["turns"],
               "session_id": res["session_id"] or task["session_id"], "commits": commits,
               "output": json.dumps(res["data"], ensure_ascii=False) if res["data"] else "",
               "branch": task["branch"] if commits else ""}
@@ -1296,15 +1602,20 @@ def _orch_poll_task(conn, run, task, tasks, now, alive=None, read=None, kill=Non
         return
     why = _orch_explain_error(err) if err else \
         f"the agent answered '{status}': " + _orch_clip((res["data"] or {}).get("summary"), 400)
-    # found live: at the plan's usage limit every attempt fails at once -- a retry only burns the attempt
-    if task["attempt"] < _ORCH_MAX_ATTEMPTS and status != "blocked" and not _orch_limit_hit(err):
+    # found live: at the plan's usage limit every attempt fails at once -- a retry only burns the attempt.
+    # Same for a failure that can't change (impossible, no access, an invalid goal, a login / model error)
+    retry = task["attempt"] < _ORCH_MAX_ATTEMPTS and status != "blocked" and not _orch_limit_hit(err)
+    final = _orch_no_retry(err, res["data"]) if retry and not timed_out else ""
+    if final:
+        why += f" -- not retried ({final}: another attempt would fail the same way)"
+    if retry and not final:
         fb = (task.get("feedback") + "\n" if task.get("feedback") else "") + "Previous attempt: " + why
         # approved=0: your OK was for one run of a sensitive agent -- the next attempt asks again
         _orch_set_task(conn, run["id"], task["id"], state="pending", error=why, feedback=fb[:3000], approved=0, **fields)
-        _orch_event(conn, run["id"], "task_retry", why, task["id"], res["cost"], now=now)
+        _orch_event(conn, run["id"], "task_retry", why, task["id"], res["cost"], now=now, est=timed_out)
         return
     _orch_set_task(conn, run["id"], task["id"], state="failed", error=why, **fields)
-    _orch_event(conn, run["id"], "task_failed", why, task["id"], res["cost"], now=now)
+    _orch_event(conn, run["id"], "task_failed", why, task["id"], res["cost"], now=now, est=timed_out)
 
 
 # ── managers (hierarchical mode): a workstream = a child run with its own team ─
@@ -1536,14 +1847,14 @@ def _orch_llm_budget(run, spent):
 def _orch_start_llm(conn, run, kind, prompt, schema, exe, now, spawn=None, read_tools=False, budget=None, cwd=None):
     """Start the planner / supervisor. False = not now (the MCP server list
     the subscription needs isn't known yet)."""
-    kw, deny, ready = _orch_proc_env()
+    kw, deny, ready = _orch_proc_env(tag=(run["id"], kind))
     if not ready:
         return False
     base = os.path.join(ORCH_DIR, run["id"], f"{kind}-{int(now)}")
     if kind in ("plan", "supervise"):
         prompt += _orch_rules_text(_orch_settings()["rules"], kind)
     budget = budget or _orch_llm_budget(run, _orch_spent(conn, run["id"]))
-    pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, schema, run["model"], budget, read_tools, deny),
+    pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, schema, run["model"], budget, read_tools, deny, stream=True),
                                  cwd or run["repo"], prompt, base, **kw)
     _orch_set_run(conn, run["id"], now=now, job_kind=kind, job_pid=pid, job_base=base, job_started=now)
     return True
@@ -1557,15 +1868,16 @@ def _orch_poll_llm(conn, run, tasks, now, alive=None, read=None, kill=None):
     if running and now - (run["job_started"] or now) <= _ORCH_LLM_TIMEOUT_S:
         return
     timed_out = running and _orch_stop(run["job_pid"], run["job_started"], alive, kill)
-    # killed before it reported a cost: count the budget it was started with (nothing was spent since)
+    # killed before it reported a cost: what its stream-json output records; the budget it was started
+    # with (nothing was spent since) only when that can't be read
     res = _orch_parse(read(run["job_base"])) if not timed_out else \
-        {"ok": False, "data": None, "cost": _orch_llm_budget(run, _orch_spent(conn, run["id"])),
-         "error": "the orchestrator took too long"}
+        {"ok": False, "data": None, "error": "the orchestrator took too long",
+         "cost": _orch_killed_cost(_orch_llm_budget(run, _orch_spent(conn, run["id"])), run["job_base"])[0]}
     kind = run["job_kind"]
     _orch_set_run(conn, run["id"], now=now, job_kind="", job_pid=None, job_base="", job_started=None)
     if kind == "plan":
         if not res["ok"]:
-            _orch_event(conn, run["id"], "plan_failed", res["error"], cost=res["cost"], now=now)
+            _orch_event(conn, run["id"], "plan_failed", res["error"], cost=res["cost"], now=now, est=timed_out)
             _orch_set_run(conn, run["id"], now=now, state="failed", error="planning failed: " + _orch_explain_error(res["error"]),
                           finished=now)
             return
@@ -1589,7 +1901,7 @@ def _orch_poll_llm(conn, run, tasks, now, alive=None, read=None, kill=None):
     # supervise
     rounds = int(run.get("rounds") or 0) + 1
     if not res["ok"]:
-        _orch_event(conn, run["id"], "supervise", "no decision: " + res["error"], cost=res["cost"], now=now)
+        _orch_event(conn, run["id"], "supervise", "no decision: " + res["error"], cost=res["cost"], now=now, est=timed_out)
         _orch_set_run(conn, run["id"], now=now, state="review", rounds=rounds,
                       report="The orchestrator's review failed (" + res["error"] + "). Check the task results below.")
         _orch_event(conn, run["id"], "review_ready", "waiting for the run above" if run.get("parent_id")
@@ -1943,8 +2255,20 @@ def _orch_worker():
 ORCH_WORKSPACES_DIR = os.path.join(AOC_DATA_DIR, "workspaces")
 
 
+_ORCH_ASCII = {"ß": "ss", "æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i"}
+
+
+def _orch_ascii(s):
+    """Pure: letters with diacritics -> plain ones ("Výskum trhu" -> "Vyskum trhu"),
+    so a name slugged to [a-z0-9-] keeps them instead of losing them (found
+    live: "Výskum trhu" became "v-skum-trhu")."""
+    import unicodedata
+    s = "".join(_ORCH_ASCII.get(ch.lower(), ch) for ch in str(s or ""))   # the few NFKD leaves alone
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+
 def _orch_workspace_slug(name):
-    return re.sub(r"[^a-z0-9-]+", "-", str(name or "").strip().lower()).strip("-")[:40]
+    return re.sub(r"[^a-z0-9-]+", "-", _orch_ascii(name).strip().lower()).strip("-")[:40]
 
 
 def _orch_workspace(name, git=None, root=None):
@@ -2053,7 +2377,7 @@ def _orch_validate_entity(data):
     """Pure: POST /orch/entity_save body -> (entity config, None) or (None, error)."""
     if not isinstance(data, dict):
         return None, "bad request"
-    eid = re.sub(r"[^a-z0-9-]+", "-", str(data.get("id") or data.get("name") or "").strip().lower()).strip("-")[:32]
+    eid = re.sub(r"[^a-z0-9-]+", "-", _orch_ascii(data.get("id") or data.get("name")).strip().lower()).strip("-")[:32]
     if not eid:
         return None, "name the entity"
     mission = str(data.get("mission") or "").strip()
@@ -2253,8 +2577,8 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
             return
         killed = _orch_stop(ent["job_pid"], ent.get("job_started"), alive, kill)
         res = _orch_parse(read(ent["job_base"]))
-        if killed and not res["cost"]:
-            res["cost"] = _ORCH_ENTITY_SCOUT_BUDGET   # killed before it reported a cost: its budget is counted
+        if killed:   # killed before it reported a cost: what its output records (its budget if nothing can be read)
+            res["cost"] = _orch_killed_cost(_ORCH_ENTITY_SCOUT_BUDGET, ent["job_base"])[0]
         _orch_entity_set(conn, eid, now=now, job_pid=None, job_base="", job_started=None, last_scout=now, run_now=0)
         if not res["ok"]:
             _orch_entity_event(conn, eid, "scout_failed", _orch_explain_error(res["error"]), res["cost"], now=now)
@@ -2326,10 +2650,11 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
     listing, notes = _orch_repo_context(folder, git)
     recent = [r for r in runs if r["state"] in _ORCH_RUN_ACTIVE]
     base = os.path.join(ORCH_DIR, "entity-" + eid, f"scout-{int(now)}")
-    kw, deny, ready = _orch_proc_env()
+    kw, deny, ready = _orch_proc_env(tag=("entity-" + eid, "scout"))
     if not ready:
         return
-    pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, _ORCH_SCOUT_SCHEMA, cfg["model"], _ORCH_ENTITY_SCOUT_BUDGET, True, deny),
+    pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, _ORCH_SCOUT_SCHEMA, cfg["model"], _ORCH_ENTITY_SCOUT_BUDGET, True, deny,
+                                                                stream=True),
                                  folder, _orch_scout_prompt(cfg, ent["memory"], recent, listing, notes, spend, now,
                                                             _orch_team(cfg, _orch_library(conn))), base, **kw)
     _orch_entity_event(conn, eid, "scout", why, now=now)
@@ -2542,97 +2867,164 @@ def _orch_halt(conn, run, tasks, now, git=None, why="cancelled"):
     """Stop a run's work: kill what runs, remove its worktrees and branches
     and close its open tasks -- a task at its gate too (an OK asked for on a
     stopped run could never be given). A process killed before it answered
-    never reports what it spent: its budget is counted instead of $0."""
+    never reports what it spent: what its output / transcript records is
+    counted (marked as an estimate), its budget only when nothing can be
+    read. Every branch is deleted: no task keeps a branch name."""
     job_budget = _orch_llm_budget(run, _orch_spent(conn, run["id"]))
     killed = _orch_cleanup(run, tasks, git)
     for t in tasks:
         if t["state"] not in ("pending", "running", "gate"):
+            if t.get("branch"):
+                _orch_set_task(conn, run["id"], t["id"], branch="")
             continue
-        cost = float(t.get("cost_usd") or 0) + (float(t["budget_usd"] or 0) if t["id"] in killed["tasks"] else 0.0)
+        cost, est = float(t.get("cost_usd") or 0), int(t.get("cost_est") or 0)
+        if t["id"] in killed["tasks"]:
+            used, note = _orch_killed_cost(t["budget_usd"], t.get("job_base"), t.get("path"), t.get("started"))
+            cost, est = cost + used, 1
+            _orch_event(conn, run["id"], "task_stopped", f"stopped ({why}) -- {note}", t["id"], used, now=now, est=True)
         if t["role"] == "manager" and t.get("child_id"):
             cost = _orch_spent(conn, t["child_id"])   # its team's spend, its own kills included (closed first)
-        _orch_set_task(conn, run["id"], t["id"], state="skipped", pid=None, error=why, finished=now, cost_usd=cost)
+        _orch_set_task(conn, run["id"], t["id"], state="skipped", pid=None, error=why, finished=now, cost_usd=cost,
+                       cost_est=est, branch="")
     if killed["job"]:
+        used, note = _orch_killed_cost(job_budget, run.get("job_base"))
         _orch_event(conn, run["id"], "plan_failed" if run.get("job_kind") == "plan" else "supervise",
-                    f"stopped before it answered ({why}) -- its budget is counted", cost=job_budget, now=now)
+                    f"stopped before it answered ({why}) -- {note}", cost=used, now=now, est=True)
+
+
+def _orch_upstream(tasks, tid):
+    """Pure: every task `tid` is built on -- its inputs, their inputs, ...
+    (each one's work is on `tid`'s branch too)."""
+    by_id = {t["id"]: t for t in tasks}
+    need, frontier = set(), set((by_id.get(tid) or {}).get("depends_on") or [])
+    while frontier:
+        need |= frontier
+        frontier = {d for f in frontier for d in ((by_id.get(f) or {}).get("depends_on") or [])} - need
+    return need
+
+
+def _orch_mergeable(tasks):
+    """Pure: the ids of the tasks with work to merge (done, commits, a branch)."""
+    return {t["id"] for t in tasks if t["state"] == "done" and t.get("commits") and t.get("branch")}
 
 
 def _orch_merge_pick(tasks, only):
     """Pure: the tasks you chose to keep -> (their ids in merge order, error).
     A task built on another one carries that one's work on its branch, so it
     can't be kept without it (found the hard way in design, not live)."""
-    by_id = {t["id"]: t for t in tasks}
-    mergeable = {t["id"] for t in tasks if t["state"] == "done" and t.get("commits") and t.get("branch")}
+    mergeable = _orch_mergeable(tasks)
     chosen = set(only) & mergeable
     if not chosen:
         return None, "pick at least one task with work to keep"
     for tid in sorted(chosen):
-        need, frontier = set(), set(by_id[tid]["depends_on"])
-        while frontier:
-            need |= frontier
-            frontier = {d for f in frontier for d in by_id[f]["depends_on"]} - need
-        missing = sorted((need & mergeable) - chosen)
+        missing = sorted((_orch_upstream(tasks, tid) & mergeable) - chosen)
         if missing:
             return None, f"'{tid}' is built on {', '.join(missing)} -- keep that too, or leave '{tid}' out"
     order = _orch_topo(tasks) or [t["id"] for t in tasks]
     return [i for i in order if i in chosen], None
 
 
-def _orch_merge(conn, rid, now, git=None, only=None):
+def _orch_merge(conn, rid, now, git=None, only=None, rest=False, finish=False):
     """Merge the developers' branches (plan order, each after its inputs) into
     the branch the run started from, each checked with merge-tree first.
-    Stops at the first conflict (nothing half-merged: that branch is skipped
-    and the run stays in review with the files named)."""
+    A conflict merges nothing of that branch (never half-merged): its task is
+    marked merge_state='conflict', the ones merged before it 'merged', and the
+    run stays in review -- found in dogfooding: it then just sat there. From
+    there you go on: resolve it yourself (merge the branch by hand, commit)
+    and merge again -- it is found merged; rest=True merges every branch that
+    still goes in cleanly, skipping the conflicting ones and the tasks built
+    on them ('blocked'); finish=True ends the run with what is merged (the
+    rest is dropped). Tasks you left out (only) are 'left_out'."""
     git = git or _wt_git
     run, tasks = _orch_load(conn, rid)
     if run["state"] != "review":
         return {"ok": False, "error": "nothing to merge yet"}
     repo = run["repo"]
+    by_id = {t["id"]: t for t in tasks}
+    mergeable = _orch_mergeable(tasks)
+    if finish:
+        merged = [i for i in (_orch_topo(tasks) or list(by_id)) if i in mergeable
+                  and git(["merge-base", "--is-ancestor", by_id[i]["branch"], run["base"]], repo)[0] == 0]
+        if not merged:
+            return {"ok": False, "error": "nothing is merged yet -- merge, or discard the run"}
+        return _orch_merge_finish(conn, run, tasks, merged, now, git)
     rc, cur, _ = git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
     if rc != 0 or cur.strip() != run["base"]:
         return {"ok": False, "error": f"the repo is on '{cur.strip() or 'detached HEAD'}', not '{run['base']}' -- check out {run['base']} first"}
     rc, dirty, _ = git(["status", "--porcelain=v1", "-z", "--untracked-files=no"], repo)
     if rc != 0 or _parse_porcelain_z(dirty):
         return {"ok": False, "error": "the repo has uncommitted changes -- commit or stash them first"}
-    order = _orch_topo(tasks) or [t["id"] for t in tasks]
-    by_id = {t["id"]: t for t in tasks}
     if only is not None:
         ids, err = _orch_merge_pick(tasks, only)
         if err:
             return {"ok": False, "error": err}
-        todo = [by_id[i] for i in ids]
-    else:
-        todo = [by_id[i] for i in order if by_id[i]["state"] == "done" and by_id[i].get("commits") and by_id[i].get("branch")]
-    merged = []
+        for i in mergeable:
+            if by_id[i].get("merge_state") != "merged":
+                by_id[i]["merge_state"] = "" if i in ids else "left_out"
+    order = _orch_topo(tasks) or [t["id"] for t in tasks]
+    todo = [by_id[i] for i in order if i in mergeable and by_id[i].get("merge_state") != "left_out"]
+    merged, stuck, first = [], [], ""
+
+    def mark(t, state):
+        t["merge_state"] = state
+        _orch_set_task(conn, rid, t["id"], merge_state=state)
+
     for t in todo:
         if git(["merge-base", "--is-ancestor", t["branch"], "HEAD"], repo)[0] == 0:
             merged.append(t["id"])
+            mark(t, "merged")
+            continue
+        if set(stuck) & _orch_upstream(tasks, t["id"]):
+            mark(t, "blocked")   # its branch carries the conflicting work
+            stuck.append(t["id"])
+            continue
+        if stuck and not rest:
+            mark(t, "")
             continue
         rc, out, er = git(["merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", t["branch"]], repo, timeout=60)
+        msg = ""
         if rc != 0:
             files = _wt_conflicts(out) if rc == 1 else []
             msg = (f"'{t['id']}' would conflict in " + ", ".join(files[:5])) if files else \
                 f"conflict check failed for '{t['id']}': " + _wt_err(er, "git merge-tree needs git 2.38 or newer")
-            _orch_set_run(conn, rid, now=now, error=msg)
+        else:
+            rc, _, er = git(["merge", "--no-ff", "--no-edit", "-m",
+                             f"Merge {t['branch']}: {t['title']} (AOC orchestration {rid})", t["branch"]], repo, timeout=120)
+            if rc != 0:
+                git(["merge", "--abort"], repo)
+                msg = f"merging '{t['id']}' failed: " + _wt_err(er, "unknown error")
+        if msg:
+            mark(t, "conflict")
+            stuck.append(t["id"])
+            first = first or msg
             _orch_event(conn, rid, "merge_conflict", msg, t["id"], now=now)
-            conn.commit()
-            return {"ok": False, "error": msg, "merged": merged}
-        rc, _, er = git(["merge", "--no-ff", "--no-edit", "-m",
-                         f"Merge {t['branch']}: {t['title']} (AOC orchestration {rid})", t["branch"]], repo, timeout=120)
-        if rc != 0:
-            git(["merge", "--abort"], repo)
-            msg = f"merging '{t['id']}' failed: " + _wt_err(er, "unknown error")
-            _orch_set_run(conn, rid, now=now, error=msg)
-            _orch_event(conn, rid, "merge_conflict", msg, t["id"], now=now)
-            conn.commit()
-            return {"ok": False, "error": msg, "merged": merged}
+            continue
         merged.append(t["id"])
-    rc, sha, _ = git(["rev-parse", "HEAD"], repo)
+        mark(t, "merged")
+    if stuck:
+        conflicts = [i for i in stuck if by_id[i]["merge_state"] == "conflict"]
+        msg = first + (f" -- {len(merged)} of {len(todo)} merged so far" if merged else "")
+        _orch_set_run(conn, rid, now=now, error=msg)
+        conn.commit()
+        return {"ok": False, "error": msg, "merged": merged, "conflicts": conflicts,
+                "blocked": [i for i in stuck if i not in conflicts], "partial": bool(merged)}
+    return _orch_merge_finish(conn, run, tasks, merged, now, git)
+
+
+def _orch_merge_finish(conn, run, tasks, merged, now, git=None):
+    """The run is merged with `merged` in its base: what you kept is merged
+    (-d is enough); every other branch goes for good (-D) -- what you left
+    out, what conflicted, and a failed task's commits too (it keeps its
+    branch to be looked at; after the merge nobody would)."""
+    git = git or _wt_git
+    rid = run["id"]
+    rc, sha, _ = git(["rev-parse", run["base"]], run["repo"])
     dropped = [t["id"] for t in tasks if t.get("branch") and t.get("commits") and t["state"] == "done" and t["id"] not in merged]
-    # what you kept is merged (-d is enough); every other branch goes for good (-D) -- what you left out,
-    # and a failed task's commits too (it keeps its branch to be looked at; after the merge nobody would)
     _orch_cleanup(run, [t for t in tasks if t["id"] in merged or not t.get("branch")], git, keep_merged=True)
     _orch_cleanup(run, [t for t in tasks if t.get("branch") and t["id"] not in merged], git)
+    for t in tasks:
+        if t["id"] in dropped and t.get("merge_state") != "left_out":
+            _orch_set_task(conn, rid, t["id"], merge_state="left_out")
     _orch_set_run(conn, rid, now=now, state="merged", error="", finished=now)
     _orch_event(conn, rid, "merged", f"{len(merged)} branch(es) into {run['base']} @ {sha.strip()[:10]}"
                 + (f"; left out: {', '.join(dropped)}" if dropped else ""), human=True, now=now)
@@ -2714,15 +3106,23 @@ def _orch_action(action, data, now=None, git=None, exe=None, spawn=None):
             elif action in ("merge", "discard") and run.get("parent_id"):
                 return {"ok": False, "error": "this team's work is taken over by the run above -- merge or discard that one"}
             elif action == "merge":
+                # rest: go on past a conflict; finish: end it with what is merged (_orch_merge)
                 only = (data or {}).get("only")
-                reply = _orch_merge(conn, rid, now, git, only=[str(x) for x in only] if isinstance(only, list) else None)
+                reply = _orch_merge(conn, rid, now, git, only=[str(x) for x in only] if isinstance(only, list) else None,
+                                    rest=(data or {}).get("rest") is True, finish=(data or {}).get("finish") is True)
                 if reply.get("ok"):
                     _orch_close_other(conn, run, now, git)
             elif action == "discard":
                 if run["state"] not in ("review", "failed"):
                     return {"ok": False, "error": "only a finished run can be discarded"}
+                if any(t.get("merge_state") == "merged" for t in tasks):
+                    return {"ok": False, "error": "part of this run is merged already -- finish the merge instead "
+                                                  "(what isn't merged is dropped)"}
                 _orch_close_teams(conn, tasks, now, git)
                 _orch_cleanup(run, tasks, git)
+                for t in tasks:   # deleted: no task shows a branch name that is gone
+                    if t.get("branch"):
+                        _orch_set_task(conn, rid, t["id"], branch="")
                 _orch_set_run(conn, rid, now=now, state="discarded", finished=run.get("finished") or now)
                 _orch_event(conn, rid, "discarded", "work discarded by you", human=True, now=now)
                 reply = {"ok": True}
@@ -2896,7 +3296,7 @@ def _orch_judge_now(rid, run=None):
     exe = _find_claude_exe()
     if not exe:
         return {"ok": False, "error": "Claude Code (claude) not found"}
-    kw, deny, ready = _orch_proc_env()
+    kw, deny, ready = _orch_proc_env(tag=(rid, "judge"))
     if not ready:
         return {"ok": False, "error": "still listing the MCP servers -- try again in a minute"}
     try:
@@ -3039,10 +3439,10 @@ def _orch_entity_action(action, data, now=None):
                 if on and (ent.get("job_pid") or ent.get("job_base")):
                     # found live: a scout still thinking when you paused went on to start (and approve) a run
                     killed = _orch_stop(ent.get("job_pid"), ent.get("job_started"))
-                    cost = _ORCH_ENTITY_SCOUT_BUDGET if killed else \
-                        (_orch_parse(_orch_read_out(ent["job_base"]))["cost"] if ent.get("job_base") else 0.0)
+                    cost, note = _orch_killed_cost(_ORCH_ENTITY_SCOUT_BUDGET, ent.get("job_base")) if killed else \
+                        ((_orch_parse(_orch_read_out(ent["job_base"]))["cost"] if ent.get("job_base") else 0.0), "")
                     _orch_entity_event(conn, eid, "scout_stopped", "paused while its scout was thinking -- no run is started"
-                                       + (" (stopped before it answered: its budget is counted)" if killed else ""),
+                                       + (f" (stopped before it answered: {note})" if killed else ""),
                                        cost, now=now)
                     fields.update(job_pid=None, job_base="", job_started=None, last_scout=now, run_now=0, note="")
                 _orch_entity_set(conn, eid, now=now, **fields)
@@ -3070,11 +3470,14 @@ def _orch_entity_action(action, data, now=None):
 # budget ...) + when (daily or on weekdays at HH:MM, every N hours -- the
 # entities' clock, _orch_entity_due) + caps per day / month. When it's due
 # it starts an ordinary run (schedule_id = it). A firing is skipped, and
-# logged, while its last run is still going (no overlap), when the caps
-# would be crossed, or -- on your subscription -- while your plan limits are
-# nearly used up; the next one comes on time. A slot missed while AOC was
-# off fires once at startup, not once per slot. Its plans wait for your OK
-# unless you let the schedule approve them (within its run budget).
+# logged, while its last run is still going (no overlap) or waits for your
+# merge, when the caps would be crossed, or -- on your subscription -- while
+# your plan limits are nearly used up; the next one comes on time. A slot
+# missed while AOC was off fires once at startup, not once per slot. Its
+# plans wait for your OK unless you let the schedule approve them (within
+# its run budget). You can edit it (same id, its runs and log stay; a new
+# clock counts from then) and fire one run now (same guards, its clock
+# doesn't move).
 _ORCH_SCHEDULE_TYPES = ("daily", "weekdays", "every")
 
 
@@ -3147,9 +3550,11 @@ def _orch_schedule_next(sch, cfg, now):
 
 def _orch_schedule_block(cfg, last, spend, billing, limits):
     """Pure: why this firing is skipped ('' = it may start). last = its last
-    run {id, state} or None, spend = ($ today, $ this month)."""
+    run {id, state, kind?} or None, spend = ($ today, $ this month)."""
     if last and last["state"] in _ORCH_ACTIVE + ("plan_ready",):
         return f"its last run ({last['id']}) is still {last['state'].replace('_', ' ')}"
+    if last and last["state"] == "review":   # finished, not merged / discarded yet: one result at a time
+        return f"its last run ({last['id']}) waits for your " + ("accept" if last.get("kind") == "workspace" else "merge")
     if spend[0] + cfg["budget_usd"] > cfg["budget_day"]:
         return f"today's budget: ${spend[0]:.2f} of ${cfg['budget_day']:.2f} spent"
     if spend[1] + cfg["budget_usd"] > cfg["budget_month"]:
@@ -3166,8 +3571,7 @@ def _orch_schedule_tick(conn, sid, now=None, exe=None, spawn=None, git=None, lim
     sch, cfg = _orch_schedule_load(conn, sid)
     if not sch:
         return
-    r = conn.execute("SELECT id, state FROM runs WHERE schedule_id=? ORDER BY created DESC LIMIT 1", (sid,)).fetchone()
-    last = dict(r) if r else None
+    last = _orch_schedule_last(conn, sid)
     if last and last["state"] == "plan_ready" and cfg.get("auto_approve"):
         n = conn.execute("SELECT COUNT(*) FROM tasks WHERE run_id=?", (last["id"],)).fetchone()[0]
         _orch_set_run(conn, last["id"], now=now, state="running")
@@ -3179,27 +3583,69 @@ def _orch_schedule_tick(conn, sid, now=None, exe=None, spawn=None, git=None, lim
         if sch.get("next_due") != next_due:
             _orch_schedule_set(conn, sid, now=now, next_due=next_due)
         return
+    _orch_schedule_fire(conn, sch, cfg, last, why, now, exe, spawn, git, limits)
+
+
+def _orch_schedule_last(conn, sid):
+    """Its newest run {id, state, kind} or None."""
+    r = conn.execute("SELECT id, state, kind FROM runs WHERE schedule_id=? ORDER BY created DESC LIMIT 1", (sid,)).fetchone()
+    return dict(r) if r else None
+
+
+def _orch_schedule_fire(conn, sch, cfg, last, why, now, exe=None, spawn=None, git=None, limits=None, manual=False):
+    """Start one run of a schedule, or skip it and log why -> (run id, '') |
+    (None, why not) | (None, None) = not yet (MCP servers still being read).
+    A firing on its clock moves the clock (last_fire, next_due); one you
+    asked for (manual, Run now) doesn't -- the next regular one comes on time."""
+    sid = sch["id"]
+    clock = {} if manual else {"last_fire": now, "next_due": _orch_schedule_next(dict(sch, last_fire=now), cfg, now)[2]}
     block = _orch_schedule_block(cfg, last, _orch_entity_spend(_orch_runs_costs(conn, "schedule_id", sid), now),
                                  _orch_settings()["billing"], limits if limits is not None else _rate_limits_snapshot())
     if block:
-        _orch_schedule_event(conn, sid, "skipped", block, now=now)
-        _orch_schedule_set(conn, sid, now=now, last_fire=now, last_result="skipped: " + block,
-                           next_due=_orch_schedule_next(dict(sch, last_fire=now), cfg, now)[2])
-        return
+        _orch_schedule_event(conn, sid, "skipped", ("run now: " if manual else "") + block, now=now)
+        if not manual:
+            _orch_schedule_set(conn, sid, now=now, last_result="skipped: " + block, **clock)
+        return None, block
     if not _orch_proc_env()[2]:
-        return   # the MCP server list isn't known yet (scanning): fire next tick
+        return None, None   # the MCP server list isn't known yet (scanning): fire next tick
     body = {k: cfg[k] for k in ("goal", "model", "max_parallel", "budget_usd", "mode", "approve_teams", "team")}
     body.update({"workspace": cfg["workspace"]} if cfg.get("workspace") else {"cwd": cfg["cwd"]}, schedule_id=sid)
     res = _orch_create(body, now=now, exe=exe, spawn=spawn, git=git, conn=conn)
-    nxt = _orch_schedule_next(dict(sch, last_fire=now), cfg, now)[2]
     if not res.get("ok"):
-        _orch_schedule_event(conn, sid, "failed", res.get("error", ""), now=now)
-        _orch_schedule_set(conn, sid, now=now, last_fire=now, last_result="could not start: " + str(res.get("error"))[:300],
-                           next_due=nxt)
-        return
+        err = str(res.get("error") or "failed")
+        _orch_schedule_event(conn, sid, "failed", ("run now: " if manual else "") + err, now=now)
+        _orch_schedule_set(conn, sid, now=now, last_result="could not start: " + err[:300], **clock)
+        return None, err
     _orch_schedule_event(conn, sid, "fired", why, run_id=res["id"], now=now)
-    _orch_schedule_set(conn, sid, now=now, last_fire=now, last_run=res["id"], last_result="started run " + res["id"],
-                       next_due=nxt)
+    _orch_schedule_set(conn, sid, now=now, last_run=res["id"],
+                       last_result="started run " + res["id"] + (" (you asked)" if manual else ""), **clock)
+    return res["id"], ""
+
+
+def _orch_schedule_run_now(data, now=None, exe=None, spawn=None, git=None, limits=None):
+    """POST /orch/schedule_run {id} -> {ok, id (the run)} or {ok: False,
+    error: why}. One run now, behind the same guards as a firing on its
+    clock (no overlap, nothing waiting for your merge, caps, plan limits);
+    also while it's paused. Its clock doesn't move."""
+    now = now or time.time()
+    sid = str((data or {}).get("id") or "")
+    limits = limits if limits is not None else (_rate_limits_snapshot() or {})
+    with _orch_lock:
+        conn = _orch_connect()
+        try:
+            sch, cfg = _orch_schedule_load(conn, sid)
+            if not sch:
+                return {"ok": False, "error": "unknown schedule"}
+            rid, why = _orch_schedule_fire(conn, sch, cfg, _orch_schedule_last(conn, sid), "you asked", now,
+                                           exe, spawn, git, limits, manual=True)
+            conn.commit()
+        finally:
+            conn.close()
+    if why is None:
+        return {"ok": False, "error": "AOC is still reading your MCP servers -- try again in a few seconds"}
+    if not rid:
+        return {"ok": False, "error": "not started: " + why}
+    return {"ok": True, "id": rid}
 
 
 def _orch_schedule_view(sch, cfg, runs, events, costs, now=None):
@@ -3235,8 +3681,11 @@ def _orch_schedules_list(now=None):
 
 def _orch_schedule_save(data, now=None, git=None):
     """POST /orch/schedule_save {goal, cwd | workspace, ..., schedule,
-    budget_day?, budget_month?, auto_approve?} -> {ok, id}. A new one."""
+    budget_day?, budget_month?, auto_approve?} -> {ok, id, next_due}. A new
+    one -- or, with an id, that one edited (_orch_schedule_edit)."""
     now = now or time.time()
+    if isinstance(data, dict) and data.get("id"):
+        return _orch_schedule_edit(str(data["id"]), data, now)
     cfg, err = _orch_validate_repeat(data)
     if err:
         return {"ok": False, "error": err}
@@ -3268,6 +3717,48 @@ def _orch_schedule_save(data, now=None, git=None):
         finally:
             conn.close()
     return {"ok": True, "id": sid, "next_due": nxt}
+
+
+# what an edit may change, as its log names it (where it works stays: its runs' history is about that repo)
+_ORCH_SCHEDULE_EDITABLE = (("goal", "goal"), ("schedule", "timing"), ("team", "team"), ("model", "orchestrator"),
+                           ("max_parallel", "parallel agents"), ("mode", "structure"), ("approve_teams", "team plans"),
+                           ("budget_usd", "run budget"), ("budget_day", "day cap"), ("budget_month", "month cap"),
+                           ("auto_approve", "approves its plans"))
+
+
+def _orch_schedule_edit(sid, data, now):
+    """POST /orch/schedule_save {id, ...}: the schedule's goal, clock, team,
+    orchestrator, budgets and self-approve change; its id, runs and log stay,
+    and so does where it works. A changed clock counts from now (like a
+    resume): no burst of slots the old one 'missed'."""
+    with _orch_lock:
+        conn = _orch_connect()
+        try:
+            sch, old = _orch_schedule_load(conn, sid)
+            if not sch:
+                return {"ok": False, "error": "unknown schedule"}
+            cfg, err = _orch_validate_repeat(dict(data, cwd=old.get("cwd") or "", workspace=old.get("workspace") or ""))
+            if err:
+                return {"ok": False, "error": err}
+            lib = _orch_library(conn)
+            team = [a for a in cfg["team"] if a in lib]
+            if cfg["team"] and not team:
+                return {"ok": False, "error": "none of the chosen agents exist any more"}
+            cfg["team"] = team
+            changed = [label for k, label in _ORCH_SCHEDULE_EDITABLE if cfg.get(k) != old.get(k)]
+            if not changed:
+                return {"ok": True, "id": sid, "next_due": sch.get("next_due"), "changed": []}
+            fields = {"data": json.dumps(dict(old, **cfg), ensure_ascii=False)}
+            if cfg["schedule"] != old.get("schedule"):
+                fields["last_fire"] = now
+            nxt = _orch_schedule_next(dict(sch, **fields), cfg, now)[2]
+            _orch_schedule_set(conn, sid, now=now, next_due=nxt, **fields)
+            _orch_schedule_event(conn, sid, "edited", ", ".join(changed) + (
+                "; next run " + time.strftime("%Y-%m-%d %H:%M", time.localtime(nxt)) if nxt else ""), now=now)
+            conn.commit()
+        finally:
+            conn.close()
+    return {"ok": True, "id": sid, "next_due": nxt, "changed": changed}
 
 
 def _orch_schedule_action(action, data, now=None):
@@ -3303,7 +3794,7 @@ def _orch_schedule_action(action, data, now=None):
 def _orch_list(limit=30):
     """GET /orch/runs: newest first, with their metrics."""
     if not os.path.exists(ORCH_DB):
-        return {"ok": True, "runs": []}
+        return {"ok": True, "runs": [], "hooks_hint": _orch_hooks_hint()}
     conn = _orch_connect()
     try:
         out = []
@@ -3313,13 +3804,14 @@ def _orch_list(limit=30):
             events = [dict(e) for e in conn.execute("SELECT * FROM events WHERE run_id=? ORDER BY ts", (rid,))]
             teams = [c for c in (_orch_load(conn, t["child_id"])[0] for t in tasks if t.get("child_id")) if c]
             out.append({"id": rid, "goal": run["goal"][:300], "repo": run["repo"], "state": run["state"],
+                        "kind": run.get("kind") or "repo",
                         "created": run["created"], "tasks": len(tasks), "mode": run.get("mode") or "flat",
                         "entity_id": run.get("entity_id") or "", "baseline_of": run.get("baseline_of") or "",
                         "start_at": run.get("start_at"), "schedule_id": run.get("schedule_id") or "",
                         "running": sum(1 for t in tasks if t["state"] == "running"),
                         "needs_you": run["state"] in ("plan_ready", "review") or any(c["state"] == "plan_ready" for c in teams),
                         "metrics": _orch_metrics(run, tasks, events, team_coordination=_orch_team_coordination(conn, rid))})
-        return {"ok": True, "runs": out}
+        return {"ok": True, "runs": out, "hooks_hint": _orch_hooks_hint()}
     finally:
         conn.close()
 

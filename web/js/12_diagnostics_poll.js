@@ -75,7 +75,7 @@ function _hooksHealthHtml(h, busy){
         ${bad.length?`<button class="adp-btn hh-fix" ${busy?'disabled':''} onclick="_hooksHealthRun(true)">${busy==='repair'?'Repairing…':'Repair'}</button>`:''}
       </span>
     </div>
-    ${rows}${_repairResultHtml(lr)}${err}
+    ${rows}${h.orch_hint?`<div class="hh-note bad">${escHtml(h.orch_hint)}</div>`:''}${_repairResultHtml(lr)}${err}
     <div class="hh-note">${when?`Checked ${when}. `:''}Repair re-runs only the needed setup.py steps. Claude Code sessions that are already open pick up hook changes after a restart.</div>
     <label class="hh-note hh-auto"><input type="checkbox" id="hh-auto-repair" ${h.auto_repair===false?'':'checked'} onchange="_autoRepairToggle(this.checked)"> Repair automatically after an update (once per update, only hooks the update made outdated)</label>`;
 }

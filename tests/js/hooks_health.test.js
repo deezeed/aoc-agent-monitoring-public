@@ -28,6 +28,9 @@ c.check('no result: error shown escaped', h.includes("Couldn't check the install
 c.check('nothing yet: placeholder', _hooksHealthHtml(null).includes('not checked yet'));
 h = _hooksHealthHtml({ ...allOk, error: 'TimeoutExpired' });
 c.check('last run error shown under the list', h.includes('Last run: TimeoutExpired'));
+h = _hooksHealthHtml({ ...allOk, orch_hint: 'Hooks outdated -- reinstall <Repair>' });
+c.check('hooks from before the Orchestrate worker tag: the hint, escaped', h.includes('Hooks outdated -- reinstall &lt;Repair&gt;'));
+c.check('no hint -> no hint line', !_hooksHealthHtml(allOk).includes('Hooks outdated'));
 
 // the last Repair click's outcome stays on the card
 const lr = (state, extra) => ({ at: 1793640000, state, fixed: [], left: [], error: '', ...extra });

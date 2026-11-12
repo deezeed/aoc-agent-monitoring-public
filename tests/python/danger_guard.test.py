@@ -37,7 +37,7 @@ ns = exec_functions(
     {"os": os, "json": json, "re": re, "time": time, "threading": threading, "_secrets": _secrets, "_socket": _socket,
      "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "_perm_lock": threading.Lock(), "_perm_requests": {},
      "_status_cond": _Cond(), "_status_version": [0],
-     "_push_session_name": lambda sid: "Sess " + str(sid),
+     "_push_session_name": lambda sid, cwd="": "Sess " + str(sid),
      "_push_notify": lambda *a, **k: pushes.append((a, k)) or 1,
      "_show_native_toast": lambda t, b: toasts.append((t, b)),
      "_log_bg_error": lambda *a: None})

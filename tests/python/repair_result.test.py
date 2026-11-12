@@ -11,7 +11,8 @@ from lib.check import Checker
 c = Checker()
 import json, tempfile
 ns = exec_functions(["_repair_summary", "_repair_now", "_hooks_health_view", "_hooks_health_bad", "_auto_repair_load"],
-                    {"time": time, "os": os, "json": json, "AUTO_REPAIR_FILE": os.path.join(tempfile.mkdtemp(), "auto_repair.json"), "_hooks_health": {"checks": None, "at": 0.0, "error": "", "repairing": False}})
+                    {"time": time, "os": os, "json": json, "AUTO_REPAIR_FILE": os.path.join(tempfile.mkdtemp(), "auto_repair.json"), "_hooks_health": {"checks": None, "at": 0.0, "error": "", "repairing": False},
+                     "_orch_hooks_hint": lambda: ""})
 summary = ns["_repair_summary"]
 
 c.check("all fixed", summary(["A", "B"], [], "", 5) == {"at": 5, "state": "fixed", "fixed": ["A", "B"], "left": [], "error": ""})

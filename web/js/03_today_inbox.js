@@ -482,17 +482,20 @@ function _inboxItems(sr, nowS){
 /* Pure: the Inbox page for those items. */
 /* orch = what orchestration waits on you for (sr.orch_attention): its block
    goes under the header and counts in it -- never "All clear" above it. */
-function _inboxHtml(items, nowS, stranded, bgDead, orch){
+/* holds = an Orchestrate agent's held dangerous command (sr.orch_holds):
+   its agent is no session of yours, so it gets its own block, also counted. */
+function _inboxHtml(items, nowS, stranded, bgDead, orch, holds){
   const nameOf=s=>s.display_name||s.project||(s.cwd||'').split(/[\\/]/).filter(Boolean).pop()||String(s.id||'').slice(0,8);
   bgDead=bgDead||[];
   orch=orch||[];
+  holds=holds||[];
   const strandedAll=stranded;
   stranded=_bgStrandedLeft(bgDead, stranded);
-  const n=items.length+bgDead.length+(stranded||[]).length+orch.length;
+  const n=items.length+bgDead.length+(stranded||[]).length+orch.length+holds.length;
   const head=`<div class="ib-head"><h2 class="ib-title">Inbox</h2><span class="ib-sub">${n?`${n} thing${n===1?'':'s'} need${n===1?'s':''} you`:'All clear'}</span></div>`;
   if(!n) return head+`<div class="ib-empty"><div class="ib-empty-mark">✓</div><div>Nothing needs you right now.</div><div class="ib-empty-sub">Permission prompts, questions, budget caps, sessions stopped by the usage limit, caches about to go cold, full contexts, stuck sessions and work an agent left behind show up here.</div></div>`;
   const usd=n=>'$'+(Number(n)||0).toFixed(2);
-  return head+(orch.length?_orInboxHtml(orch):'')+(items.length?`<div class="ib-list">${items.map(it=>{
+  return head+(holds.length?_orHoldsHtml(holds):'')+(orch.length?_orInboxHtml(orch):'')+(items.length?`<div class="ib-list">${items.map(it=>{
     if(it.kind==='limit') return `<article class="td-card ib-item ib-limit">
       <div class="ib-row"><span class="ib-kind">${escHtml(it.label)}</span><span class="ib-name">${escHtml(it.s?nameOf(it.s):(it.ls.title||String(it.ls.cwd||'').split(/[\\/]/).filter(Boolean).pop()||''))}</span>
         <span class="ib-when">${escHtml([it.s&&it.s.machine||'', it.ls.at?_fmtDurationDHM(Math.max(60,nowS-it.ls.at))+' ago':''].filter(Boolean).join(' · '))}</span></div>
@@ -522,7 +525,7 @@ function renderInbox(sr){
   /* don't swap the DOM under an open "Details" or a focused button */
   if(el.contains(document.activeElement)&&document.activeElement!==el&&document.activeElement.tagName!=='BUTTON') return;
   /* orchestration first: plans, sensitive tasks and results waiting for you (web/js/19) */
-  const html=_inboxHtml(_inboxItems(sr, Date.now()/1000), Date.now()/1000, _wtStranded, _bgDead(_bgAgents), sr.orch_attention);
+  const html=_inboxHtml(_inboxItems(sr, Date.now()/1000), Date.now()/1000, _wtStranded, _bgDead(_bgAgents), sr.orch_attention, sr.orch_holds);
   if(el.innerHTML!==html) el.innerHTML=html;
 }
 function _todayHtml(sr, an, cm, nowS, todayStr, recaps, recapMode, resume, worktrees, stranded, bgAgents){

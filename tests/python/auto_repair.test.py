@@ -20,7 +20,7 @@ ns = exec_functions(["_AUTO_REPAIR_IDS", "_auto_repair_targets", "_hook_sources_
                      "_repair_summary", "_hooks_health_bad", "_hooks_health_view"],
                     {"os": os, "json": json, "time": time, "_hooks_health": H, "AUTO_REPAIR_FILE": state_file,
                      "AOC_PREVIEW": False, "AOC_VERSION_FILE": os.path.join(d, "VERSION"),
-                     "_read_installed_version": lambda p: "1.0.500", "_log_bg_error": lambda *a: None})
+                     "_read_installed_version": lambda p: "1.0.500", "_log_bg_error": lambda *a: None, "_orch_hooks_hint": lambda: ""})
 targets, key_of, decide = ns["_auto_repair_targets"], ns["_hook_sources_key"], ns["_auto_repair_decide"]
 
 chk = lambda i, ok=False, detail="": {"id": i, "label": i.upper(), "ok": ok, "detail": detail}

@@ -204,7 +204,12 @@ def run(hook, sleep=time.sleep, clock=time.monotonic, idle=idle_seconds):
     return None
 
 
-def main():
+def main(env=None):
+    # An Orchestrate agent (AOC_ORCH_RUN, set by the AOC that started it) is
+    # AOC's own worker: it never holds a prompt or a turn for you -- its run
+    # in Orchestrate is where it waits on you, not the Inbox.
+    if (os.environ if env is None else env).get("AOC_ORCH_RUN"):
+        return
     try:
         raw = sys.stdin.buffer.read()
         hook = json.loads(raw.decode("utf-8", errors="replace") or "{}")

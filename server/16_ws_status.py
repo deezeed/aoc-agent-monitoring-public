@@ -634,7 +634,8 @@ def _build_status_payload_uncached() -> dict:
          "edited_count": v.get("edited_count", 0),
          "note": v.get("note", ""),
          "pr_url": _pr_link_cache_snapshot.get(v.get("git_branch", ""), {}).get("url"),
-         "waiting_secs": _compute_waiting_secs(v, now_epoch)}
+         "waiting_secs": _compute_waiting_secs(v, now_epoch),
+         "orch": _orch_worker_of(v)}
         for k, v in sessions_from_dict.items()
     ]
     _ctx = _context_snapshot([s["id"] for s in active_sessions])
@@ -664,12 +665,18 @@ def _build_status_payload_uncached() -> dict:
             s["waiting_secs"] = max(s.get("waiting_secs") or 0, _dg[0]["age_s"])
         s["reply_request"] = _replies.get(s["id"])
         s["budget"] = _budget_snap["sessions"].get(s["id"]) or _budget_snap["day"]
+    # Orchestrate's own agents leave the session list (and with it the Inbox,
+    # Today, the waiting/stuck/cost alerts and their toasts and pushes) for
+    # orch_workers; their cost stays in the status file -> History
+    active_sessions, data["orch_workers"], data["orch_holds"], data["agents"], _orch_foreign = \
+        _orch_split_workers(active_sessions, data.get("agents") or [], _perms, set(_own_claude_pids))
     # sessions_count: floor at the real claude.exe process count (background
     # scanner, _claude_proc_worker, counts claude.exe processes every 2s). Hook-tracked
     # sessions can under-count — a CLI sitting idle with no fresh heartbeat,
     # or one whose entry got dismissed/stale — so trusting the dict alone
     # made AOC report fewer CLIs than are actually running.
-    data["sessions_count"] = max(len(sessions_from_dict), _claude_proc_count[0])
+    # (minus Orchestrate agents another AOC started -- a preview's)
+    data["sessions_count"] = max(len(active_sessions), _claude_proc_count[0] - _orch_foreign)
     data["sessions_list"] = active_sessions
     data["last_autosave"] = _autosave_time[0] or None
     # Expose claude binary path so frontend can launch it in bash (cached)

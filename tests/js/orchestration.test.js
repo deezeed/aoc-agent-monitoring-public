@@ -7,7 +7,7 @@ const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
 const part = fs.readFileSync(path.join(WEB_DIR, 'js', '19_orchestration.js'), 'utf8');
-for (const v of ['_OR_STATES', '_OR_TASK_STATES', '_OR_ROLES', '_OR_ENTITY_STATES', '_OR_ATTN']) {
+for (const v of ['_OR_STATES', '_OR_TASK_STATES', '_OR_MERGE_STATES', '_OR_ROLES', '_OR_ENTITY_STATES', '_OR_ATTN', '_OR_SCHEDULE_EVS']) {
   const m = new RegExp(`^var ${v}=([\\s\\S]*?\\});`, 'm').exec(part);
   if (!m) throw new Error(v + ' not found');
   eval(`global.${v}=${m[1]}`);
@@ -17,9 +17,10 @@ for (const v of ['_OR_PLAN_FIELDS', '_OR_TASK_BUDGET']) {
   if (!m) throw new Error(v + ' not found');
   (0, eval)(m[0]);   // indirect eval: the var(s) on that line become globals
 }
-for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_fmtDurShort', '_orChip', '_orMoney', '_orFormHtml', '_orRunsHtml',
-  '_orMetricsHtml', '_orCompareHtml', '_orTaskHtml', '_orGoalHtml', '_orPickSet', '_orStatsHtml', '_orInboxHtml', '_orBillingHtml', '_orRulesHtml', '_orScheduleText', '_orWhen', '_orBudgetBar', '_orEntityCardHtml', '_orEntityDraftOf', '_orEntityEditorHtml', '_orEntitiesHtml', '_orFormDefaults', '_orTeamOf', '_orClipText', '_orAgentCardHtml', '_orAgentEditorHtml', '_orAgentsHtml', '_orAgentDraftOf', '_orDraftFrom', '_orSlug', '_orDraftAdd', '_orDraftRemove', '_orDraftMove', '_orDraftRename', '_orPlanCheck', '_orPlanEditorHtml', '_orDetailHtml', '_orHtml', '_orConfirmText',
-  '_orLocalInput', '_orWhenBody', '_orWhenHtml', '_orRepeatCardHtml', '_orLaterCardHtml', '_orScheduledHtml', '_orCommitsHtml']) eval(extractFunction(src, f));
+for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_fmtDurShort', '_orChip', '_orMoney', '_orCost', '_orShortPath', '_orMergeChip', '_orMergeStatus', '_orMergeHtml', '_orMergeGoText', '_orFormHtml', '_orRunsHtml',
+  '_orMetricsHtml', '_orCompareHtml', '_orTaskHtml', '_orGoalHtml', '_orPickSet', '_orStatsHtml', '_orInboxHtml', '_orWorkerRef', '_orWorkersHtml', '_orBillingHtml', '_orRulesHtml', '_orScheduleText', '_orWhen', '_orBudgetBar', '_orEntityCardHtml', '_orEntityDraftOf', '_orEntityEditorHtml', '_orEntitiesHtml', '_orFormDefaults', '_orTeamOf', '_orClipText', '_orAgentCardHtml', '_orAgentEditorHtml', '_orAgentsHtml', '_orAgentDraftOf', '_orDraftFrom', '_orSlug', '_orDraftAdd', '_orDraftRemove', '_orDraftMove', '_orDraftRename', '_orPlanCheck', '_orPlanEditorHtml', '_orDetailHtml', '_orHtml', '_orConfirmText',
+  '_orLocalInput', '_orWhenBody', '_orWhenHtml', '_orRepeatCardHtml', '_orLaterCardHtml', '_orScheduledHtml', '_orCommitsHtml',
+  '_orFormFromSchedule', '_orScheduleSavedText', '_orScheduleEvHtml']) eval(extractFunction(src, f));
 const c = new Checker();
 global._orState = { pick: null };
 
@@ -334,6 +335,40 @@ c.check('repeat card: clock, escaped goal, folder, caps, next run, last result a
 const scp = _orRepeatCardHtml(Object.assign({}, sch, { paused: true, last_result: 'started run r2', runs: [] }));
 c.check('repeat card paused: Resume, no next run, a plain last result', scp.includes('>Resume<') && scp.includes('_orScheduleAct(\'pause\',&quot;s1111-090000&quot;,false)')
   && !scp.includes('Next run:') && scp.includes('or-note">Last: started run r2'));
+c.check('repeat card: Run now (also when paused) and Edit, by id', sc.includes('_orScheduleRun(&quot;s1111-090000&quot;)') && sc.includes('>Run now<')
+  && sc.includes('_orScheduleEdit(&quot;s1111-090000&quot;)') && scp.includes('>Run now<') && scp.includes('also while paused'));
+const evs = [{ ts: 1, kind: 'skipped', message: 'its last run (r1) waits for your <merge>', run_id: '', user: '' },
+  { ts: 2, kind: 'fired', message: 'due', run_id: 'r<2>', user: 'ana' },
+  { ts: 3, kind: 'edited', message: 'goal, timing; next run 2026-11-13 02:00', run_id: '', user: '' },
+  { ts: 4, kind: 'failed', message: 'run now: no repo', run_id: '', user: '' }].map(_orScheduleEvHtml);
+c.check('schedule log: a skip (waiting for your merge) and a failed start read as warnings, escaped',
+  evs[0].includes('or-ev warn') && evs[0].includes('>skipped<') && evs[0].includes('waits for your &lt;merge&gt;')
+  && evs[3].includes('or-ev warn') && evs[3].includes('could not start'));
+c.check('schedule log: a started run links to it (escaped id), with who', evs[1].includes('>started<') && evs[1].includes('_orSelect(&quot;r&lt;2&gt;&quot;)')
+  && evs[1].includes('run r&lt;2&gt;') && evs[1].includes('— ana') && !evs[1].includes('warn'));
+c.check('schedule log: an edit says what changed; unknown kinds still show', evs[2].includes('>edited<') && evs[2].includes('goal, timing; next run')
+  && !evs[2].includes('warn') && _orScheduleEvHtml({ ts: 1, kind: 'some_thing', message: '' }).includes('>some thing<')
+  && sc.includes('or-ev warn'));
+const schEdit = Object.assign({}, sch, { config: Object.assign({}, sch.config, { model: 'sonnet', max_parallel: 2, mode: 'hierarchical', approve_teams: true,
+  team: ['developer', 'qa'], budget_usd: 3, schedule: { type: 'every', hours: 6 } }) });
+const ef = _orFormFromSchedule(schEdit);
+c.check('edit: the form filled from the schedule (id, goal, clock, team, orchestrator, caps, self-approve)',
+  ef.sch_id === 's1111-090000' && ef.goal === 'Nightly <deps> check' && ef.when === 'repeat' && ef.rtype === 'every' && ef.rhours === 6
+  && ef.model === 'sonnet' && ef.par === 2 && ef.mode === 'hierarchical' && ef.teams === true && ef.team.join() === 'developer,qa'
+  && ef.budget === 3 && ef.bday === 10 && ef.bmonth === 100 && ef.auto === true && ef.where === 'repo' && ef.cwd === 'C:\\r\\shop');
+c.check('edit: daily clock kept; an empty team = the built-ins; a workspace schedule', _orFormFromSchedule(sch).rat === '02:00'
+  && _orFormFromSchedule(Object.assign({}, sch, { config: Object.assign({}, sch.config, { team: [] }) })).team === null
+  && _orFormFromSchedule(Object.assign({}, sch, { config: Object.assign({}, sch.config, { workspace: 'ops', cwd: '' }) })).where === 'workspace');
+c.check('edit: the round trip -- the form gives back the same clock and caps', JSON.stringify(_orWhenBody(ef, nowMs))
+  === JSON.stringify({ schedule: { type: 'every', hours: 6 }, budget_day: 10, budget_month: 100, auto_approve: true }));
+const efh = _orFormHtml([], true, Object.assign(_orFormFromSchedule(sch), { cwd: 'C:\\r\\<shop>' }), lib, []);
+c.check('edit form: titled, where it works read-only (escaped), only Repeat, Save changes + Cancel',
+  efh.includes('>Edit schedule<') && efh.includes('or-ro">C:\\r\\&lt;shop&gt;<') && !efh.includes('id="or-cwd"') && !efh.includes('id="or-where"')
+  && !efh.includes('value="now"') && !efh.includes('value="later"') && efh.includes('>Save changes<') && efh.includes('_orScheduleEditCancel()')
+  && efh.includes('Nightly &lt;deps&gt; check') && !efh.includes('>New orchestration<'));
+c.check('new form: no Cancel, no edit title', !fRep.includes('_orScheduleEditCancel') && fRep.includes('>New orchestration<'));
+c.check('edit saved: what changed and the next run, or nothing', _orScheduleSavedText({ changed: ['goal', 'timing'], next_due: 1e9 }).startsWith('Changed: goal, timing. Next run ')
+  && _orScheduleSavedText({ changed: [] }) === 'Nothing changed.' && _orScheduleSavedText({ changed: ['day cap'] }) === 'Changed: day cap.');
 const later = { id: '1111-0900', goal: 'Upgrade <x>', repo: 'C:\\r\\shop', state: 'scheduled', start_at: 2e9, tasks: 0, metrics };
 const sh = _orScheduledHtml([later, { id: 'r', goal: 'g', repo: 'x', state: 'merged', tasks: 1, metrics }], [sch]);
 c.check('Scheduled: runs for later (start now / cancel) and repeating runs; nothing scheduled -> no card',
@@ -365,4 +400,48 @@ c.check('run commits: short sha, escaped subject, task, the session link when Hi
   cm.includes('>abcdef1<') && cm.includes('Add &lt;api&gt;') && cm.includes('<code>api</code>') && (cm.match(/_jumpToSessionHistory/g) || []).length === 1
   && cm.includes('(no message)'));
 c.check('run commits: none found said so', _orCommitsHtml({ run: mv.run.id, commits: [] }, mv).includes('No commits found'));
+// round 17: estimated costs, a merge stopped at a conflict, workspace wording, long paths, names with diacritics
+c.check('cost: an estimate is marked', _orCost(0.42, 1) === '~$0.42 est.' && _orCost(0.42, 0) === '$0.42');
+c.check('task card: an estimated spend says so', _orTaskHtml(task('api', { cost_est: 1 })).includes('spent ~$0.40 est.'));
+c.check('a cancelled task whose branch is gone shows no commits', !_orTaskHtml(task('api', { state: 'skipped', branch: '' })).includes('commit'));
+const ev = view('running'); ev.events.push({ ts: 2, kind: 'task_stopped', task_id: 'api', message: 'stopped', cost_usd: 0.3, cost_est: 1, human: 0 });
+c.check('log: an estimated event cost says so', _orDetailHtml(ev, false).includes('~$0.30 est.'));
+c.check('metrics: the run cost marked as an estimate', _orMetricsHtml(Object.assign({}, metrics, { cost_est: true })).includes('~$1.20 est.'));
+c.check('short path: the end of a long one, a short one as it is',
+  _orShortPath('C:\\Users\\marek\\AppData\\Local\\AOC\\workspaces\\vyskum-trhu') === '…\\workspaces\\vyskum-trhu'
+  && _orShortPath('C:\\r\\shop') === 'C:\\r\\shop' && _orShortPath('/home/a/b/c/d') === '…/c/d' && _orShortPath('') === '');
+const lp = view('review'); lp.run.repo = 'C:\\Users\\marek\\AppData\\Local\\AOC\\workspaces\\vyskum-trhu';
+const lph = _orDetailHtml(lp, false);
+c.check('detail header: the path shortened, the whole one in its title', lph.includes('title="C:\\Users\\marek\\AppData\\Local\\AOC\\workspaces\\vyskum-trhu">…\\workspaces\\vyskum-trhu<'));
+c.check('workspace run chip: accept results, not review & merge', _orChip('review', 'run', 'workspace').includes('accept results')
+  && !_orChip('review', 'run', 'workspace').includes('merge') && _orChip('review', 'run').includes('review &amp; merge')
+  && _orChip('merged', 'run', 'workspace').includes('Accepted') && _orChip('review', 'task', 'workspace').includes('review'));
+c.check('runs list: a workspace run reads accept results', _orRunsHtml([{ id: 'w', goal: 'g', repo: 'x', kind: 'workspace', state: 'review', tasks: 1, metrics }], '').includes('accept results'));
+c.check('slug: diacritics become plain letters, like the server', _orSlug('Výskum trhu') === 'vyskum-trhu' && _orSlug('Straße Łódź') === 'strasse-lodz');
+// partial merge
+const pm = view('review');
+pm.tasks = [task('one', { merge_state: 'merged' }), task('two', { merge_state: 'conflict', branch: 'aoc/orch-1/two' }),
+  task('three', { merge_state: '' }), task('four', { merge_state: 'blocked', depends_on: ['two'] }), task('five', { merge_state: 'left_out' })];
+pm.waves = [['one', 'two', 'three', 'five'], ['four']];
+pm.run.error = "'two' would conflict in app.txt -- 1 of 4 merged so far";
+const ms = _orMergeStatus(pm);
+c.check('merge status: per state, open = not merged and not left out', ms.merged.join() === 'one' && ms.conflict.join() === 'two'
+  && ms.blocked.join() === 'four' && ms.untried.join() === 'three' && ms.open.join() === 'two,four,three');
+c.check('merge status: none before a merge was tried, none past review', _orMergeStatus(view('review')) === null
+  && _orMergeStatus(Object.assign({}, pm, { run: Object.assign({}, pm.run, { state: 'merged' }) })) === null);
+const pmh = _orDetailHtml(pm, false);
+c.check('partial merge: the box with try again / merge the rest / finish, no plain Merge or Discard, no keep boxes',
+  pmh.includes('The merge stopped at a conflict') && pmh.includes('1 of 4 merged into main') && pmh.includes("_orMergeGo(&quot;1107-1200&quot;,'retry')")
+  && pmh.includes("'rest')") && pmh.includes("'finish')") && !pmh.includes('Merge into main') && !pmh.includes("_orAct('discard'") && !pmh.includes('or-keep'));
+c.check('partial merge: how to resolve the conflict yourself', pmh.includes('git merge aoc/orch-1/two'));
+c.check('partial merge: each task card says where its merge stands', pmh.includes('>merged<') && pmh.includes('>conflict<')
+  && pmh.includes('>waits on a conflict<') && pmh.includes('>left out<'));
+const pm0 = view('review'); pm0.tasks = [task('two', { merge_state: 'conflict' })]; pm0.waves = [['two']];
+const pm0h = _orMergeHtml(pm0);
+c.check('nothing merged yet: no finish, discard instead; no merge-the-rest with nothing untried',
+  !pm0h.includes("'finish')") && pm0h.includes("_orAct('discard'") && !pm0h.includes("'rest')"));
+c.check('finish confirm names what is kept and what is dropped', _orMergeGoText('finish', pm).includes('(one)') && _orMergeGoText('finish', pm).includes('two, four, three'));
+const wpm = Object.assign({}, pm, { run: Object.assign({}, pm.run, { kind: 'workspace' }) });
+c.check('workspace partial merge: accepted, not merged', _orMergeHtml(wpm).includes('accepted so far') && _orMergeChip('merged', true).includes('accepted'));
+c.check('agent editor: each label stays with its field', (edh.match(/class="or-ag-f"/g) || []).length === 4);
 c.finish();

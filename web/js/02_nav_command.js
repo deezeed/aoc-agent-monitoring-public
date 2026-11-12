@@ -531,7 +531,8 @@ function _sbUpdate(sr){
   _bgAgentsTick();
   const bgDead=_bgDead(_bgAgents);
   const inbox=_inboxItems(sr, Date.now()/1000).length+bgDead.length+_bgStrandedLeft(bgDead, _wtStranded).length;
-  const orch=((sr&&sr.orch_attention)||[]).length;
+  /* an Orchestrate agent's held command (orch_holds) needs you too */
+  const orch=((sr&&sr.orch_attention)||[]).length+((sr&&sr.orch_holds)||[]).length;
   set('sb-n-inbox', inbox+orch, true);
   set('mnav-n-inbox', inbox+orch, true);
   set('sb-n-orch', orch, true);

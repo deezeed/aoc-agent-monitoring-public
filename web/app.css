@@ -2574,6 +2574,8 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
 #orch-area .or-en-cwd { flex:1 1 200px; }
 .or-sch { border-left-color:var(--c); } .or-sch-paused { border-left-color:var(--t3);opacity:.75; }
 .or-sch .or-actions { align-items:center; }
+.or-ev.warn b { color:var(--o); } .or-ev-run { display:inline;padding:0;font-size:10px;color:var(--c); }
+.or-ro { font-size:11px;overflow-wrap:anywhere;min-width:0; } .or-new-ed { border-left:3px solid var(--c); }
 .or-commits-t td { padding:3px 6px;font-size:11px;vertical-align:middle; } .or-commits-t .cc-subj { word-break:break-word; }
 @media (max-width: 600px) { .or-ent-grid { grid-template-columns:1fr; } }
 .or-top { display:flex; }
@@ -2651,3 +2653,21 @@ body.light .vo-panel { background:var(--bay); }
 .or-rules textarea { width:100%;box-sizing:border-box;margin:8px 0 4px;font-family:var(--font2);font-size:11px; }
 .or-rules summary .or-note { margin-left:8px; }
 @media (max-width: 600px) { .or-rules summary .or-note { display:none; } }
+/* one disclosure arrow all over Orchestrate: the cards hid theirs (list-style:none), the inner ones kept the browser's */
+#orch-area details > summary { list-style:none;cursor:pointer; }
+#orch-area details > summary::-webkit-details-marker { display:none; }
+#orch-area details > summary::before { content:'\25B8';display:inline-block;width:1em;font-size:.85em;color:var(--t3);transition:transform .15s; }
+#orch-area details[open] > summary::before { transform:rotate(90deg); }
+/* a workspace path is long (%LOCALAPPDATA%\AOC\workspaces\...): its end only, the whole one in the title */
+.or-path { display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom; }
+/* agent editor: a label stays with its field (on a phone "Default $" broke into two lines) */
+.or-ag-f { display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%; }
+.or-ag-f .ln-lbl { white-space:nowrap;flex:none; }
+.or-task-chips { display:inline-flex;gap:4px;flex-wrap:wrap;justify-content:flex-end; }
+.or-mergebox { border:1px solid var(--o);border-radius:6px;padding:8px 10px;margin:10px 0;font-size:12px;color:var(--t); }
+.or-mg-row { display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:3px 0; }
+.or-mg-row code { font-size:10px; }
+.or-mg-how { flex-basis:100%;word-break:break-word; }
+.or-mergebox .or-actions { margin:8px 0 0; }
+/* voice: Yes and No stay together (No used to wrap onto a line of its own) */
+.vo-yn { display:inline-flex;gap:6px;flex:none;margin-left:auto; } .vo-yn .adp-btn { white-space:nowrap; }

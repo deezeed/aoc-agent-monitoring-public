@@ -585,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
                         no_cache=True)
         elif path_no_qs == "/worktrees/stranded":
             try:
-                reply = _wt_stranded_list((_own_status_payload() or {}).get("sessions_list") or [])
+                reply = _wt_stranded_list(_orch_open_in_folders(_own_status_payload()))
             except Exception as e:
                 _log_bg_error("stranded worktrees", e)
                 reply = {"ok": False, "error": "failed", "items": []}
@@ -870,6 +870,10 @@ class Handler(BaseHTTPRequestHandler):
                     sessions[session_id]["display_name"] = _fix_mojibake(update["display_name"])
                 if update.get("host_pid"):
                     sessions[session_id]["host_pid"] = update["host_pid"]
+                # an Orchestrate agent (the hook's tag, or its aoc-orch-* worktree
+                # for hooks from before the tag): kept, so its cost counts, but it
+                # never waits on you -- /status lists it under orch_workers
+                _orch_mark_worker(sessions[session_id], update)
                 if "waiting_on_you" in update:
                     # Real-time signal from the Stop/UserPromptSubmit heartbeat hook:
                     # Stop means Claude just finished a turn and control is back with
@@ -1185,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise ValueError("expected an object")
                 reply = _wt_stranded_act(path_no_qs.rsplit("/", 1)[1], str(data.get("id") or ""),
-                                         (_own_status_payload() or {}).get("sessions_list") or [])
+                                         _orch_open_in_folders(_own_status_payload()))
                 self._serve(200, "application/json", json.dumps(reply, ensure_ascii=False).encode())
             except Exception as e:
                 _log_bg_error("stranded worktrees", e)
@@ -1240,7 +1244,8 @@ class Handler(BaseHTTPRequestHandler):
                             "/orch/baseline", "/orch/judge",
                             "/orch/agent_save", "/orch/agent_delete", "/orch/entity_save", "/orch/entity_run",
                             "/orch/entity_pause", "/orch/entity_forget", "/orch/entity_delete", "/orch/settings",
-                            "/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete"):
+                            "/orch/start", "/orch/schedule_save", "/orch/schedule_pause", "/orch/schedule_delete",
+                            "/orch/schedule_run"):
             # starts paid agents, creates/merges/deletes git branches: this PC, or the owner / a member
             # through the tunnel (their own token; viewers never get here -- _authorize)
             if not (self._is_direct_loopback() or self._user["role"] in ("owner", "member")):
@@ -1266,6 +1271,8 @@ class Handler(BaseHTTPRequestHandler):
                     reply = _orch_entity_save(data)
                 elif act == "schedule_save":
                     reply = _orch_schedule_save(data)
+                elif act == "schedule_run":
+                    reply = _orch_schedule_run_now(data)
                 elif act.startswith("schedule_"):
                     reply = _orch_schedule_action(act[len("schedule_"):], data)
                 elif act.startswith("entity_"):
