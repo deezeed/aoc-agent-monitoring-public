@@ -669,7 +669,7 @@ def _build_status_payload_uncached() -> dict:
     # Today, the waiting/stuck/cost alerts and their toasts and pushes) for
     # orch_workers; their cost stays in the status file -> History
     active_sessions, data["orch_workers"], data["orch_holds"], data["agents"], _orch_foreign = \
-        _orch_split_workers(active_sessions, data.get("agents") or [], _perms, set(_own_claude_pids))
+        _orch_split_workers(active_sessions, data.get("agents") or [], _perms, _not_cli_pids())
     # sessions_count: floor at the real claude.exe process count (background
     # scanner, _claude_proc_worker, counts claude.exe processes every 2s). Hook-tracked
     # sessions can under-count — a CLI sitting idle with no fresh heartbeat,

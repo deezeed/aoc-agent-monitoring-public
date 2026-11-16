@@ -9,6 +9,17 @@ _claude_proc_count = [0]  # cached count of running claude.exe processes
 _own_claude_pids = set()  # `claude -p` recaps AOC runs itself (_run_haiku): not CLI sessions
 
 
+def _not_cli_pids():
+    """claude.exe pids that are no CLI session of yours: AOC's own `claude -p`
+    plus every AOC's Orchestrate workers (server/17 -- loaded after this
+    part, so absent for the first moments of a start)."""
+    reg = globals().get("_orch_registry_pids")
+    try:
+        return set(_own_claude_pids) | (set(reg()) if reg else set())
+    except Exception:
+        return set(_own_claude_pids)
+
+
 def _claude_proc_worker():
     """Background thread: count running claude.exe processes every 2 seconds
     (via _snapshot_processes; tasklist only as a fallback).
@@ -32,8 +43,10 @@ def _claude_proc_worker():
             # failed snapshot only.
             procs = _snapshot_processes()
             if procs is not None:
-                # minus the `claude -p` recaps AOC itself is running
-                new_count = sum(1 for pid, exe in procs if exe == "claude.exe" and pid not in _own_claude_pids)
+                # minus the `claude -p` recaps AOC itself is running and every
+                # AOC's Orchestrate workers (a preview's too -- server/17)
+                skip = _not_cli_pids()
+                new_count = sum(1 for pid, exe in procs if exe == "claude.exe" and pid not in skip)
             else:
                 r = _sp.run(
                     ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],

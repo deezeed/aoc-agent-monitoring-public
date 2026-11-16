@@ -17,6 +17,9 @@ function _mergeRemoteData(sr){
      agent would look abandoned immediately since its session_id would
      never be found in the local machine's own sessions dict. */
   const mergedSessionsDict={...(sr.sessions||{})};
+  /* a remote Orchestrate agent's held command needs you as much as a local
+     one: its machine routes Allow/Deny there (_permDecide) */
+  const orch_holds=(sr.orch_holds||[]).slice();
   _remoteMachines.forEach((m,idx)=>{
     const cached=_remoteCache[idx];
     if(!cached||!cached.ok||!cached.data) return;
@@ -24,8 +27,9 @@ function _mergeRemoteData(sr){
     (cached.data.sessions_list||[]).forEach(s=>sessions_list.push({...s, machine:name, _isLocal:false, _domId:'m'+idx+'_'+s.id}));
     (cached.data.agents||[]).forEach(a=>agents.push({...a, machine:name, _isLocal:false, _domId:'m'+idx+'_'+a.id}));
     Object.assign(mergedSessionsDict, cached.data.sessions||{});
+    (cached.data.orch_holds||[]).forEach(q=>orch_holds.push({...q, machine:name}));
   });
-  return {...sr, sessions_list, agents, sessions:mergedSessionsDict, sessions_count:sessions_list.length};
+  return {...sr, sessions_list, agents, sessions:mergedSessionsDict, sessions_count:sessions_list.length, orch_holds};
 }
 
 function _pollRemoteMachines(){

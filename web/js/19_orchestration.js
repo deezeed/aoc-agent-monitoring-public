@@ -517,7 +517,7 @@ function _orEntityCardHtml(e, agents){
   const where=cfg.where==='workspace'?`workspace ${cfg.workspace}`:String(cfg.cwd||'').split(/[\\/]/).filter(Boolean).pop()||cfg.cwd;
   const runs=(e.runs||[]).slice(0,5).map(r=>`<button class="or-ent-run" onclick="_orSelect(${jsq(r.id)})">${_orChip(r.state,'run')} ${escHtml(r.goal)}</button>`).join('');
   const mem=(e.memory||[]).map(m=>`<div class="or-ev"><span>${_orWhen(m.ts)}</span><b>${escHtml(m.outcome)}</b> ${escHtml(m.goal)} <i>${_orMoney(m.cost)}</i>${m.summary?` — ${escHtml(m.summary)}`:''}</div>`).join('');
-  const evs=(e.events||[]).slice().reverse().slice(0,30).map(x=>`<div class="or-ev"><span>${_orWhen(x.ts)}</span><b>${escHtml(x.kind.replace(/_/g,' '))}</b> ${escHtml(x.message||'')}${x.user?` <i>— ${escHtml(x.user)}</i>`:''}${x.cost_usd?` <i>${_orMoney(x.cost_usd)}</i>`:''}</div>`).join('');
+  const evs=(e.events||[]).slice().reverse().slice(0,30).map(x=>`<div class="or-ev"><span>${_orWhen(x.ts)}</span><b>${escHtml(x.kind.replace(/_/g,' '))}</b> ${escHtml(x.message||'')}${x.user?` <i>— ${escHtml(x.user)}</i>`:''}${x.cost_usd?` <i>${_orCost(x.cost_usd,x.cost_est)}</i>`:''}</div>`).join('');
   return `<div class="or-ent or-ent-${escHtml(e.state)}">
     <div class="or-ent-h"><span class="or-chip or-c-${cls}">${escHtml(label)}</span><b>${escHtml(cfg.name)}</b>
       <span class="or-note">${escHtml(where)} · ${escHtml(_orScheduleText(cfg))}</span></div>
@@ -914,9 +914,10 @@ function _orHoldsHtml(holds){
   if(!(holds||[]).length) return '';
   const row=q=>{
     const ref=_orWorkerRef(q);
-    const who=ref.entity?`entity ${ref.entity} · scout`:[ref.run?'run '+ref.run:'', ref.task?'task '+ref.task:''].filter(Boolean).join(' · ')||'an Orchestrate agent';
-    const call=d=>`_permDecide('',${jsq(q.id)},'${d}')`;
-    const open=ref.run&&!ref.entity?`<button class="adp-btn" onclick="_orOpenRun(${jsq(ref.run)})">Open run</button>`:'';
+    const who=[q.machine||'', ref.entity?`entity ${ref.entity} · scout`:[ref.run?'run '+ref.run:'', ref.task?'task '+ref.task:''].filter(Boolean).join(' · ')||'an Orchestrate agent'].filter(Boolean).join(' · ');
+    /* q.machine: another machine's agent (Remote Machines) -- answered there, its run isn't here */
+    const call=d=>`_permDecide(${q.machine?jsq(q.machine):"''"},${jsq(q.id)},'${d}')`;
+    const open=ref.run&&!ref.entity&&!q.machine?`<button class="adp-btn" onclick="_orOpenRun(${jsq(ref.run)})">Open run</button>`:'';
     return `<div class="or-ib"><div class="or-ib-h"><span class="or-chip or-c-wait">${q.danger?'Dangerous command':'Needs your OK'}</span><b>${escHtml(who)}</b></div>
       <div class="perm-sum">${escHtml(q.summary||'')}</div>
       <div class="or-note">${q.danger?escHtml(q.danger):''}${q.age_s?`${q.danger?' · ':''}held ${escHtml(_fmtDurShort(q.age_s))}`:''}</div>

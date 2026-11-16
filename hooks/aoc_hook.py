@@ -359,8 +359,9 @@ def _dispatch_cloud_post(path: str, data: dict) -> None:
 
 def post_aoc(path: str, data: dict) -> bool:
     _rotate_log()
-    if ORCH_WORKER:
-        data = dict(data, orch=ORCH_WORKER)
+    # orch False: not an Orchestrate worker -- AOC then shows a session you
+    # opened yourself in an aoc-orch-* worktree instead of hiding it
+    data = dict(data, orch=ORCH_WORKER or False)
     ok = False
     try:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")

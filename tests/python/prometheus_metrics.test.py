@@ -55,5 +55,21 @@ data2 = {"sessions_count": 0, "agents": [], "sessions_list": [
 ]}
 out2 = _render_prometheus_metrics(data2, {"hook_misses": 0})
 c.check("project names with quotes are escaped in the label", 'project="weird \\"quoted\\" name"' in out2)
+c.check("no Orchestrate workers -> active-workers gauge 0", "aoc_orch_workers_active 0" in out2)
+
+# Orchestrate's agents left sessions_list, but their spend still shows -- labelled with their run
+data3 = {"sessions_count": 1, "agents": [], "sessions_list": [{"id": "me", "project": "AOC", "estimated_cost": 1.5}],
+         "orch_workers": [{"id": "w1", "project": "repo", "run": "1112-172316", "estimated_cost": 0.42, "session_active": True},
+                          {"id": "w2", "project": "", "run": "", "slot": "orch-R-x-1", "estimated_cost": 0.1,
+                           "session_active": False}]}
+out3 = _render_prometheus_metrics(data3, {"hook_misses": 0})
+c.check("worker cost: same metric, an orch_run label",
+        'aoc_session_cost_dollars{session_id="w1",project="repo",orch_run="1112-172316"} 0.42' in out3)
+c.check("worker cost: no run known -> its worktree slot",
+        'aoc_session_cost_dollars{session_id="w2",project="none",orch_run="orch-R-x-1"} 0.1' in out3)
+c.check("your session's series is unchanged (no orch_run label)",
+        'aoc_session_cost_dollars{session_id="me",project="AOC"} 1.5' in out3)
+c.check("active workers gauge counts only working ones", "aoc_orch_workers_active 1" in out3
+        and "# TYPE aoc_orch_workers_active gauge" in out3)
 
 c.finish()

@@ -52,6 +52,16 @@ c.check('_mergeRemoteData: domIds prefixed local_/m0_', localSession._domId === 
 c.check('_mergeRemoteData: raw sessions dict merged (checkStaleAgents lookup)', out.sessions['sess-remote-1'] && out.sessions['sess-remote-1'].last_seen_epoch === 2000);
 c.check('_mergeRemoteData: tunnel field stays local-only', out.tunnel.status === 'off');
 
+c.check('_mergeRemoteData: no holds anywhere -> an empty orch_holds', Array.isArray(out.orch_holds) && out.orch_holds.length === 0);
+
+// a remote Orchestrate agent's held command reaches this Inbox, tagged with its machine
+_remoteCache[0].data.orch_holds = [{ id: 'p-r', summary: 'Bash: rm -rf dist', run: 'R9', task: 'api' }];
+out = _mergeRemoteData({ ...localSr, orch_holds: [{ id: 'p-l', summary: 'Bash: git push -f' }] });
+c.check('_mergeRemoteData: orch_holds = local + remote, the remote one carries its machine',
+  out.orch_holds.length === 2 && out.orch_holds[0].id === 'p-l' && !out.orch_holds[0].machine
+  && out.orch_holds[1].id === 'p-r' && out.orch_holds[1].machine === 'Desktop' && out.orch_holds[1].run === 'R9');
+delete _remoteCache[0].data.orch_holds;
+
 _remoteCache = { 0: { ok: false, data: null } };
 out = _mergeRemoteData(localSr);
 c.check('_mergeRemoteData: failed remote (ok:false) excluded cleanly', out.sessions_list.length === 1);

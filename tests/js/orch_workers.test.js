@@ -43,6 +43,10 @@ c.check('hold: an entity scout -> named, no run to open', h.includes('entity sho
 h = _orHoldsHtml([{ id: 'p4', summary: 'Bash: rm y' }]);
 c.check('hold: nothing known -> generic name, no link', h.includes('an Orchestrate agent') && !h.includes('_orOpenRun'));
 c.check('hold: none -> empty', _orHoldsHtml([]) === '' && _orHoldsHtml(null) === '');
+h = _orHoldsHtml([{ id: 'p5', summary: 'Bash: rm z', danger: 'recursive delete', run: '1112-172316', task: 'api', machine: "Desk'top" }]);
+c.check('hold: another machine (Remote Machines) -> named with it, answered there, no local run link',
+  h.includes('Desk&#39;top · run 1112-172316 · task api')
+  && h.includes(`_permDecide(${jsq("Desk'top")},${jsq('p5')},'allow')`) && !h.includes('_orOpenRun'));
 
 // the Orchestrate view's line
 const W = o => Object.assign({ id: 'w', run: 'R1', task: 't', session_active: true, estimated_cost: 0.25 }, o);

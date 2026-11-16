@@ -1064,6 +1064,18 @@ def _render_prometheus_metrics(data: dict, analytics: dict) -> str:
         project = _prom_escape(sess.get("project", "") or "none")
         cost = sess.get("estimated_cost", 0.0) or 0.0
         lines.append(f'aoc_session_cost_dollars{{session_id="{sid}",project="{project}"}} {cost}')
+    # Orchestrate's own agents left sessions_list (server/17) but their
+    # spend is real: same metric, told apart by an orch_run label
+    workers = data.get("orch_workers") or []
+    for w in workers:
+        sid = _prom_escape(w.get("id", ""))
+        project = _prom_escape(w.get("project", "") or "none")
+        run = _prom_escape(w.get("run", "") or w.get("slot", "") or "unknown")
+        cost = w.get("estimated_cost", 0.0) or 0.0
+        lines.append(f'aoc_session_cost_dollars{{session_id="{sid}",project="{project}",orch_run="{run}"}} {cost}')
+    lines.append("# HELP aoc_orch_workers_active Orchestrate agents working right now (not counted as sessions)")
+    lines.append("# TYPE aoc_orch_workers_active gauge")
+    lines.append(f'aoc_orch_workers_active {sum(1 for w in workers if w.get("session_active") is not False)}')
 
     lines.append("# HELP aoc_hook_misses_total Agent events detected via transcript fallback")
     lines.append("# TYPE aoc_hook_misses_total counter")

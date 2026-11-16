@@ -7,7 +7,7 @@ worker's waiting_on_you (_orch_mark_worker), the push name, the "hooks
 outdated" hint -- and the hooks for real: hooks/aoc_hook.py reports a
 worker to the port of the AOC that started it, tagged, and
 hooks/aoc_permission.py never holds anything for a worker."""
-import sys, os, json, importlib.util, re, subprocess, tempfile, threading
+import sys, os, json, importlib.util, re, subprocess, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -20,7 +20,7 @@ O = exec_functions(["ORCH_ENV_RUN", "ORCH_ENV_TASK", "ORCH_ENV_PORT", "_ORCH_WOR
                     "_orch_worker_path", "_orch_worker_of", "_orch_split_workers", "_orch_worker_tag",
                     "_orch_mark_worker", "_orch_worker_label", "_ORCH_HOOK_MARK", "_orch_hooks_stale",
                     "_orch_hooks_hint", "_orch_open_in_folders", "_orch_proc_env"],
-                   {"os": os, "re": re, "PORT": 5151,
+                   {"os": os, "re": re, "time": time, "PORT": 5151, "_ORCH_CATALOG_TTL_S": 900,
                     "_orch_settings": lambda: {"billing": "api"}, "_orch_catalog_load": lambda: None,
                     "_orch_catalog_cache": {"mcp": ["claude_ai_Vercel"]}, "_orch_catalog": lambda: None,
                     "_orch_subscription_env": lambda: {"PATH": "x"}, "_orch_mcp_deny": lambda a, m: list(m)})
@@ -64,6 +64,9 @@ c.check("of: hooks from before the tag -- found by its folder or transcript dir"
         of({"cwd": r"C:\r\.claude\worktrees\aoc-orch-R-x-1"}) == {"run": "", "task": "", "slot": "orch-R-x-1"}
         and of({"transcript_dir": "C--r--claude-worktrees-aoc-orch-R-y-1"})["slot"] == "orch-R-y-1")
 c.check("of: your session -> None", of({"cwd": r"C:\repo"}) is None and of(None) is None and of({"orch": {}}) is None)
+c.check("of: the hook said 'no worker' (orch False) -> your session, even in an aoc-orch-* folder",
+        of({"orch": False, "cwd": r"C:\r\.claude\worktrees\aoc-orch-R-x-1",
+            "transcript_dir": "C--r--claude-worktrees-aoc-orch-R-x-1"}) is None)
 c.check("label", O["_orch_worker_label"]({"task": "api"}) == "Orchestrate · api"
         and O["_orch_worker_label"]({"slot": "orch-R-x-1"}) == "Orchestrate · orch-R-x-1"
         and O["_orch_worker_label"](None) == "Orchestrate · agent")
@@ -116,6 +119,15 @@ c.check("mark: an untagged worker (old hooks) found by its folder", O["_orch_mar
 up = {"waiting_on_you": True}
 c.check("mark: stays a worker on later updates without the tag",
         O["_orch_mark_worker"]({"orch": {"run": "R1", "task": "x"}}, up) is True and "waiting_on_you" not in up)
+sess = {"cwd": r"C:\r\.claude\worktrees\aoc-orch-R1-api-1"}
+up = {"waiting_on_you": True, "orch": False}
+c.check("mark: you opened claude in a worker's folder yourself (current hook: orch False) -> your session",
+        O["_orch_mark_worker"](sess, up) is False and up["waiting_on_you"] is True and sess["orch"] is False)
+up = {"waiting_on_you": True}
+c.check("mark: ... and stays yours on updates without the field", O["_orch_mark_worker"](sess, up) is False)
+sess = {"orch": {"run": "R1", "task": "x"}}
+c.check("mark: orch False never unmarks a tagged worker",
+        O["_orch_mark_worker"](sess, {"orch": False}) is True and sess["orch"] == {"run": "R1", "task": "x"})
 
 # ── hooks outdated ──
 c.check("stale: deployed hook without the worker tag", O["_orch_hooks_stale"]("def main(): pass"))
@@ -180,6 +192,13 @@ c.check("hook run: a worker's Stop goes to the AOC that started it, tagged",
         len(ups) == 1 and ups[0][0] == spawner.server_port and ups[0][2]["orch"] == {"run": "1112-172316", "task": "api"}
         and ups[0][2]["session_id"] == "sess-w")
 c.check("hook run: nothing reaches the default monitor", not any(p[0] == default.server_port for p in posts))
+posts.clear()
+env_me = {k: v for k, v in env.items() if not k.startswith("AOC_ORCH_")}
+subprocess.run([sys.executable, hook], input=json.dumps(dict(ev, session_id="sess-me")).encode(), env=env_me, timeout=60)
+ups = [p for p in posts if p[1] == "/update"]
+c.check("hook run: your session goes to the default monitor with orch False ('no worker')",
+        len(ups) == 1 and ups[0][0] == default.server_port and ups[0][2]["orch"] is False
+        and ups[0][2]["session_id"] == "sess-me")
 for s in (spawner, default):
     s.shutdown()
 

@@ -733,7 +733,7 @@ dv = O["_orch_agent_argv"]("c", T("x", role="shop"), a, ["mcp__claude_ai_Vercel"
 c.check("argv carries the deny list", dv[dv.index("--disallowedTools") + 1] == "mcp__claude_ai_Vercel"
         and "--disallowedTools" not in O["_orch_agent_argv"]("c", T("x"), None))
 cat_cache = g["_orch_catalog_cache"]
-cat_cache.update(mcp=[], loaded=True, scanning=True)
+cat_cache.update(mcp=[], loaded=True, scanning=True, at=time.time())  # fresh: no real `claude mcp list` rescan
 r = O["_orch_create"]({"goal": "Report on last week's sales", "cwd": repo, "team": ["shop-analyst-2", "writer", "gone-agent"]},
                       exe="claude.exe", spawn=tspawn)
 rid = r["id"]
@@ -978,6 +978,30 @@ e = O["_orch_entities_list"]()["entities"][0]
 c.check("pause stops its scout: no run starts, the scout's cost still counts",
         len(e["runs"]) == n_runs and e["state"] == "paused"
         and any(x["kind"] == "scout_stopped" and x["cost_usd"] == 0.05 for x in e["events"]))
+c.check("... it had answered (not killed): its cost is no estimate",
+        [x["cost_est"] for x in e["events"] if x["kind"] == "scout_stopped"] == [0])
+# a scout killed before it answered: what it used is an estimate -- marked in the entity log ("~$x est.")
+real_stop = g["_orch_stop"]
+g["_orch_stop"] = lambda pid, since=None, alive=None, kill=None: bool(pid)
+try:
+    O["_orch_entity_action"]("pause", {"id": "store-watch", "paused": False})
+    O["_orch_entity_action"]("run", {"id": "store-watch"})
+    scout_answers.append({"action": "idle", "goal": "", "reason": "nothing new", "mode": "flat"})
+    conn = O["_orch_connect"](); O["_orch_entity_tick"](conn, "store-watch", T0 + 6 + 67 * 60, **ekw); conn.commit(); conn.close()
+    conn = O["_orch_connect"](); O["_orch_entity_tick"](conn, "store-watch", T0 + 6 + 68 * 60, **ekw); conn.commit(); conn.close()
+    e = O["_orch_entities_list"]()["entities"][0]
+    c.check("tick: a killed scout's cost is marked as an estimate",
+            [(x["kind"], x["cost_est"]) for x in e["events"] if x["cost_usd"]][-1] == ("idle", 1))
+    O["_orch_entity_action"]("run", {"id": "store-watch"})
+    scout_answers.append({"action": "idle", "goal": "", "reason": "nothing new", "mode": "flat"})
+    conn = O["_orch_connect"](); O["_orch_entity_tick"](conn, "store-watch", T0 + 6 + 69 * 60, **ekw); conn.commit(); conn.close()
+    O["_orch_entity_action"]("pause", {"id": "store-watch", "paused": True})
+    e = O["_orch_entities_list"]()["entities"][0]
+    c.check("pause: a scout killed while thinking -> its cost marked as an estimate",
+            [(x["kind"], x["cost_est"]) for x in e["events"] if x["kind"] == "scout_stopped"][-1] == ("scout_stopped", 1)
+            and [x for x in e["events"] if x["kind"] == "scout_stopped"][-1]["cost_usd"] > 0)
+finally:
+    g["_orch_stop"] = real_stop
 c.check("forget clears its memory", O["_orch_entity_action"]("forget", {"id": "store-watch"})["ok"]
         and O["_orch_entities_list"]()["entities"][0]["memory"] == [])
 c.check("delete", O["_orch_entity_action"]("delete", {"id": "store-watch"})["ok"] and O["_orch_entities_list"]()["entities"] == [])
@@ -994,6 +1018,22 @@ cat_cache.update(mcp=[], scanning=True)
 c.check("subscription without the server list: not ready", pe(None, "subscription")[2] is False and pe(None, "api")[2] is True)
 cat_cache.update(mcp=servers, scanning=False)
 c.check("planner/supervisor argv carry the deny list", O["_orch_llm_argv"]("c", {}, "opus", 1.0, True, ["mcp__x"])[-1] == "mcp__x")
+c.check("planner/supervisor load no MCP server at all (a connector the deny list doesn't know yet can't fill the context)",
+        all("--strict-mcp-config" in a for a in (O["_orch_llm_argv"]("c", {}, "opus", 1.0),
+                                                 O["_orch_llm_argv"]("c", {}, "opus", 1.0, True, stream=True)))
+        and "--strict-mcp-config" not in O["_orch_agent_argv"]("c", T("x"), None))
+rescans = []
+real_catalog = g["_orch_catalog"]
+g["_orch_catalog"] = lambda fresh=False: rescans.append(1)
+try:
+    cat_cache.update(at=time.time() - O["_ORCH_CATALOG_TTL_S"] - 5)
+    old_ready = pe(None, "subscription")
+    cat_cache.update(at=time.time())
+    fresh_ready = pe(None, "subscription")
+finally:
+    g["_orch_catalog"] = real_catalog
+c.check("subscription: an old MCP server list is used but rescanned in the background; a fresh one isn't",
+        old_ready[2] and fresh_ready[2] and len(rescans) == 1 and old_ready[1] == fresh_ready[1])
 c.check("an empty credit balance explained", "switch Orchestrate's billing to your Claude subscription"
         in O["_orch_explain_error"]("Credit balance is too low") and O["_orch_explain_error"]("boom") == "boom")
 setf = tempfile.mkdtemp()
@@ -1604,6 +1644,21 @@ stream = "\n".join([json.dumps({"type": "system", "subtype": "init"}), asst("A",
                     asst("B", 200_000, 0)])
 c.check("usage cost: each API call once (its last copy), summed -- 1.0 + 1.0",
         abs(O["_orch_usage_cost"](stream) - 2.0) < 1e-9)
+
+def think(n):
+    return json.dumps({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": n, "estimated_tokens_delta": n})
+
+
+# Live: a streamed message reports output_tokens 1 (when it started); its text, tool input and the thinking
+# estimated before it are what it really wrote -- ~4 characters a token. Opus 5 output = $25 / Mtok
+live = "\n".join([think(300), think(200), asst("D", 0, 1, content=[{"type": "text", "text": "y" * 4000}]),
+                  asst("D", 0, 1, content=[{"type": "tool_use", "name": "StructuredOutput", "input": {"r": "z" * 3991}}]),
+                  asst("E", 0, 5000, content=[{"type": "text", "text": "short"}])])
+c.check("usage cost: a streamed message's output = its text + tool input / 4 + the thinking before it, "
+        "or its output_tokens when that is more", abs(O["_orch_usage_cost"](live) - (8000 // 4 + 500 + 5000) * 25 / 1e6) < 1e-9)
+c.check("usage cost: a bad thinking line is skipped",
+        abs(O["_orch_usage_cost"]('{"type":"system","subtype":"thinking_tokens","estimated_tokens_delta":"x"}\n'
+                                  + asst("F", 0, 100)) - 100 * 25 / 1e6) < 1e-9)
 c.check("usage cost: nothing recorded -> None", O["_orch_usage_cost"]("") is None
         and O["_orch_usage_cost"](json.dumps({"type": "system"})) is None)
 p = O["_orch_parse"](stream)

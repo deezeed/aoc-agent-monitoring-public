@@ -321,8 +321,10 @@ def _orch_proc_env(agent=None, billing=None, tag=None):
     On the subscription (chosen, or the agent needs connectors) the API key
     is dropped and every MCP server it doesn't need is denied -- all of them
     together don't fit a model's context. Until AOC knows the server list it
-    isn't ready (the caller tries again next tick). tag = (run id, task id):
-    the process is marked as an Orchestrate worker (_orch_worker_env)."""
+    isn't ready (the caller tries again next tick); an old list is used but
+    rescanned in the background (a connector added since would otherwise load
+    whole into every worker). tag = (run id, task id): the process is marked
+    as an Orchestrate worker (_orch_worker_env)."""
     billing = billing or _orch_settings()["billing"]
     if billing != "subscription" and not (agent or {}).get("mcp"):
         return ({"env": _orch_worker_env(os.environ, *tag)} if tag else {}), [], True
@@ -330,6 +332,8 @@ def _orch_proc_env(agent=None, billing=None, tag=None):
     if not _orch_catalog_cache["mcp"]:
         _orch_catalog()
         return {}, [], False
+    if time.time() - _orch_catalog_cache.get("at", 0) > _ORCH_CATALOG_TTL_S:
+        _orch_catalog()
     env = _orch_subscription_env()
     return {"env": _orch_worker_env(env, *tag) if tag else env}, _orch_mcp_deny(agent or {}, _orch_catalog_cache["mcp"]), True
 
@@ -371,9 +375,13 @@ def _orch_worker_path(path):
 def _orch_worker_of(sess):
     """Pure: {run, task, slot} when this live session is an Orchestrate
     worker -- tagged by the hook, or (hooks not updated yet) found by its
-    folder / transcript dir -- else None."""
+    folder / transcript dir -- else None. orch False = the hook said it is
+    no worker (a session you opened yourself in an aoc-orch-* worktree):
+    the folder doesn't count then."""
     sess = sess or {}
     tag = sess.get("orch")
+    if tag is False:
+        return None
     if isinstance(tag, dict) and (tag.get("run") or tag.get("slot")):
         return {"run": str(tag.get("run") or ""), "task": str(tag.get("task") or ""), "slot": str(tag.get("slot") or "")}
     slot = _orch_worker_path(sess.get("cwd")) or _orch_worker_path(sess.get("transcript_dir"))
@@ -442,6 +450,8 @@ def _orch_mark_worker(sess, update):
     tag = _orch_worker_tag(update)
     if tag:
         sess["orch"] = tag
+    elif update.get("orch") is False and not isinstance(sess.get("orch"), dict):
+        sess["orch"] = False   # the hook knows: not a worker, whatever its folder
     if not _orch_worker_of(sess):
         return False
     update.pop("waiting_on_you", None)
@@ -623,7 +633,8 @@ def _orch_connect(path=None):
                              ("runs", "baseline_of", "TEXT DEFAULT ''"), ("runs", "verdict", "TEXT DEFAULT ''"),
                              ("runs", "start_at", "REAL"), ("runs", "schedule_id", "TEXT DEFAULT ''"),
                              ("tasks", "cost_est", "INTEGER DEFAULT 0"), ("events", "cost_est", "INTEGER DEFAULT 0"),
-                             ("tasks", "merge_state", "TEXT DEFAULT ''")):
+                             ("tasks", "merge_state", "TEXT DEFAULT ''"),
+                             ("entity_events", "cost_est", "INTEGER DEFAULT 0")):
         if col not in have[table]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return conn
@@ -918,8 +929,11 @@ def _orch_llm_argv(exe, schema, model, budget, read_tools=False, deny=(), stream
     yours), not saved, the plan's JSON schema; the planner may read the repo.
     stream: stream-json (--verbose) -- each API call's usage is in the output
     as it happens, so one killed before it answered can be charged what it
-    used (it keeps no transcript) instead of its whole budget."""
-    argv = [exe, "-p", "--model", model, "--no-session-persistence",
+    used (it keeps no transcript) instead of its whole budget. None of them
+    uses MCP: --strict-mcp-config loads no server at all, so a connector the
+    deny list doesn't know yet can't fill the context either (found live: all
+    connectors = 623 tools, ~520k tokens, $2 for a one-line answer)."""
+    argv = [exe, "-p", "--model", model, "--no-session-persistence", "--strict-mcp-config",
             "--settings", '{"disableAllHooks": true}', "--output-format", "stream-json" if stream else "json"] \
         + (["--verbose"] if stream else []) + ["--json-schema", json.dumps(schema), "--max-budget-usd", f"{budget:.2f}"]
     if read_tools:
@@ -1002,11 +1016,24 @@ def _orch_usage_cost(text):
     """Pure: the $ of the API calls a stream-json output (--verbose) or a
     Claude Code transcript records -- what a process killed before it
     answered had used. Each message once (it repeats per content block: the
-    last copy counts). None = not one API call recorded."""
-    last = {}
+    last copy counts). Found live: a stream-json message carries the
+    output_tokens of when it started streaming (2, against 400+ in the end),
+    so its output is at least its blocks' text / tool input at ~4 characters
+    a token, plus the thinking the stream estimated before it (its thinking
+    text is empty). None = not one API call recorded."""
+    last, chars, thinking, pending = {}, {}, {}, 0
     for line in str(text or "").splitlines():
         line = line.strip()
-        if not line.startswith("{") or '"assistant"' not in line:
+        if not line.startswith("{"):
+            continue
+        if '"thinking_tokens"' in line:
+            try:
+                d = json.loads(line)
+                pending += max(int(d.get("estimated_tokens_delta") or 0), 0) if d.get("subtype") == "thinking_tokens" else 0
+            except (ValueError, TypeError, AttributeError):
+                pass
+            continue
+        if '"assistant"' not in line:
             continue
         try:
             d = json.loads(line)
@@ -1014,14 +1041,21 @@ def _orch_usage_cost(text):
             continue
         m = d.get("message") if isinstance(d, dict) and d.get("type") == "assistant" else None
         if isinstance(m, dict) and isinstance(m.get("usage"), dict):
-            last[m.get("id") or d.get("uuid") or len(last)] = m
+            key = m.get("id") or d.get("uuid") or len(last)
+            last[key] = m
+            thinking[key], pending = thinking.get(key, 0) + pending, 0
+            for b in m.get("content") or []:
+                if isinstance(b, dict):
+                    body = b.get("text") or b.get("thinking") or (json.dumps(b["input"]) if "input" in b else "")
+                    chars[key] = chars.get(key, 0) + len(str(body or ""))
     if not last:
         return None
     cost = 0.0
-    for m in last.values():
+    for key, m in last.items():
         u = m["usage"]
         cc = u.get("cache_creation") or {}
-        cost += _calc_cost(int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+        out = max(int(u.get("output_tokens") or 0), chars.get(key, 0) // 4 + thinking.get(key, 0))
+        cost += _calc_cost(int(u.get("input_tokens") or 0), out,
                            int(u.get("cache_creation_input_tokens") or 0), int(u.get("cache_read_input_tokens") or 0),
                            str(m.get("model") or ""), int(cc.get("ephemeral_1h_input_tokens") or 0))
     return round(cost, 6)
@@ -1323,7 +1357,99 @@ def _orch_spawn(argv, cwd, stdin_text, base, popen=None, env=None):
     finally:
         fin.close(), fout.close(), ferr.close()
     _own_claude_pids.add(p.pid)
+    _orch_pid_register(p.pid)
     return p.pid
+
+
+# ── every AOC's workers, machine-wide ─────────────────────────────────────
+# The CLI count is every claude.exe on the PC minus the ones AOC itself
+# started. A preview's (or a reloaded monitor's earlier) workers aren't in
+# _own_claude_pids, and with current hooks they report to the AOC that
+# started them, so the live 5151 never even sees their sessions -- yet it
+# counted their claude.exe as yours. Each AOC lists its workers' pids in
+# <temp>/aoc-orch-pids/<port>.json; the count skips every listed pid.
+_ORCH_PID_TTL_S = 24 * 3600   # no worker lives this long: an older entry is a recycled pid
+
+
+def _orch_pid_dir():
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "aoc-orch-pids")
+
+
+def _orch_pid_entries(text, now):
+    """Pure: one registry file's text -> {pid: started} still within the TTL."""
+    try:
+        raw = json.loads(text or "{}")
+    except Exception:
+        return {}
+    out = {}
+    for k, v in (raw.items() if isinstance(raw, dict) else ()):
+        try:
+            pid, t = int(k), float(v)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0 and now - t < _ORCH_PID_TTL_S:
+            out[pid] = t
+    return out
+
+
+def _orch_pid_register(pid, now=None, folder=None, alive=None):
+    """Add a worker pid to this AOC's registry file, dropping dead ones."""
+    now = now or time.time()
+    folder = folder or _orch_pid_dir()
+    alive = alive or _orch_pid_alive_set
+    path = os.path.join(folder, f"{PORT}.json")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cur = _orch_pid_entries(f.read(), now)
+        except OSError:
+            cur = {}
+        live = alive()
+        if live is not None:
+            cur = {p: t for p, t in cur.items() if p in live}
+        cur[int(pid)] = now
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(p): t for p, t in cur.items()}, f)
+        _replace_with_retry(tmp, path)
+    except Exception as e:
+        _log_bg_error("orch_pid_register", e)
+
+
+def _orch_pid_alive_set():
+    """{pid} of running claude.exe processes, or None if it can't be read."""
+    procs = _snapshot_processes()
+    return None if procs is None else {pid for pid, exe in procs if exe == "claude.exe"}
+
+
+_orch_pid_cache = {"at": 0.0, "pids": frozenset()}
+
+
+def _orch_registry_pids(now=None, folder=None):
+    """Every pid any AOC on this PC lists as its Orchestrate worker (all
+    ports, this one too: it outlives a reload). Cached 5 s -- the CLI count
+    asks every 2 s."""
+    now = now or time.time()
+    if folder is None and now - _orch_pid_cache["at"] < 5:
+        return _orch_pid_cache["pids"]
+    folder = folder or _orch_pid_dir()
+    pids = set()
+    try:
+        names = [n for n in os.listdir(folder) if n.endswith(".json")]
+    except OSError:
+        names = []
+    for n in names:
+        try:
+            with open(os.path.join(folder, n), encoding="utf-8") as f:
+                pids.update(_orch_pid_entries(f.read(), now))
+        except OSError:
+            pass
+    out = frozenset(pids)
+    if folder == _orch_pid_dir():
+        _orch_pid_cache.update(at=now, pids=out)
+    return out
 
 
 def _orch_read_out(base):
@@ -2521,9 +2647,11 @@ def _orch_entity_load(conn, eid):
     return ent, dict(cfg, id=eid)
 
 
-def _orch_entity_event(conn, eid, kind, message="", cost=0.0, run_id="", now=None):
-    conn.execute("INSERT INTO entity_events (entity_id, ts, kind, message, cost_usd, run_id, user) VALUES (?,?,?,?,?,?,?)",
-                 (eid, now or time.time(), kind, str(message)[:2000], float(cost or 0), run_id, _orch_who()))
+def _orch_entity_event(conn, eid, kind, message="", cost=0.0, run_id="", now=None, est=False):
+    """est: the cost is an estimate (a scout killed before it reported what it spent)."""
+    conn.execute("INSERT INTO entity_events (entity_id, ts, kind, message, cost_usd, run_id, user, cost_est) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 (eid, now or time.time(), kind, str(message)[:2000], float(cost or 0), run_id, _orch_who(), 1 if est else 0))
 
 
 def _orch_entity_set(conn, eid, now=None, **fields):
@@ -2580,13 +2708,14 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
         if killed:   # killed before it reported a cost: what its output records (its budget if nothing can be read)
             res["cost"] = _orch_killed_cost(_ORCH_ENTITY_SCOUT_BUDGET, ent["job_base"])[0]
         _orch_entity_set(conn, eid, now=now, job_pid=None, job_base="", job_started=None, last_scout=now, run_now=0)
+        est = bool(killed)   # its cost is then an estimate: marked "~$x est." in the entity log
         if not res["ok"]:
-            _orch_entity_event(conn, eid, "scout_failed", _orch_explain_error(res["error"]), res["cost"], now=now)
+            _orch_entity_event(conn, eid, "scout_failed", _orch_explain_error(res["error"]), res["cost"], now=now, est=est)
             _orch_entity_set(conn, eid, now=now, state="idle", note="the scout failed: " + _orch_explain_error(res["error"])[:300])
             return
         d = res["data"]
         if d.get("action") != "run" or len(str(d.get("goal") or "").strip()) < 10:
-            _orch_entity_event(conn, eid, "idle", str(d.get("reason") or "")[:600], res["cost"], now=now)
+            _orch_entity_event(conn, eid, "idle", str(d.get("reason") or "")[:600], res["cost"], now=now, est=est)
             _orch_entity_set(conn, eid, now=now, state="idle", note="nothing to do: " + str(d.get("reason") or "")[:300])
             return
         body = {"goal": str(d["goal"]).strip()[:8000], "model": cfg["model"], "max_parallel": cfg["max_parallel"],
@@ -2595,11 +2724,11 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
         body.update({"workspace": cfg["workspace"]} if cfg["where"] == "workspace" else {"cwd": cfg["cwd"]})
         r = _orch_create(body, now=now, exe=exe, spawn=spawn, git=git, conn=conn)
         if not r.get("ok"):
-            _orch_entity_event(conn, eid, "start_failed", r.get("error", ""), res["cost"], now=now)
+            _orch_entity_event(conn, eid, "start_failed", r.get("error", ""), res["cost"], now=now, est=est)
             _orch_entity_set(conn, eid, now=now, state="idle", note="could not start a run: " + str(r.get("error"))[:300])
             return
         _orch_entity_event(conn, eid, "run_started", f"{body['goal'][:300]} -- {str(d.get('reason') or '')[:300]}",
-                           res["cost"], run_id=r["id"], now=now)
+                           res["cost"], run_id=r["id"], now=now, est=est)
         _orch_entity_set(conn, eid, now=now, state="running", note="")
         return
     active = next((r for r in runs if r["state"] in _ORCH_RUN_ACTIVE), None)
@@ -3443,7 +3572,7 @@ def _orch_entity_action(action, data, now=None):
                         ((_orch_parse(_orch_read_out(ent["job_base"]))["cost"] if ent.get("job_base") else 0.0), "")
                     _orch_entity_event(conn, eid, "scout_stopped", "paused while its scout was thinking -- no run is started"
                                        + (f" (stopped before it answered: {note})" if killed else ""),
-                                       cost, now=now)
+                                       cost, now=now, est=bool(killed))
                     fields.update(job_pid=None, job_base="", job_started=None, last_scout=now, run_now=0, note="")
                 _orch_entity_set(conn, eid, now=now, **fields)
                 _orch_entity_event(conn, eid, "paused" if on else "resumed", "", now=now)
