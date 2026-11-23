@@ -12,7 +12,7 @@ SCRATCH = tempfile.mkdtemp(prefix="aoc_test_backup_restore_")
 AOC_DIR = SCRATCH
 DB_FILE = os.path.join(SCRATCH, "history.db")
 
-ns = exec_functions(["_list_backups", "_restore_backup"], {
+ns = exec_functions(["_list_backups", "_restore_backup", "_BACKUP_PATTERNS"], {
     "os": os, "sqlite3": sqlite3, "glob": __import__("glob"),
     "AOC_DIR": AOC_DIR, "DB_FILE": DB_FILE,
     "_db_lock": threading.Lock(), "datetime": datetime,

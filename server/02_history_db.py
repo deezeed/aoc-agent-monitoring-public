@@ -1216,6 +1216,83 @@ _db_prune_old()
 _prune_old_logs()
 
 _BACKUP_RETENTION_DAYS = 14
+# Everything backups/ holds: history.db, orchestration.db and a zip of the
+# JSON settings (_backup_state). /backups lists these, retention prunes them.
+_BACKUP_PATTERNS = ("history_*.db", "orchestration_*.db", "state_*.zip")
+# JSON state in AOC_DATA_DIR worth a daily copy: people, house rules, your
+# prompts/clients/caps/guard rules, push/recap/voice prefs, worktrees.
+# Never secrets: push_vapid.json (private key), aoc_token.txt, the license.
+# users.json holds only token hashes. Caches/logs are left out on purpose.
+_BACKUP_STATE_FILES = ("users.json", "orch_settings.json", "prompts.json", "clients.json", "budget_caps.json",
+                       "danger_guard.json", "push.json", "recap.json", "voice.json", "worktrees.json")
+# ...plus these two that live in AOC_DIR.
+_BACKUP_STATE_AOC_FILES = ("aoc_notify_settings.json", "aoc_webhook_settings.json")
+
+
+def _snapshot_sqlite(src, backup_path) -> bool:
+    """Copy the open sqlite connection `src` to backup_path with sqlite's
+    own .backup() (a raw copy mid-write can tear), then integrity_check the
+    copy: a completed .backup() only means it didn't raise. A copy that
+    fails the check is renamed *_CORRUPT.db (kept as evidence) -> False."""
+    dst = sqlite3.connect(backup_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+    try:
+        check_conn = sqlite3.connect(backup_path)
+        try:
+            result = check_conn.execute("PRAGMA integrity_check").fetchall()
+        finally:
+            check_conn.close()
+    except Exception:
+        result = None
+    if result == [("ok",)]:
+        return True
+    try:
+        os.replace(backup_path, backup_path[:-3] + "_CORRUPT.db")
+    except Exception:
+        pass
+    return False
+
+
+def _backup_state():
+    """Daily snapshot of what history.db's backup never covered (audit
+    FIND-009): orchestration.db (runs, agent library, entities, schedules,
+    entity memory) -> orchestration_<day>.db, and the JSON settings ->
+    state_<day>.zip. Same folder, schedule and retention as history.db.
+    Runs from _backup_worker after every part is loaded; ORCH_DB comes
+    from a later part, hence globals().get."""
+    import zipfile
+    try:
+        backup_dir = os.path.join(AOC_DIR, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        day = datetime.now().strftime('%Y-%m-%d')
+        orch_db = globals().get("ORCH_DB") or os.path.join(AOC_DATA_DIR, "orchestration.db")
+        if os.path.isfile(orch_db):
+            # No _orch_lock: a one-step .backup() reads under sqlite's own
+            # shared lock, so it is consistent without stalling a run tick.
+            src = sqlite3.connect(orch_db, timeout=30)
+            try:
+                ok = _snapshot_sqlite(src, os.path.join(backup_dir, f"orchestration_{day}.db"))
+            finally:
+                src.close()
+            if not ok:
+                _show_native_toast("AOC Backup", "Orchestration DB backup failed integrity check -- see backups/ folder",
+                                   kind="backup")
+        files = ([os.path.join(AOC_DATA_DIR, n) for n in _BACKUP_STATE_FILES]
+                 + [os.path.join(AOC_DIR, n) for n in _BACKUP_STATE_AOC_FILES])
+        files = [f for f in files if os.path.isfile(f)]
+        if files:
+            zip_path = os.path.join(backup_dir, f"state_{day}.zip")
+            tmp = zip_path + ".tmp"
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+                for f in files:
+                    z.write(f, os.path.basename(f))
+            os.replace(tmp, zip_path)
+    except Exception as e:
+        _log_bg_error("_backup_state", e)
+
 
 def _backup_history_db():
     """history.db moved off OneDrive into %LOCALAPPDATA% (2026-07-16, to fix
@@ -1234,35 +1311,20 @@ def _backup_history_db():
         backup_path = os.path.join(backup_dir, f"history_{datetime.now().strftime('%Y-%m-%d')}.db")
         with _db_lock:
             src = _db_conn()
-            dst = sqlite3.connect(backup_path)
-            src.backup(dst)
-            dst.close()
-            src.close()
-        # A completed .backup() call only means the copy operation didn't
-        # raise -- it doesn't guarantee the result is actually restorable.
-        # Verify with SQLite's own integrity_check rather than trusting a
-        # silently-corrupt backup nobody would notice until they needed it.
-        try:
-            check_conn = sqlite3.connect(backup_path)
-            result = check_conn.execute("PRAGMA integrity_check").fetchall()
-            check_conn.close()
-            if result != [("ok",)]:
-                corrupt_path = backup_path[:-3] + "_CORRUPT.db"
-                try:
-                    os.replace(backup_path, corrupt_path)
-                except Exception:
-                    pass
-                # Deliberate exception to "toasts are for agent status only"
-                # (the only other caller is _headless_notify_worker) -- a
-                # trusted-but-corrupt backup is worse than no backup, and
-                # this is exactly the rare/important class of event native
-                # toasts exist for. If _show_native_toast isn't defined yet
-                # (module still loading when this runs at startup, extremely
-                # unlikely given how rare an actual corruption is), the outer
-                # except below absorbs it same as any other failure here.
-                _show_native_toast("AOC Backup", "History DB backup failed integrity check -- see backups/ folder", kind="backup")
-        except Exception:
-            pass
+            try:
+                ok = _snapshot_sqlite(src, backup_path)
+            finally:
+                src.close()
+        if not ok:
+            # Deliberate exception to "toasts are for agent status only"
+            # (the only other caller is _headless_notify_worker) -- a
+            # trusted-but-corrupt backup is worse than no backup, and
+            # this is exactly the rare/important class of event native
+            # toasts exist for. If _show_native_toast isn't defined yet
+            # (module still loading when this runs at startup, extremely
+            # unlikely given how rare an actual corruption is), the outer
+            # except below absorbs it same as any other failure here.
+            _show_native_toast("AOC Backup", "History DB backup failed integrity check -- see backups/ folder", kind="backup")
         # globals().get(...) rather than a direct _notify_settings reference:
         # _backup_worker's thread (started right below, at module load) can
         # reach this line before _notify_settings is even defined further
@@ -1284,8 +1346,9 @@ def _backup_history_db():
         cutoff = time.time() - retention_days * 86400
         # -journal: left behind when a backup was interrupted mid-copy; the
         # .db pattern alone never matched them, so they piled up forever.
-        for p in (glob.glob(os.path.join(backup_dir, "history_*.db"))
-                  + glob.glob(os.path.join(backup_dir, "history_*.db-journal"))):
+        # orchestration_*/state_*: _backup_state's snapshots, same retention.
+        for p in [p for pat in _BACKUP_PATTERNS + ("history_*.db-journal", "orchestration_*.db-journal")
+                  for p in glob.glob(os.path.join(backup_dir, pat))]:
             if "_CORRUPT.db" in p:
                 continue  # keep corrupt backups for inspection, don't auto-delete the evidence
             try:
@@ -1321,6 +1384,7 @@ def _backup_worker():
     time.sleep(_first_backup_delay(time.time(), mtime))
     while True:
         _backup_history_db()
+        _backup_state()
         time.sleep(_BACKUP_INTERVAL_S)  # hourly; dated filename means only today's snapshot actually changes
 
 threading.Thread(target=_backup_worker, daemon=True).start()
@@ -1339,14 +1403,16 @@ def _list_backups() -> list:
     backup_dir = os.path.join(AOC_DIR, "backups")
     out = []
     try:
-        for p in sorted(glob.glob(os.path.join(backup_dir, "history_*.db")), reverse=True):
-            name = os.path.basename(p)
-            out.append({
-                "filename": name,
-                "size_bytes": os.path.getsize(p),
-                "mtime": os.path.getmtime(p),
-                "corrupt": name.endswith("_CORRUPT.db"),
-            })
+        for pat in _BACKUP_PATTERNS:
+            for p in sorted(glob.glob(os.path.join(backup_dir, pat)), reverse=True):
+                name = os.path.basename(p)
+                out.append({
+                    "filename": name,
+                    "kind": name.split("_", 1)[0],
+                    "size_bytes": os.path.getsize(p),
+                    "mtime": os.path.getmtime(p),
+                    "corrupt": name.endswith("_CORRUPT.db"),
+                })
     except Exception:
         pass
     return out
@@ -1363,7 +1429,13 @@ def _restore_backup(filename: str) -> dict:
     backup_dir = os.path.join(AOC_DIR, "backups")
     # filename is a POST body value, not a trusted internal path -- reject
     # anything that isn't a bare filename already sitting in backups/.
-    if os.path.basename(filename) != filename or not filename.startswith("history_"):
+    if os.path.basename(filename) != filename:
+        return {"ok": False, "error": "invalid filename"}
+    if filename.startswith("orchestration_") and filename.endswith(".db"):
+        return _orch_restore_backup(filename)
+    if filename.startswith("state_") and filename.endswith(".zip"):
+        return _restore_state(filename)
+    if not filename.startswith("history_"):
         return {"ok": False, "error": "invalid filename"}
     if filename.endswith("_CORRUPT.db"):
         return {"ok": False, "error": "refusing to restore a backup that failed its own integrity check"}
@@ -1394,6 +1466,43 @@ def _restore_backup(filename: str) -> dict:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+def _restore_state(filename: str) -> dict:
+    """Put the JSON settings from backups/state_<day>.zip back. Only names
+    on the _BACKUP_STATE_* lists are written (a zip entry can't pick its own
+    path), each must parse as JSON, and the current files go to
+    state_PRE_RESTORE_<ts>.zip first. Settings are read at startup, so AOC
+    must restart to use them."""
+    import zipfile
+    backup_dir = os.path.join(AOC_DIR, "backups")
+    src_path = os.path.join(backup_dir, filename)
+    if not os.path.isfile(src_path):
+        return {"ok": False, "error": "backup file not found"}
+    targets = {n: os.path.join(AOC_DATA_DIR, n) for n in _BACKUP_STATE_FILES}
+    targets.update({n: os.path.join(AOC_DIR, n) for n in _BACKUP_STATE_AOC_FILES})
+    try:
+        with zipfile.ZipFile(src_path) as z:
+            data = {n: z.read(n) for n in z.namelist() if n in targets}
+        for raw in data.values():
+            json.loads(raw.decode("utf-8"))  # a broken file must not replace a good one
+    except Exception as e:
+        return {"ok": False, "error": f"unreadable backup: {e}"}
+    if not data:
+        return {"ok": False, "error": "backup holds no settings files"}
+    pre_name = f"state_PRE_RESTORE_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.zip"
+    try:
+        with zipfile.ZipFile(os.path.join(backup_dir, pre_name), "w", zipfile.ZIP_DEFLATED) as z:
+            for n, path in targets.items():
+                if os.path.isfile(path):
+                    z.write(path, n)
+        for n, raw in data.items():
+            tmp = targets[n] + ".restore.tmp"
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.replace(tmp, targets[n])
+    except Exception as e:
+        return {"ok": False, "error": str(e), "pre_restore_backup": pre_name}
+    return {"ok": True, "pre_restore_backup": pre_name, "restored": sorted(data), "restart_needed": True}
+
 def _get_diag_info() -> dict:
     """Self-diagnostics for AOC itself -- uptime/DB size/thread count/memory/
     backup status. Nothing tracked any of this before; useful for debugging
@@ -1419,8 +1528,8 @@ def _get_diag_info() -> dict:
         pass
     try:
         backup_dir = os.path.join(AOC_DIR, "backups")
+        info["backups_count"] = sum(len(glob.glob(os.path.join(backup_dir, pat))) for pat in _BACKUP_PATTERNS)
         files = sorted(glob.glob(os.path.join(backup_dir, "history_*.db")))
-        info["backups_count"] = len(files)
         if files:
             latest = files[-1]
             info["backups_latest"] = os.path.basename(latest)

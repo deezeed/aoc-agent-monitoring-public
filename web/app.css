@@ -2489,6 +2489,12 @@ body.light .hg-tab.active, body.light .viz-tab.active { color:var(--c);backgroun
 .or-metrics b { font:700 13px var(--font2);color:var(--t); }
 .or-metrics span { font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:var(--t3); }
 .or-report { border-left:3px solid var(--g);padding:4px 10px;margin:10px 0; }
+.or-verify { border-left:3px solid var(--g);padding:4px 10px;margin:10px 0;font-size:12px;display:flex;flex-wrap:wrap;align-items:center;gap:6px; }
+.or-verify.bad { border-left-color:var(--r); }
+.or-verify code { word-break:break-all; }
+.or-verify details { flex-basis:100%; }
+.or-verify pre { white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--t2);margin:4px 0;font-family:var(--font2);max-height:300px;overflow:auto; }
+.or-verify-in { flex:1;min-width:0;font-family:var(--font2); }
 .or-report h3 { margin:0 0 4px; }
 .or-report pre, .or-out pre, .or-instr pre { white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--t2);margin:4px 0;font-family:var(--font2);max-height:360px;overflow:auto; }
 .or-waves { display:flex;flex-direction:column;gap:10px;margin-top:10px; }

@@ -15,7 +15,7 @@ spawned = []
 ns = exec_functions(["_restart_blockers", "_restart_aoc"],
                     {"os": os, "sys": sys, "AOC_DIR": "C:\\aoc", "_perm_requests": {}, "_tunnel_status": ["off"],
                      "_update_job": {"state": "idle"}, "_hooks_health": {"repairing": False},
-                     "_release_job": {"state": "idle"}})
+                     "_release_job": {"state": "idle"}, "_orch_stepping": [0]})
 r = ns["_restart_aoc"](spawn=lambda args, cwd: spawned.append((args, cwd)))
 c.check("nothing held -> restarts", r == {"ok": True, "blockers": []} and len(spawned) == 1)
 args, cwd = spawned[0]
@@ -32,6 +32,14 @@ r = ns["_restart_aoc"](spawn=lambda a, w: spawned.append(a))
 c.check("held prompt -> asks first, nothing spawned", r == {"ok": False, "blockers": ["1 prompt(s) waiting for your OK"]} and not spawned)
 r = ns["_restart_aoc"](force=True, spawn=lambda a, w: spawned.append(a))
 c.check("force -> restarts anyway, still reports what it dropped", r["ok"] and r["blockers"] and len(spawned) == 1)
+ns["_perm_requests"].clear()
+spawned.clear()
+ns["_orch_stepping"][0] = 1_800_000_000.0
+r = ns["_restart_aoc"](spawn=lambda a, w: spawned.append(a))
+c.check("Orchestrate step in progress -> waits, nothing spawned",
+        r == {"ok": False, "blockers": ["Orchestrate is starting agents"]} and not spawned)
+ns["_orch_stepping"][0] = 0
+c.check("step done -> restarts", ns["_restart_aoc"](spawn=lambda a, w: spawned.append(a))["ok"] and len(spawned) == 1)
 
 src = read_monitor_source()
 seg = src[src.index('elif path_no_qs == "/restart":'):]

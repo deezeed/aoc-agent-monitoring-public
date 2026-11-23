@@ -40,7 +40,8 @@ c.check("every type has a group, label, channels and a 2-part sample",
 c.check("webhook channel <-> webhook key", all(("webhook" in t["channels"]) == bool(t.get("webhook")) for t in TYPES))
 c.check("channels are known ones", all(set(t["channels"]) <= {"toast", "push", "webhook"} for t in TYPES))
 src = read_monitor_source()
-used = set(re.findall(r'kind="([a-z_]+)"', src))
+# a notification's kind= argument, not another name ending in it (job_kind="verify" is orchestration's)
+used = set(re.findall(r'(?<![A-Za-z0-9_])kind="([a-z_]+)"', src))
 c.check("every kind= used in monitor.py is in the table", used <= set(keys))
 c.check("webhook keys are all known to _sanitize_webhook_events",
         all(t["webhook"] in ns["_sanitize_webhook_events"]({t["webhook"]: True}) for t in TYPES if t.get("webhook")))

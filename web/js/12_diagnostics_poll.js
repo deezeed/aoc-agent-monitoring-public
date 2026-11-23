@@ -21,7 +21,8 @@ async function renderDiag(){
                                             fetch('/release/status').then(r=>r.json()).catch(()=>null)]);
     const backupRows=(backups||[]).map(b=>`
       <div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.05);font-family:var(--font2);font-size:10px">
-        <span style="flex:1;color:${b.corrupt?'var(--r)':'var(--t2)'}">${escHtml(b.filename)}${b.corrupt?' ⚠ CORRUPT':''}</span>
+        <span style="width:92px;color:var(--t3)">${escHtml(_backupKind(b.filename).label)}</span>
+        <span style="flex:1;min-width:0;overflow-wrap:anywhere;color:${b.corrupt?'var(--r)':'var(--t2)'}">${escHtml(b.filename)}${b.corrupt?' ⚠ CORRUPT':''}</span>
         <span style="color:var(--t3)">${fmtBytes(b.size_bytes)}</span>
         <span style="color:var(--t3)">${fmtDate(b.mtime)}</span>
         ${b.corrupt?'':`<button class="adp-btn" onclick="_restoreBackup(${jsq(b.filename)})" style="font-size:9px;padding:2px 10px;color:var(--r)">RESTORE</button>`}
@@ -47,7 +48,7 @@ async function renderDiag(){
         <div class="hist-kpi"><div class="hk-val">${d.backups_count??'—'}</div><div class="hk-lbl">Backups</div></div>
       </div>
       <div style="font-size:9px;font-family:var(--font2);color:var(--t3);margin-bottom:6px">
-        Restoring overwrites the live history.db (this only affects Session History/Analytics, not the live dashboard). A safety copy of whatever's currently live is taken automatically first.
+        Daily snapshots of history.db, orchestration.db (runs, agent library, entities, schedules) and your settings. Restoring overwrites the live copy; a safety copy of whatever's currently live is taken automatically first.
       </div>
       <div id="backup-restore-msg" style="font-size:10px;font-family:var(--font2);margin-bottom:6px"></div>
       ${backupRows||'<div style="font-size:10px;color:var(--t3);font-family:var(--font2)">// no backups yet</div>'}
@@ -292,16 +293,30 @@ async function _restartAoc(){
   say('✗ AOC did not come back within 2 min -- run python setup.py --restart in the AOC folder','var(--r)');
 }
 
+/* Pure: what a backups/ file holds -> row label, restore confirm text and
+   the noun for the result message (history_ / orchestration_ / state_). */
+function _backupKind(filename){
+  const f=String(filename||'');
+  if(f.startsWith('orchestration_')) return {label:'Orchestrate', what:'orchestration.db',
+    confirm:`Restore orchestration.db from "${f}"?\n\nRuns, agent library, entities and schedules go back to that day. The current database is safety-copied first. Refused while a run, agent or scout is working.`};
+  if(f.startsWith('state_')) return {label:'Settings', what:'settings',
+    confirm:`Restore settings from "${f}"?\n\nPeople, house rules, prompts, clients, budget caps, danger-guard rules, notification/webhook/push/voice settings go back to that day. The current files are safety-copied first. Restart AOC afterwards to use them.`};
+  return {label:'History', what:'history.db',
+    confirm:`Restore history.db from "${f}"?\n\nThe current database will be safety-copied first, then overwritten. This affects Session History/Analytics only, not the live dashboard.`};
+}
 async function _restoreBackup(filename){
-  if(!confirm(`Restore history.db from "${filename}"?\n\nThe current database will be safety-copied first, then overwritten. This affects Session History/Analytics only, not the live dashboard.`)) return;
+  const kind=_backupKind(filename);
+  if(!confirm(kind.confirm)) return;
   const msgEl=document.getElementById('backup-restore-msg');
   if(msgEl){ msgEl.style.color='var(--t3)'; msgEl.textContent='Restoring…'; }
   try{
     const r=await fetch('/restore_backup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename})});
     const result=await r.json();
     if(result.ok){
-      if(msgEl){ msgEl.style.color='var(--g)'; msgEl.textContent=`✓ Restored from ${filename} (previous DB saved as ${result.pre_restore_backup})`; }
-      log(`Restored history.db from ${filename}`,'success');
+      if(msgEl){ msgEl.style.color='var(--g)'; msgEl.textContent=`✓ Restored ${kind.what} from ${filename}`+
+        (result.pre_restore_backup?` (previous copy saved as ${result.pre_restore_backup})`:'')+
+        (result.restart_needed?' -- click Restart AOC above to use them':''); }
+      log(`Restored ${kind.what} from ${filename}`,'success');
     } else {
       if(msgEl){ msgEl.style.color='var(--r)'; msgEl.textContent=`✗ ${result.error||'restore failed'}`; }
       log('Restore failed: '+(result.error||'unknown error'),'error');

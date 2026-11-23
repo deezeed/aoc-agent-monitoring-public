@@ -911,7 +911,7 @@ def _restart_aoc(force=False, blockers=None, spawn=None) -> dict:
     AOC process, starts the watchdog task again). Held prompts / an open
     tunnel / an update on its way are named first unless force."""
     blockers = _restart_blockers(_perm_requests, _tunnel_status[0], _update_job.get("state"), _hooks_health["repairing"],
-                                 _release_job.get("state")) if blockers is None else blockers
+                                 _release_job.get("state"), bool(_orch_stepping[0])) if blockers is None else blockers
     if blockers and not force:
         return {"ok": False, "blockers": blockers}
     py = os.path.join(os.path.dirname(sys.executable), "python.exe")
@@ -1035,15 +1035,20 @@ _threading.Thread(target=_selfupdate_worker, daemon=True).start()
 # Code hook request open, and a restart would drop it -- the hook then fails
 # open and the command runs unapproved -- so those block the restart.
 
-def _restart_blockers(perm_requests, tunnel_state, update_state=None, repairing=False, release_state=None) -> list:
+def _restart_blockers(perm_requests, tunnel_state, update_state=None, repairing=False, release_state=None,
+                      orch_step=False) -> list:
     """Pure: reasons not to restart right now (empty = safe). An open remote
     tunnel blocks too: the restart would cut the phone off mid-use, and so
     does a one-click update on its way (the installer restarts AOC itself)
     and a hook repair (taskkill /F of this process takes setup.py with it,
     so Repair silently did nothing when a code reload landed mid-run). Same
     for Health's Publish release / Sync public mirror: killed half-way, a
-    release could exist without its asset, or a mirror commit go unpushed."""
+    release could exist without its asset, or a mirror commit go unpushed.
+    And an Orchestrate step: it creates worktrees and starts agents (a kill
+    there is recovered, but waiting a few seconds is cheaper)."""
     out = []
+    if orch_step:
+        out.append("Orchestrate is starting agents")
     if repairing:
         out.append("hook repair running")
     if release_state == "running":

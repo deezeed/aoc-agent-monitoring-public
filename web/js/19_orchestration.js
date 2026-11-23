@@ -10,7 +10,7 @@ var _orTimer=null;
 var _OR_STATES={scheduled:['Scheduled','muted'], planning:['Planning','run'], plan_ready:['Plan ready — needs your OK','wait'], running:['Running','run'],
   supervising:['Reviewing results','run'], review:['Done — review & merge','wait'], merged:['Merged','done'],
   discarded:['Discarded','muted'], cancelled:['Cancelled','muted'], failed:['Failed','err']};
-var _OR_TASK_STATES={pending:['waiting','muted'], running:['running','run'], done:['done','done'], failed:['failed','err'],
+var _OR_TASK_STATES={pending:['waiting','muted'], starting:['starting','run'], running:['running','run'], done:['done','done'], failed:['failed','err'],
   blocked:['blocked','err'], skipped:['skipped','muted'], gate:['waits for your OK','wait']};
 var _OR_MERGE_STATES={merged:['merged','done'], conflict:['conflict','err'], blocked:['waits on a conflict','wait'], left_out:['left out','muted']};
 var _OR_ROLES={research:'Research', analyst:'Analyst', developer:'Developer', qa:'QA', manager:'Manager'};
@@ -40,7 +40,7 @@ function _orMergeChip(ms, workspace){
 
 /* The form's values live here (a refresh redraws the view: typed text must survive it). */
 function _orFormDefaults(){ return {goal:'', cwd:'', where:'repo', workspace:'', model:'opus', par:3, budget:5, mode:'flat', teams:false, team:null,
-  when:'now', at:'', rtype:'daily', rat:'08:00', rhours:24, bday:10, bmonth:100, auto:false}; }
+  when:'now', at:'', rtype:'daily', rat:'08:00', rhours:24, bday:10, bmonth:100, auto:false, verify:''}; }
 /* Pure: a repeating run (GET /orch/schedules) as the form's values, to edit it (sch_id = which one;
    where it works stays -- shown, not editable). An empty team = the built-ins, as when it was made. */
 function _orFormFromSchedule(s){
@@ -49,7 +49,7 @@ function _orFormFromSchedule(s){
     where:cfg.workspace?'workspace':'repo', workspace:cfg.workspace||'', model:cfg.model||'opus', par:Number(cfg.max_parallel)||3,
     budget:Number(cfg.budget_usd)||5, mode:cfg.mode||'flat', teams:!!cfg.approve_teams, team:(cfg.team||[]).length?cfg.team.slice():null,
     when:'repeat', rtype:sc.type||'daily', rat:sc.at||'08:00', rhours:Number(sc.hours)||24,
-    bday:Number(cfg.budget_day)||10, bmonth:Number(cfg.budget_month)||100, auto:!!cfg.auto_approve});
+    bday:Number(cfg.budget_day)||10, bmonth:Number(cfg.budget_month)||100, auto:!!cfg.auto_approve, verify:cfg.verify||''});
 }
 /* Pure: what saving an edited schedule said (POST /orch/schedule_save {id, ...} -> {changed, next_due}). */
 function _orScheduleSavedText(r){
@@ -140,12 +140,35 @@ function _orFormHtml(dirs, open, f, agents, workspaces){
           <input type="checkbox" id="or-teams"${f.teams?' checked':''} onchange="_orFormSet('teams',this.checked)"> also approve each team's plan</label>`:''}
       </div>
       ${picker?`<div class="or-team-row"><span class="ln-lbl">Team</span>${picker}${team.length?'':'<span class="or-errs">pick at least one agent</span>'}</div>`:''}
+      ${_orVerifyInputHtml(f.verify, "_orFormSet('verify',this.value)", 'or-verify')}
       ${_orWhenHtml(f)}
       <div class="ln-row"><span class="or-note">${f.when==='repeat'&&f.auto?'Each run approves its own plan.':'Nothing runs before you approve the plan.'} Agents work in their own git worktrees off the repo's last commit; you approve the merge at the end. Agents are billed like any <code>claude -p</code> run; agents with MCP services run on your Claude subscription.</span>
         <span class="ln-err" id="or-err"></span>${ed?'<button type="button" class="adp-btn" onclick="_orScheduleEditCancel()">Cancel</button>':''}<button type="submit" class="adp-btn ln-go"${picker&&!team.length?' disabled':''}>${ed?'Save changes':f.when==='later'?'Schedule it':f.when==='repeat'?'Save the schedule':'Plan it'}</button></div>
     </form></details>`;
 }
 function _orClipText(s, n){ s=String(s||''); return s.length>n?s.slice(0,n)+'…':s; }
+/* Pure: the "Check command" field (new run / schedule / entity). */
+function _orVerifyInputHtml(value, oninput, id){
+  return `<div class="ln-row"><label class="ln-lbl" for="${id}">Check command</label>
+      <input id="${id}" class="settings-input or-verify-in" placeholder="optional, e.g. python -m pytest -q  or  npm test" autocomplete="off" value="${escHtml(value||'')}" oninput="${oninput}"></div>
+    <span class="or-note">AOC runs it itself on the finished work (all tasks merged, in a throwaway folder) before the review: exit 0 = passes. The orchestrator sees the result, and so do you before merging. It runs on this PC with your rights.</span>`;
+}
+var _OR_VERIFY={pass:['Check passed','done'], fail:['Check failed','err'], timeout:['Check timed out','err'],
+  conflict:['Check not run: the tasks conflict','err'], skipped:['Check not run: nothing changed','muted'], error:['Check could not run','err']};
+/* Pure: the run's check -- running, or its last result with the end of its output (open when it didn't pass). */
+function _orVerifyHtml(r){
+  if(!r||!r.verify) return '';
+  const cmd=`<code>${escHtml(r.verify)}</code>`;
+  if(r.job_kind==='verify') return `<div class="or-verify"><span class="or-chip or-c-run">Checking</span> ${cmd} <span class="or-note">· on all done tasks' work merged, before the review</span></div>`;
+  if(!r.verify_state) return `<div class="or-verify"><span class="or-chip or-c-muted">Check</span> ${cmd} <span class="or-note">· runs when the tasks are done</span></div>`;
+  const [label,cls]=_OR_VERIFY[r.verify_state]||[r.verify_state,'muted'];
+  const bad=['fail','timeout','conflict','error'].includes(r.verify_state);
+  const meta=(r.verify_code!=null&&r.verify_state!=='pass'?` · exit ${r.verify_code}`:'')+(r.verify_secs!=null?` · ${_fmtDurShort(Math.round(r.verify_secs))}`:'')
+    +(Number(r.verify_round)>0?` · review round ${Number(r.verify_round)+1}`:'');
+  const tail=String(r.verify_tail||'').trim();
+  return `<div class="or-verify${bad?' bad':''}"><span class="or-chip or-c-${cls}">${escHtml(label)}</span> ${cmd}<span class="or-note">${escHtml(meta)}</span>
+    ${tail?`<details class="or-log" data-k="verify"${bad?' open':''}><summary>Output (end)</summary><pre>${escHtml(tail)}</pre></details>`:''}</div>`;
+}
 function _orTeamToggle(id, on){
   const f=_orState.form, team=_orTeamOf(f, _orState.agents).filter(x=>x!==id);
   f.team=on?team.concat([id]):team;
@@ -477,7 +500,8 @@ function _orDetailHtml(v, editing, cmp, judging, commits){
       ${v.estimate.from_history?`(from your past tasks of the same agents and models${v.estimate.guessed?`; ${v.estimate.guessed} task(s) without history guessed at half their budget`:''})`:'(no history yet: half of each budget, 3 min per task)'}</div>`:''}
     ${r.state==='scheduled'?`<div class="or-note">Starts ${escHtml(_orWhen(r.start_at))} — the ${lead} plans it then, on the repo as it is at that time; you approve the plan.</div>`:''}
     ${r.state==='planning'?`<div class="or-note">The ${lead} is reading the repo and writing the plan…</div>`:''}
-    ${r.state==='supervising'?`<div class="or-note">The ${lead} is reviewing the results…</div>`:''}
+    ${r.state==='supervising'&&r.job_kind!=='verify'?`<div class="or-note">The ${lead} is reviewing the results…</div>`:''}
+    ${_orVerifyHtml(r)}
     ${r.state==='plan_ready'&&planned>r.budget_usd*0.85+1e-9?`<div class="or-warn">The tasks' budgets (${_orMoney(planned)}) are over 85% of the run's ${_orMoney(r.budget_usd)} — tasks that would go over it are skipped. Raise the run budget or lower theirs.</div>`:''}
     ${r.error?`<div class="or-warn">${escHtml(r.error)}</div>`:''}
     ${mstat&&!r.parent_id?_orMergeHtml(v):''}
@@ -520,13 +544,13 @@ function _orEntityCardHtml(e, agents){
   const evs=(e.events||[]).slice().reverse().slice(0,30).map(x=>`<div class="or-ev"><span>${_orWhen(x.ts)}</span><b>${escHtml(x.kind.replace(/_/g,' '))}</b> ${escHtml(x.message||'')}${x.user?` <i>— ${escHtml(x.user)}</i>`:''}${x.cost_usd?` <i>${_orCost(x.cost_usd,x.cost_est)}</i>`:''}</div>`).join('');
   return `<div class="or-ent or-ent-${escHtml(e.state)}">
     <div class="or-ent-h"><span class="or-chip or-c-${cls}">${escHtml(label)}</span><b>${escHtml(cfg.name)}</b>
-      <span class="or-note">${escHtml(where)} · ${escHtml(_orScheduleText(cfg))}</span></div>
+      <span class="or-note">${escHtml(where)} · ${escHtml(_orScheduleText(cfg))} · ${cfg.autonomy==='propose'?'plans wait for you':'approves its plans'}</span></div>
     <div class="or-ent-mission">${escHtml(_orClipText(cfg.mission,260))}</div>
     <div class="or-ent-team">${names.map(n=>`<span class="or-chip or-c-muted">${escHtml(n)}</span>`).join(' ')}</div>
     <div class="or-ent-buds">${_orBudgetBar('today',e.spend_day,cfg.budget_day)}${_orBudgetBar('month',e.spend_month,cfg.budget_month)}<span class="or-note">≤ ${_orMoney(cfg.budget_run)} per run</span></div>
-    ${e.note?`<div class="${e.state==='waiting'?'or-warn':'or-note'}">${escHtml(e.note)}</div>`:''}
+    ${e.note?`<div class="${['waiting','waiting_you'].includes(e.state)?'or-warn':'or-note'}">${escHtml(e.note)}</div>`:''}
     ${!e.paused&&e.next_due&&['idle','waiting'].includes(e.state)?`<div class="or-note">Next look: ${_orWhen(e.next_due)}</div>`:''}
-    ${e.state==='waiting_you'?'<div class="or-warn">A run waits for your merge / accept below.</div>':''}
+    ${e.state==='waiting_you'&&!e.note?'<div class="or-warn">A run waits for your merge / accept below.</div>':''}
     <div class="or-actions">
       <button class="adp-btn ln-go" onclick="_orEntityAct('run',${id})"${['scouting','running','waiting_you'].includes(e.state)?' disabled':''} title="Let it look for work now (even when paused)">Run now</button>
       <button class="adp-btn" onclick="_orEntityAct('pause',${id},${e.paused?'false':'true'})">${e.paused?'Resume':'Pause'}</button>
@@ -539,7 +563,7 @@ function _orEntityCardHtml(e, agents){
 /* Pure: a new / existing entity as an editable draft. */
 function _orEntityDraftOf(e){
   if(!e) return {old_id:'', name:'', mission:'', where:'workspace', cwd:'', workspace:'', team:null, model:'opus', mode:'flat',
-    max_parallel:2, budget_run:3, budget_day:10, budget_month:100, schedule:{type:'manual'}, loop:false, cooldown_min:10};
+    max_parallel:2, budget_run:3, budget_day:10, budget_month:100, schedule:{type:'manual'}, loop:false, cooldown_min:10, autonomy:'propose'};
   return Object.assign(JSON.parse(JSON.stringify(e.config)), {old_id:e.id});
 }
 /* Pure: the entity editor. */
@@ -559,12 +583,14 @@ function _orEntityEditorHtml(d, agents, workspaces){
         :`<input class="settings-input or-en-cwd" placeholder="C:\\path\\to\\repo" value="${escHtml(d.cwd||'')}" oninput="_orEntitySet('cwd',this.value)">`}</div>
     <div class="or-team-row"><span class="ln-lbl">Team</span>${(agents||[]).map(a=>`<label class="ln-chk or-team-pick"><input type="checkbox"${team.includes(a.id)?' checked':''} onchange="_orEntityTeam(${jsq(a.id)},this.checked)"> ${escHtml(a.name)}</label>`).join('')}</div>
     <div class="ln-row">${num('budget_run','$ per run',0.5,20,0.5)}${num('budget_day','$ per day',0.5,200,1)}${num('budget_month','$ per month',1,2000,5,90)}</div>
+    ${_orVerifyInputHtml(d.verify, "_orEntitySet('verify',this.value)", 'or-en-verify')}
     <div class="ln-row"><label class="ln-lbl">Acts</label><select class="settings-input" onchange="_orEntitySched('type',this.value)">${opt(s.type,[['manual','When I say (Run now)'],['every','Every N hours'],['daily','Daily at'],['weekdays','On weekdays at']])}</select>
       ${s.type==='every'?`<input class="settings-input" type="number" min="0.5" max="168" step="0.5" value="${Number(s.hours)||24}" style="width:70px" oninput="_orEntitySched('hours',+this.value)"> <span class="or-note">hours</span>`:''}
       ${s.type==='daily'||s.type==='weekdays'?`<input class="settings-input" type="time" value="${escHtml(s.at||'08:00')}" oninput="_orEntitySched('at',this.value)">`:''}
       <label class="ln-chk"><input type="checkbox"${d.loop?' checked':''} onchange="_orEntitySet('loop',this.checked,true)"> and again after each run</label>
       ${d.loop?num('cooldown_min','min later',1,1440,1,70):''}</div>
-    <div class="or-note">It approves its own plans within the per-run budget; merging / accepting results always waits for you. New entities start paused.</div>
+    <div class="ln-row"><label class="ln-lbl">Plans</label><select class="settings-input" onchange="_orEntitySet('autonomy',this.value,true)">${opt(d.autonomy||'execute',[['propose','Wait for my approval'],['execute','It approves them itself, within $ per run']])}</select></div>
+    <div class="or-note">${d.autonomy==='propose'?'Each plan waits in your Inbox before any agent starts.':'It approves its own plans within the per-run budget.'} Merging / accepting results always waits for you. New entities start paused.</div>
     <div class="ln-row"><span class="ln-err" id="or-en-err"></span><span style="flex:1"></span><button class="adp-btn" onclick="_orEntityCancel()">Cancel</button><button class="adp-btn ln-go" onclick="_orEntitySave()">Save entity</button></div></div>`;
 }
 /* Pure: the entities section. */
@@ -773,7 +799,8 @@ async function _orCreate(form){
   if(when.error){ err.textContent=when.error; return; }
   const body=Object.assign({goal:String(f.goal||'').trim(), model:f.model, max_parallel:+f.par,
     cwd:f.where==='workspace'?'':String(f.cwd||'').trim(), workspace:f.where==='workspace'?String(f.workspace||'').trim():'',
-    budget_usd:+f.budget, mode:f.mode, approve_teams:f.mode==='hierarchical'&&!!f.teams, team:_orTeamOf(f, _orState.agents)}, when);
+    budget_usd:+f.budget, mode:f.mode, approve_teams:f.mode==='hierarchical'&&!!f.teams, team:_orTeamOf(f, _orState.agents),
+    verify:String(f.verify||'').trim()}, when);
   const repeat=f.when==='repeat';
   if(f.sch_id){   // an existing schedule edited: same id, where it works stays (the server keeps it)
     err.textContent='Saving…';
@@ -789,7 +816,7 @@ async function _orCreate(form){
   const r=await _orPost(repeat?'/orch/schedule_save':'/orch/create', body);
   if(!r.ok){ err.textContent=r.error||'failed'; return; }
   err.textContent='';
-  _orState.form=Object.assign(_orFormDefaults(), {cwd:f.cwd, where:f.where, workspace:f.workspace, model:f.model, par:f.par, budget:f.budget, mode:f.mode, team:f.team});
+  _orState.form=Object.assign(_orFormDefaults(), {cwd:f.cwd, where:f.where, workspace:f.workspace, model:f.model, par:f.par, budget:f.budget, mode:f.mode, team:f.team, verify:f.verify});
   _orState.formOpen=false;
   if(repeat) showToast('success','Scheduled',`First run ${_orWhen(r.next_due)} — see Scheduled.`);
   else{
@@ -957,10 +984,18 @@ function _orStatsHtml(st, open){
   const body=!st?'<span class="or-note">Loading…</span>':!st.runs?'<span class="or-note">No runs yet.</span>':`
     <div class="or-metrics">${[['Runs',String(st.runs)],['Kept',pct(st.kept_rate)],['Cost',_orMoney(st.cost)],['Avg run',_orMoney(st.avg_cost)],
       ['Coordination',pct(st.coordination_share)],['Avg time',st.avg_s==null?'—':_fmtDurationDHM(st.avg_s)]].map(([k,v])=>`<div><b>${escHtml(v)}</b><span>${k}</span></div>`).join('')}</div>
+    <div class="or-metrics">${[['$ / done task',st.cost_per_success==null?'—':_orMoney(st.cost_per_success),'Everything spent (planning, reviews, failed attempts) divided by the tasks that got done'],
+      ['First pass',pct(st.first_pass),'Tasks done on their first attempt, out of all finished tasks'],
+      ['Retries / task',st.retry_rate==null?'—':String(st.retry_rate),'Extra attempts per finished task'],
+      ['Your actions / run',st.human_per_run==null?'—':String(st.human_per_run),'Approvals, gates, plan edits and merges per run'],
+      ['Median run',st.median_s==null?'—':_fmtDurationDHM(st.median_s),`Half of the ${st.ended_runs||0} ended runs took less`],
+      ['p90 run',st.p90_s==null?'—':_fmtDurationDHM(st.p90_s),'9 of 10 ended runs took less'+(st.iqr_s==null?'':' · middle half spread '+_fmtDurationDHM(st.iqr_s))],
+      ['Passed check',pct(st.verify_pass_rate),`Runs whose work passed your check command, of the ${st.verified_runs||0} that were checked (the last check of each run)`]]
+      .map(([k,v,tip])=>`<div title="${escHtml(tip)}"><b>${escHtml(v)}</b><span>${k}</span></div>`).join('')}</div>
     <table class="cache-table or-stats-t"><tr><th>kind of run</th><th>runs</th><th>kept</th><th>dropped</th><th>avg $</th></tr>
       ${(st.by_kind||[]).map(k=>`<tr><td>${escHtml(k.name)}</td><td>${k.runs}</td><td>${k.kept}</td><td>${k.dropped}</td><td>${_orMoney(k.avg_cost)}</td></tr>`).join('')}</table>
     ${table(st.by_agent||[],'agent')}${table(st.by_model||[],'model')}
-    <div class="or-note">Kept = merged / accepted by you out of the runs you decided on. A kind of run, agent or model that costs more without being kept more is a candidate to drop (PDF ch. 9).</div>`;
+    <div class="or-note">Kept = merged / accepted by you out of the runs you decided on. A kind of run, agent or model that costs more without being kept more is a candidate to drop (PDF ch. 9). To compare before / after a change, use $ / done task, first pass and the median run -- not one lucky run.</div>`;
   return `<details class="td-card or-statsc" data-k="stats"${open?' open':''}><summary onclick="_orStatsToggle(this)"><h3 style="display:inline-flex">Stats · last ${st&&st.days||90} days</h3></summary>${body}</details>`;
 }
 function _orStatsToggle(sum){

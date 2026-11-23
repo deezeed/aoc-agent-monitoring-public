@@ -277,7 +277,8 @@ c.check("POST /release/*: this PC only, dev checkout only", "_is_direct_loopback
 g = src[src.index('elif path_no_qs == "/release/status":'):]
 g = g[:g.index("elif path_no_qs", 10)]
 c.check("GET /release/status hides the buttons off this PC", "self._is_direct_loopback()" in g)
-c.check("both restart-blocker call sites pass the release state", src.count('_hooks_health["repairing"],') >= 2
-        and src.count("_release_job.get(\"state\"))") >= 2)
+c.check("both restart-blocker call sites pass the release state + orchestration step",
+        src.count('_hooks_health["repairing"],') >= 2
+        and src.count('_release_job.get("state"), bool(_orch_stepping[0]))') >= 2)
 c.check("AOC_PUBLIC_MIRROR is env-only", 'os.environ.get("AOC_PUBLIC_MIRROR")' in src and src.count("AOC_PUBLIC_MIRROR") == 2)
 c.finish()

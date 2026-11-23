@@ -268,16 +268,24 @@ class Handler(BaseHTTPRequestHandler):
                 # read any file the process can (e.g. ?file=C:\Users\x\.ssh\id_rsa).
                 base_real = os.path.realpath(base)
                 full_real = os.path.realpath(full_path)
+                role, refused = _current_user()["role"], ""
+                if role != "owner":   # a non-owner sees tracked files only, never a secret-looking one
+                    refused = _diff_refusal(role, rel, _run(["git", "ls-files", "--error-unmatch", "--", git_rel],
+                                                            cwd=cwd, timeout=5).returncode == 0)
                 if full_real != base_real and not full_real.startswith(base_real + os.sep):
                     diff_text = f"(access denied: {rel} is outside the project directory)"
+                elif refused:
+                    diff_text = refused
                 else:
                     # 1) unstaged changes
-                    r = _run(["git", "diff", "HEAD", "--", git_rel], cwd=cwd, timeout=5)
+                    r = _run(["git", "diff", "HEAD", "--", git_rel], cwd=cwd, timeout=5, encoding="utf-8", errors="replace")
                     if r.stdout.strip():
                         diff_text = r.stdout
                     else:
                         # 2) last commit changes for this file
-                        r2 = _run(["git", "log", "-1", "--pretty=format:", "-p", "--", git_rel], cwd=cwd, timeout=5)
+                        # utf-8: git prints the file's bytes; the system code page (cp1250) failed on them and left stdout None
+                        r2 = _run(["git", "log", "-1", "--pretty=format:", "-p", "--", git_rel], cwd=cwd, timeout=5,
+                                  encoding="utf-8", errors="replace")
                         if r2.stdout.strip():
                             diff_text = r2.stdout
                     if not diff_text.strip():
@@ -344,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] == "/restart_ok" and self._is_direct_loopback():
             # watchdog.py's code-reload probe (no token, like the hooks)
             body = {"pid": os.getpid(), "blockers": _restart_blockers(_perm_requests, _tunnel_status[0], _update_job.get("state"), _hooks_health["repairing"],
-                                                                      _release_job.get("state"))}
+                                                                      _release_job.get("state"), bool(_orch_stepping[0]))}
             self._serve(200, "application/json", json.dumps(body).encode(), no_cache=True)
             return
         if self.path.split("?")[0] == "/join":
@@ -1255,6 +1263,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise ValueError("expected an object")
                 act = path_no_qs.rsplit("/", 1)[1]
+                why = "" if self._user["role"] == "owner" else _orch_member_refusal(act, data)
+                if why:
+                    self._serve(403, "application/json", json.dumps({"ok": False, "error": why}).encode()); return
                 if act == "create":
                     reply = _orch_create(data)
                 elif act == "agent_save":

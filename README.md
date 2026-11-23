@@ -413,9 +413,18 @@ next agent, errors). A failed or invalid answer is retried once with the
 reason; a task whose inputs failed is blocked; nothing starts that would
 take the run past its budget. Agents keep AOC's hooks, so they show up as
 sessions and the danger guard still holds destructive commands for your OK.
-When nothing is left to run, the orchestrator reviews the results and
-finishes with a report, re-runs a task with feedback or adds tasks (at most
-3 reviews). Last, you approve the merge: the developers' branches go into
+When nothing is left to run and the run has a **check command** (optional,
+e.g. `python -m pytest -q` or `npm test`; on a run, a schedule or an
+entity, the owner's only), AOC runs it itself first: in a throwaway
+worktree with every done task's branch merged in plan order, through a
+detached runner that survives a reload, 20 minutes at most. Exit 0 passes;
+a failure, a timeout or conflicting task work doesn't. The orchestrator's
+review gets the result and the end of the output (a failure means the goal
+isn't met yet), each retry round is checked again, the run shows it above
+the merge buttons, and Stats counts how often the work passed. The command
+runs with your rights, not sandboxed. Then the orchestrator reviews the
+results and finishes with a report, re-runs a task with feedback or adds
+tasks (at most 3 reviews). Last, you approve the merge: the developers' branches go into
 the branch the run started from in dependency order, each checked with
 `git merge-tree` first -- it stops at a conflict and names the files. Each
 run shows its cost split into coordination (planner + reviews) and the
@@ -450,8 +459,12 @@ limits allow (it waits while a 5-hour or weekly window is 90 % used), a
 scout (`claude -p`, read-only tools in its folder) reads the mission, the
 team's capabilities, the entity's memory and what's in progress, and names
 the next concrete goal -- or says there's nothing to do now, and why. The
-goal becomes an ordinary run; the entity approves its plan itself (within
-the per-run budget), merging / accepting the results always waits for you.
+goal becomes an ordinary run. Who approves its plan is the entity's
+*Plans* setting: *Wait for my approval* (the plan waits in the Inbox; the
+default for a new entity whose team can run commands or use a connected
+service) or *It approves them itself* (within the per-run budget; the
+default for a read-only team, and what entities saved before this setting
+keep). Merging / accepting the results always waits for you.
 Each finished run is remembered (goal, kept or dropped by you, cost,
 summary) and the next scout reads it, so the team builds on what you
 accepted and doesn't redo what you dropped. New entities start paused.
@@ -465,8 +478,8 @@ Allow or Skip it; the tasks after it wait, the run isn't reviewed
 meanwhile), results to merge or accept -- shows in the Inbox (with
 Approve / Allow / Skip / Open), on the Orchestrate badge, and once as a
 toast + phone push (Settings -> Notify -> *Orchestration needs you*;
-announced items are remembered across reloads). An entity's own plans
-don't ask: it approves them itself. **Stats** (last 90 days): runs, how
+announced items are remembered across reloads). An entity's plan shows
+there only when the entity waits for your approval. **Stats** (last 90 days): runs, how
 many you kept, cost, coordination share, and per kind of run (one team /
 hierarchical / an entity's), per agent and per model: tasks, success,
 average cost and time, retries -- what to keep, what to drop.
@@ -513,12 +526,20 @@ monitor reload in the middle of a run loses nothing. `GET /orch/runs`,
 the host; others join through its tunnel with a personal invite link (one
 use, 7 days; only a hash of the code and of their token is stored) and get
 their own token -- the page they load carries theirs, never yours. Roles:
-*owner* (this PC and the main token: everything), *member* (everything but
-people, AOC's own settings -- tunnel, license, updates, restart, hooks,
-notifications, billing, memory files -- and actions on this PC itself;
-may approve, start runs and entities, also through the tunnel), *viewer*
-(reads; the voice assistant only answers). Every request is checked
-against the role; what people approve, start, merge or skip is logged with
+*owner* (this PC and the main token: everything), *member* (reads
+everything but people and your token; changes only what an allowlist names
+-- a new route is the owner's until it's added: approve plans, answer
+permission prompts, start runs, entities and schedules in **workspaces**
+with agents that use no connected service, run now / pause / cancel what
+you set up, dismiss session cards. Not: people, AOC's own settings --
+tunnel, license, updates, restart, hooks, notifications, billing, memory
+files -- anything on this PC itself, a repository folder, saving an agent
+with Bash / PowerShell or MCP, merge, discard, gates), *viewer* (reads; the
+voice assistant only answers). A non-owner's `/diff` shows only files git
+tracks and never one named like a secret (`.env*`, `*.pem`, `*.key`,
+`id_rsa`, `*secret*`, `*credential*`). Every request is checked against
+the role (`tests/python/users.test.py` lists every POST route with the
+least role that may use it); what people approve, start, merge or skip is logged with
 their name; the top bar shows who's here; a viewer sees a read-only strip.
 Disable or remove someone and their token stops working at once; 20 wrong
 invite codes an hour close `/join`. `GET /users`, `GET /me`,

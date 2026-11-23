@@ -18,7 +18,7 @@ conn.commit()
 conn.close()
 
 errors = []
-ns = exec_functions(["_backup_history_db"], extra_globals={
+ns = exec_functions(["_backup_history_db", "_snapshot_sqlite", "_BACKUP_PATTERNS"], extra_globals={
     "os": os, "glob": glob, "time": time, "sqlite3": sqlite3, "datetime": datetime,
     "AOC_DIR": tmp, "_db_lock": threading.Lock(),
     "_db_conn": lambda: sqlite3.connect(src_db),

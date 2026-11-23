@@ -7,7 +7,7 @@ const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
 const part = fs.readFileSync(path.join(WEB_DIR, 'js', '19_orchestration.js'), 'utf8');
-for (const v of ['_OR_STATES', '_OR_TASK_STATES', '_OR_MERGE_STATES', '_OR_ROLES', '_OR_ENTITY_STATES', '_OR_ATTN', '_OR_SCHEDULE_EVS']) {
+for (const v of ['_OR_STATES', '_OR_TASK_STATES', '_OR_MERGE_STATES', '_OR_ROLES', '_OR_ENTITY_STATES', '_OR_ATTN', '_OR_SCHEDULE_EVS', '_OR_VERIFY']) {
   const m = new RegExp(`^var ${v}=([\\s\\S]*?\\});`, 'm').exec(part);
   if (!m) throw new Error(v + ' not found');
   eval(`global.${v}=${m[1]}`);
@@ -20,7 +20,7 @@ for (const v of ['_OR_PLAN_FIELDS', '_OR_TASK_BUDGET']) {
 for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_fmtDurShort', '_orChip', '_orMoney', '_orCost', '_orShortPath', '_orMergeChip', '_orMergeStatus', '_orMergeHtml', '_orMergeGoText', '_orFormHtml', '_orRunsHtml',
   '_orMetricsHtml', '_orCompareHtml', '_orTaskHtml', '_orGoalHtml', '_orPickSet', '_orStatsHtml', '_orInboxHtml', '_orWorkerRef', '_orWorkersHtml', '_orBillingHtml', '_orRulesHtml', '_orScheduleText', '_orWhen', '_orBudgetBar', '_orEntityCardHtml', '_orEntityDraftOf', '_orEntityEditorHtml', '_orEntitiesHtml', '_orFormDefaults', '_orTeamOf', '_orClipText', '_orAgentCardHtml', '_orAgentEditorHtml', '_orAgentsHtml', '_orAgentDraftOf', '_orDraftFrom', '_orSlug', '_orDraftAdd', '_orDraftRemove', '_orDraftMove', '_orDraftRename', '_orPlanCheck', '_orPlanEditorHtml', '_orDetailHtml', '_orHtml', '_orConfirmText',
   '_orLocalInput', '_orWhenBody', '_orWhenHtml', '_orRepeatCardHtml', '_orLaterCardHtml', '_orScheduledHtml', '_orCommitsHtml',
-  '_orFormFromSchedule', '_orScheduleSavedText', '_orScheduleEvHtml']) eval(extractFunction(src, f));
+  '_orFormFromSchedule', '_orScheduleSavedText', '_orScheduleEvHtml', '_orVerifyInputHtml', '_orVerifyHtml']) eval(extractFunction(src, f));
 const c = new Checker();
 global._orState = { pick: null };
 
@@ -208,7 +208,7 @@ c.check('entity card: escaped name, state, where, team names, budgets, why it wa
   && ec2.includes('$9.80 / $10.00') && ec2.includes("today&#39;s budget") && ec2.includes('dropped by you') && ec2.includes('Weekly &lt;report&gt;')
   && ec2.includes('_orEntityAct(\'run\',&quot;store-watch&quot;)') && ec2.includes('>Pause<') && ec2.includes('Next look'));
 c.check('entity card: runs open their run', ec2.includes('_orSelect(&quot;r1&quot;)'));
-const busy = _orEntityCardHtml(Object.assign({}, ent, { state: 'waiting_you', paused: true }), lib);
+const busy = _orEntityCardHtml(Object.assign({}, ent, { state: 'waiting_you', paused: true, note: '' }), lib);
 c.check('entity card: needs you -> says so, Run now off; paused -> Resume', busy.includes('waits for your merge') && /Run now/.test(busy)
   && /ln-go"[^>]*disabled/.test(busy) && busy.includes('>Resume<'));
 const nd = _orEntityDraftOf(null);
@@ -218,6 +218,14 @@ const eed = _orEntityEditorHtml(_orEntityDraftOf(ent), lib, [{ name: 'store-watc
 c.check('entity editor: mission, workspace offered, team checked, budgets, daily time, loop minutes, starts-paused note',
   eed.includes('Keep the store healthy</textarea>') && eed.includes('<option value="store-watch">') && /checked[^>]*_orEntityTeam\(&quot;shop&quot;/.test(eed)
   && eed.includes('$ per month') && eed.includes('type="time" value="08:00"') && eed.includes('min later') && eed.includes('start paused'));
+const prop = _orEntityCardHtml(Object.assign({}, ent, { state: 'waiting_you', note: 'its plan waits for your approval (Inbox)', config: Object.assign({}, ent.config, { autonomy: 'propose' }) }), lib);
+c.check('entity card: a proposing entity says plans wait for you; its waiting plan is a warning, not the merge line',
+  prop.includes('plans wait for you') && /or-warn">its plan waits for your approval/.test(prop) && !prop.includes('waits for your merge')
+  && _orEntityCardHtml(Object.assign({}, ent, { config: Object.assign({}, ent.config, { autonomy: 'execute' }) }), lib).includes('approves its plans'));
+c.check('new entity draft: its plans wait for you', nd.autonomy === 'propose'
+  && _orEntityEditorHtml(nd, lib, []).includes('<option value="propose" selected>') && _orEntityEditorHtml(nd, lib, []).includes('waits in your Inbox'));
+c.check('entity editor: an entity that approves its own plans says so', _orEntityEditorHtml(Object.assign(_orEntityDraftOf(ent), { autonomy: 'execute' }), lib, [])
+  .includes('<option value="execute" selected>'));
 c.check('entity editor: a repo entity asks for the folder', _orEntityEditorHtml(Object.assign(_orEntityDraftOf(null), { where: 'repo' }), lib, []).includes('or-en-cwd'));
 c.check('entity editor: the repo example shows single backslashes; the workspace field gets the wide input', _orEntityEditorHtml(Object.assign(_orEntityDraftOf(null), { where: 'repo' }), lib, []).includes('placeholder="C:\\path\\to\\repo"')
   && /class="settings-input or-en-cwd" list="or-en-wss"/.test(_orEntityEditorHtml(_orEntityDraftOf(null), lib, [])));
@@ -245,7 +253,17 @@ const sth = _orStatsHtml({ days: 90, runs: 3, merged: 2, discarded: 1, kept_rate
   by_agent: [{ name: 'Dev <x>', n: 2, success: 1, avg_cost: 0.4, avg_s: 60, retries: 1 }], by_model: [{ name: 'sonnet', n: 3, success: 0.667, avg_cost: 0.9, avg_s: null, retries: 1 }] }, true);
 c.check('stats card: totals, kept, per kind / agent / model', sth.includes('Stats · last 90 days') && sth.includes('67%') && sth.includes('$4.50')
   && sth.includes('<td>entity</td>') && sth.includes('Dev &lt;x&gt;') && sth.includes('<td>sonnet</td>'));
-c.check('stats card: empty / loading', _orStatsHtml({ runs: 0 }, true).includes('No runs yet') && _orStatsHtml(null, true).includes('Loading'));
+c.check('stats card: no new metrics yet (older AOC answering) -> dashes, no "undefined"',
+  sth.includes('$ / done task') && !sth.includes('undefined') && !sth.includes('NaN'));
+const sq = _orStatsHtml({ days: 90, runs: 3, kept_rate: 0.5, cost: 4.5, avg_cost: 1.5, coordination_share: 0.2, avg_s: 150,
+  cost_per_success: 2.25, first_pass: 0.333, retry_rate: 0.333, human_per_run: 1.33, ended_runs: 3, median_s: 100, p90_s: 260, iqr_s: 125,
+  by_kind: [], by_agent: [], by_model: [] }, true);
+c.check('stats card: $ / done task, first pass, retries, your actions, median + p90 run',
+  sq.includes('<b>$2.25</b><span>$ / done task</span>') && sq.includes('<b>33%</b><span>First pass</span>')
+  && sq.includes('<b>0.333</b><span>Retries / task</span>') && sq.includes('<b>1.33</b><span>Your actions / run</span>')
+  && sq.includes('<span>Median run</span>') && sq.includes('<span>p90 run</span>') && sq.includes('Half of the 3 ended runs took less')
+  && sq.includes('middle half spread'));
+c.check('stats card: empty / loading',_orStatsHtml({ runs: 0 }, true).includes('No runs yet') && _orStatsHtml(null, true).includes('Loading'));
 c.check('task card: Watch while running (live session), Replay when done, nothing for a manager',
   _orTaskHtml(task('a', { state: 'running', session_id: '', live_session: 'live-1', output: null })).includes('openReplay(&quot;live-1&quot;')
   && _orTaskHtml(task('a', { state: 'running', session_id: '', live_session: 'live-1', output: null })).includes('Watch')
@@ -444,4 +462,27 @@ c.check('finish confirm names what is kept and what is dropped', _orMergeGoText(
 const wpm = Object.assign({}, pm, { run: Object.assign({}, pm.run, { kind: 'workspace' }) });
 c.check('workspace partial merge: accepted, not merged', _orMergeHtml(wpm).includes('accepted so far') && _orMergeChip('merged', true).includes('accepted'));
 c.check('agent editor: each label stays with its field', (edh.match(/class="or-ag-f"/g) || []).length === 4);
+// the check command (AOC runs it on the done work before the review)
+const vr = { id: 'r9', verify: 'python -m pytest -q', state: 'review', verify_state: 'fail', verify_code: 1, verify_secs: 12.4, verify_round: 1,
+  verify_tail: 'FAILED test_x.py::test_a <boom>' };
+const vh = _orVerifyHtml(vr);
+c.check('check: failed -> red, the command, exit code, time, round, its output open and escaped',
+  vh.includes('or-verify bad') && vh.includes('Check failed') && vh.includes('<code>python -m pytest -q</code>') && vh.includes('exit 1')
+  && vh.includes('review round 2') && /<details[^>]* open>/.test(vh) && vh.includes('&lt;boom&gt;'));
+const vp = _orVerifyHtml(Object.assign({}, vr, { verify_state: 'pass', verify_code: 0, verify_round: 0, verify_tail: 'ok' }));
+c.check('check: passed -> green, no exit code, output closed', vp.includes('Check passed') && !vp.includes('or-verify bad')
+  && !vp.includes('exit 0') && !/<details[^>]* open>/.test(vp));
+c.check('check: running / not yet / none', _orVerifyHtml(Object.assign({}, vr, { job_kind: 'verify' })).includes('Checking')
+  && _orVerifyHtml({ verify: 'npm test' }).includes('runs when the tasks are done') && _orVerifyHtml({ verify: '' }) === '');
+c.check('check: a conflict / timeout read as not passing', _orVerifyHtml(Object.assign({}, vr, { verify_state: 'conflict' })).includes('or-verify bad')
+  && _orVerifyHtml(Object.assign({}, vr, { verify_state: 'timeout' })).includes('timed out'));
+const vf = _orFormHtml([], true, Object.assign(_orFormDefaults(), { verify: 'npm test' }), [], []);
+c.check('new run form: the check command field, kept as typed', vf.includes('Check command') && vf.includes('value="npm test"')
+  && vf.includes("_orFormSet('verify',this.value)"));
+c.check('schedule edit: its check command comes back', _orFormFromSchedule({ id: 's', config: { goal: 'g', verify: 'pytest' } }).verify === 'pytest');
+c.check('entity editor: the check command field', _orEntityEditorHtml(Object.assign(_orEntityDraftOf(null), { verify: 'make check' }), lib, [])
+  .includes('value="make check"'));
+const svh = _orStatsHtml({ runs: 3, verify_pass_rate: 0.667, verified_runs: 3, by_kind: [], by_agent: [], by_model: [] }, true);
+c.check('stats: how often the work passed the check', svh.includes('Passed check') && svh.includes('67%') && svh.includes('of the 3 that were checked'));
+
 c.finish();

@@ -32,8 +32,10 @@ function _pePaneHtml(d, invite, err){
       <button class="adp-btn" onclick="copyText(this,this.previousElementSibling.value)">Copy</button>
       ${invite.link?'':'<span class="or-warn">No tunnel running: this link only works on your network. Start the tunnel (TUNNEL tab) to invite people from anywhere.</span>'}</div>`:'';
   return `<div class="settings-section"><div class="settings-section-title">PEOPLE ON THIS AOC</div>
-    <div class="or-note">They join through your tunnel with their own link and token. Members can do everything except people and AOC's own settings
-      (and nothing on this PC itself); viewers only look. What they approve, start or merge is logged with their name.</div>
+    <div class="or-note">They join through your tunnel with their own link and token. Members approve plans, answer permission prompts and start
+      runs, entities and schedules in workspaces with agents that use no connected service. People, AOC's own settings, anything on this PC,
+      a repository folder, agents with a shell or MCP, merge / discard and gates stay yours. Viewers only look.
+      What they approve or start is logged with their name.</div>
     <div class="ln-row"><label class="ln-lbl" for="pe-owner">Your name</label><input id="pe-owner" class="settings-input" value="${escHtml(d.owner_name||'')}" onchange="_peUpdate('',{owner_name:this.value})"></div>
     ${people||'<div class="or-note">Nobody else yet.</div>'}
     <form class="ln-row pe-inv" onsubmit="event.preventDefault();_peInvite(this)"><label class="ln-lbl">Invite</label>

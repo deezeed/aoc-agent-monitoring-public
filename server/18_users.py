@@ -7,11 +7,13 @@
 # invite link (one use, 7 days) and get their own token -- the page they
 # load carries THEIR token, never the owner's. Roles:
 #   owner  -- this PC (localhost) and the main token: everything
-#   member -- everything but people and AOC's own settings (tunnel, license,
-#             updates, restart, hooks, notifications, billing, memory
-#             files) and actions on the owner's PC (open a console, focus a
-#             window); may approve, start runs and entities, type in shared
-#             sessions
+#   member -- reads everything but people and the owner's token; changes
+#             only what _MEMBER_POST lists (an allowlist: a new route is the
+#             owner's until it's added there). Approves plans, starts runs,
+#             entities and schedules in workspaces with agents that use no
+#             connected service (_orch_member_refusal), answers permission
+#             prompts, types in shared sessions. Never: people, AOC's own
+#             settings, actions on the owner's PC, merge / discard / gates.
 #   viewer -- reads; may ask the voice assistant (it answers, doesn't act)
 # Each request runs as one person (_req_ctx.user): orchestration records
 # who approved / merged / skipped, and /status says who's here.
@@ -41,7 +43,28 @@ _OWNER_ONLY_EXACT = {
 _GET_CHANGES = {"/history/save_current", "/permission/poll", "/reply/poll"}
 _OWNER_ONLY_PREFIX = ("/users", "/tunnel/", "/hooks_health/", "/release/", "/selfupdate/", "/webhook_", "/memory_file",
                       "/fixes/")
-_VIEWER_POST = {"/voice/ask", "/whats_new/dismiss", "/me"}
+_VIEWER_POST = {"/voice/ask", "/whats_new/dismiss"}
+# What a member may change. An allowlist (audit FIND-002): with the old
+# denylist every route someone forgot to list was open to members -- found
+# twice in review. Left out on purpose: whatever acts on this PC or its
+# settings, the hooks' own posts (/permission/request, /reply/request: a member
+# could plant prompts on the owner's dashboard), /context_save/send (types
+# into the owner's sessions), and orchestration's merge / discard / gate /
+# settings (the owner's decisions). tests/python/users.test.py lists every
+# POST route with what each role gets: a new route fails it until decided.
+_MEMBER_POST = _VIEWER_POST | {
+    "/ask", "/clear_done", "/danger_guard/test", "/history_tags", "/kill_session", "/notes", "/remove", "/reset",
+    "/session_note", "/prompts", "/prompts/delete", "/prompts/used", "/push/subscribe", "/push/unsubscribe",
+    "/permission/decide", "/reply/send", "/queue/cancel", "/voice/confirm",
+    "/orch/create", "/orch/plan", "/orch/approve", "/orch/cancel", "/orch/baseline", "/orch/judge",
+    "/orch/agent_save", "/orch/agent_delete", "/orch/entity_save", "/orch/entity_run", "/orch/entity_pause",
+    "/orch/entity_forget", "/orch/entity_delete", "/orch/start", "/orch/schedule_save", "/orch/schedule_pause",
+    "/orch/schedule_delete", "/orch/schedule_run",
+}
+_MEMBER_DELETE_PREFIX = ("/session/",)   # dismiss a closed session card
+# files a non-owner never gets through /diff, tracked or not (audit FIND-006)
+_DIFF_SECRET_RE = re.compile(r"(^|[\\/])(\.env[^\\/]*|[^\\/]*\.(pem|key|p12|pfx)|id_(rsa|ed25519|ecdsa)[^\\/]*"
+                             r"|[^\\/]*(secret|credential)[^\\/]*)$", re.I)
 
 
 def _user_hash(token):
@@ -95,8 +118,24 @@ def _user_allowed(role, method, path):
             return False
         return not owner_only or path == "/users/me"
     if role == "viewer":
-        return path in _VIEWER_POST
-    return role == "member" and not owner_only
+        return method == "POST" and path in _VIEWER_POST
+    if role == "member":
+        return (method == "POST" and path in _MEMBER_POST) or \
+               (method == "DELETE" and path.startswith(_MEMBER_DELETE_PREFIX))
+    return False
+
+
+def _diff_refusal(role, rel, tracked):
+    """Pure: why /diff won't show this file to this role ('' = it will). A
+    non-owner sees only files git tracks (an untracked file can be anything:
+    a local config, a key) and never one named like a secret."""
+    if role == "owner":
+        return ""
+    if _DIFF_SECRET_RE.search(str(rel or "")):
+        return f"(not shown: {rel} may hold secrets -- only the owner sees it)"
+    if not tracked:
+        return f"(not shown: {rel} isn't tracked by git -- only the owner sees untracked files)"
+    return ""
 
 
 def _tokenless_owner_ok(host, origin, fetch_site, fetch_mode, method, path, port):

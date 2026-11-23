@@ -835,7 +835,7 @@ c.check("a workspace run doesn't need a repo folder", not O["_orch_create"]({"go
 base_ent = {"name": "Store Watch", "mission": "Keep a weekly, accurate picture of the store's health and report it.",
             "where": "workspace", "workspace": "store-watch", "team": ["research", "developer"], "model": "haiku",
             "budget_run": 2, "budget_day": 5, "budget_month": 50, "schedule": {"type": "every", "hours": 24},
-            "loop": True, "cooldown_min": 30}
+            "loop": True, "cooldown_min": 30, "autonomy": "execute"}
 ec, err = O["_orch_validate_entity"](base_ent)
 c.check("entity: id from the name, schedule and budgets kept", err is None and ec["id"] == "store-watch"
         and ec["schedule"] == {"type": "every", "hours": 24.0} and ec["budget_run"] == 2 and ec["loop"] is True)
@@ -843,6 +843,16 @@ c.check("entity: budgets must grow", "grow" in O["_orch_validate_entity"](dict(b
 c.check("entity: daily needs HH:MM", "HH:MM" in O["_orch_validate_entity"](dict(base_ent, schedule={"type": "daily", "at": "25:00"}))[1])
 c.check("entity: a repo entity needs its folder", "repository" in O["_orch_validate_entity"](dict(base_ent, where="repo", cwd=""))[1])
 c.check("entity: a mission is needed", "mission" in O["_orch_validate_entity"](dict(base_ent, mission="x"))[1])
+c.check("entity: autonomy kept; unknown or missing -> None (the save decides)", ec["autonomy"] == "execute"
+        and O["_orch_validate_entity"](dict(base_ent, autonomy="yolo"))[0]["autonomy"] is None
+        and O["_orch_validate_entity"]({k: v for k, v in base_ent.items() if k != "autonomy"})[0]["autonomy"] is None)
+bi = O["_orch_builtin_agents"]()
+dflt = O["_orch_entity_default_autonomy"]
+c.check("autonomy default: a team that can run commands or use a connected service proposes; a read-only team executes",
+        dflt([bi["research"], bi["analyst"]]) == "execute" and dflt([bi["research"], bi["developer"]]) == "propose"
+        and dflt([bi["qa"]]) == "propose" and dflt([dict(bi["research"], mcp=["claude.ai Gmail"])]) == "propose")
+c.check("autonomy of an entity saved before it existed: it approves its own plans, as it did",
+        O["_orch_entity_autonomy"]({}) == "execute" and O["_orch_entity_autonomy"]({"autonomy": "propose"}) == "propose")
 due = O["_orch_entity_due"]
 man = dict(ec, schedule={"type": "manual"}, loop=False)
 c.check("due: manual -> only when you ask", due(man, {}, None, 1000)[0] is False and due(man, {"run_now": 1}, None, 1000)[:2] == (True, "you asked"))
@@ -1005,6 +1015,48 @@ finally:
 c.check("forget clears its memory", O["_orch_entity_action"]("forget", {"id": "store-watch"})["ok"]
         and O["_orch_entities_list"]()["entities"][0]["memory"] == [])
 c.check("delete", O["_orch_entity_action"]("delete", {"id": "store-watch"})["ok"] and O["_orch_entities_list"]()["entities"] == [])
+
+# autonomy "propose": the entity's plan waits for you
+pent = dict({k: v for k, v in base_ent.items() if k != "autonomy"}, name="Plan Keeper", workspace="plan-keeper", loop=False,
+            schedule={"type": "manual"})
+c.check("a new entity with a developer and no autonomy given -> propose", O["_orch_entity_save"](pent)["entity"]["autonomy"] == "propose")
+
+
+def ptick(now):
+    conn = O["_orch_connect"]()
+    O["_orch_entity_tick"](conn, "plan-keeper", now, **ekw)
+    for (rid_,) in conn.execute("SELECT id FROM runs WHERE state IN ('planning','running','supervising')").fetchall():
+        O["_orch_step"](conn, rid_, now, **{k: v for k, v in ekw.items() if k != "limits"})
+    conn.commit(); conn.close()
+
+
+O["_orch_entity_action"]("run", {"id": "plan-keeper"})
+scout_answers.append({"action": "run", "goal": "Write the store health report to health.md", "reason": "first", "mode": "flat"})
+for i in range(4):
+    ptick(T0 + 200 + i)
+e = O["_orch_entities_list"]()["entities"][0]
+prid = e["runs"][0]["id"]
+c.check("propose: the plan is ready but not approved -- the entity waits for you and says so",
+        O["_orch_get"](prid)["run"]["state"] == "plan_ready" and e["state"] == "waiting_you" and "your approval" in e["note"]
+        and not any(x["kind"] == "approved" for x in O["_orch_get"](prid)["events"]))
+conn = O["_orch_connect"]()
+c.check("propose: its plan is in your Inbox", any(i["key"] == "plan:" + prid for i in O["_orch_attention_items"](conn)))
+conn.close()
+c.check("an edit without autonomy keeps it", O["_orch_entity_save"](dict(pent, budget_run=1))["entity"]["autonomy"] == "propose")
+c.check("you approve", O["_orch_action"]("approve", {"id": prid}, now=T0 + 210)["ok"])
+ptick(T0 + 211)
+e = O["_orch_entities_list"]()["entities"][0]
+c.check("after your OK it works; the approval is yours, not the entity's", e["state"] == "running" and e["note"] == ""
+        and [x["human"] for x in O["_orch_get"](prid)["events"] if x["kind"] == "approved"] == [1])
+O["_orch_action"]("discard", {"id": prid})
+conn = O["_orch_connect"]()
+conn.execute("UPDATE entities SET data=? WHERE id='plan-keeper'",
+             (json.dumps({k: v for k, v in O["_orch_entities_list"]()["entities"][0]["config"].items() if k not in ("id", "autonomy")}),))
+conn.commit(); conn.close()
+c.check("an entity saved before autonomy existed reads as execute and keeps it on an edit",
+        O["_orch_entities_list"]()["entities"][0]["config"]["autonomy"] == "execute"
+        and O["_orch_entity_save"](dict(pent, budget_run=1))["entity"]["autonomy"] == "execute")
+O["_orch_entity_action"]("delete", {"id": "plan-keeper"})
 # ── billing: API key or the Claude subscription ──
 pe = O["_orch_proc_env"]
 cat_cache.update(mcp=servers, scanning=False, loaded=True)
@@ -1103,6 +1155,12 @@ c.check("attention: your plan, results to review, a gate, a team plan you approv
 c.check("attention: not an entity's plan (it approves its own), not an auto-approved team plan, not a team's review",
         not any(i["run_id"] in ("en", "ch2", "chr") for i in items))
 c.check("attention: the gate names the agent", items[-1]["detail"] == "Shop Poster" and items[-1]["task_id"] == "post")
+aconn.execute("INSERT INTO entities (id, data, created, updated, paused) VALUES ('keeper', ?, 1, 1, 0)", (json.dumps({"autonomy": "propose"}),))
+aconn.execute("INSERT INTO entities (id, data, created, updated, paused) VALUES ('store', ?, 1, 1, 0)", (json.dumps({}),))
+ins("ep", "plan_ready", entity="keeper")
+ak = [i["key"] for i in O["_orch_attention_items"](aconn)]
+c.check("attention: a proposing entity's plan is yours; an executing one's isn't", "plan:ep" in ak and "plan:en" not in ak)
+aconn.execute("DELETE FROM runs WHERE id='ep'"); aconn.execute("DELETE FROM entities")
 aconn.execute("UPDATE runs SET goal=? WHERE id='ch'", ("Docs for partners\n\nDONE WHEN: pages exist\n\nOVERALL GOAL: portal",))
 c.check("attention: a team plan's title is its workstream, not the context from the run above",
         next(i for i in O["_orch_attention_items"](aconn) if i["run_id"] == "ch")["title"] == "Docs for partners")
@@ -1145,6 +1203,26 @@ c.check("stats per model and per kind of run", {m["name"]: m["n"] for m in st["b
         and {k["name"]: (k["runs"], k["kept"], k["dropped"]) for k in st["by_kind"]}
         == {"one team": (1, 1, 0), "hierarchical": (1, 0, 1), "entity": (1, 1, 0)})
 c.check("stats: nothing yet", O["_orch_stats_from"]([])["runs"] == 0 and O["_orch_stats_from"]([])["kept_rate"] is None)
+# what tells whether a change helped (audit FIND-014): 3 finished non-manager tasks (a, q, b), 2 done, a on attempt 2
+c.check("stats: $ per done task = everything spent / tasks done (managers count through their team)",
+        st["tasks"] == 3 and st["tasks_done"] == 2 and st["cost_per_success"] == 2.25)
+c.check("stats: first pass = done on attempt 1 / finished tasks; retries per task",
+        st["first_pass"] == 0.333 and st["retry_rate"] == 0.333)
+c.check("stats: no human count in the metrics -> 0 per run, not an error", st["human_per_run"] == 0)
+c.check("stats: quantiles are linear between neighbours", O["_orch_quantile"]([10, 1, 3, 2], 0.5) == 2.5
+        and O["_orch_quantile"]([5], 0.9) == 5 and O["_orch_quantile"]([], 0.5) is None
+        and O["_orch_quantile"]([0, 100], 0.9) == 90)
+c.check("stats: median / p90 / IQR of ended runs", st["ended_runs"] == 3 and st["median_s"] == 100
+        and st["p90_s"] == 260 and st["iqr_s"] == 125)
+hm = lambda cost, secs, human: dict(mk(cost, 0, secs), human_interventions=human)
+st2 = O["_orch_stats_from"]([({"state": "merged", "mode": "flat", "entity_id": ""}, [T("x", state="done", attempt=1)], hm(1, 60, 3)),
+                             ({"state": "running", "mode": "flat", "entity_id": ""}, [T("y", state="running")], hm(0.5, 9999, 1)),
+                             ({"state": "review", "mode": "flat", "entity_id": ""}, [T("z", state="failed", attempt=2)], hm(1, 120, 0))])
+c.check("stats: a run still going isn't in the time quantiles; your actions per run over all runs",
+        st2["ended_runs"] == 2 and st2["median_s"] == 90 and st2["human_per_run"] == 1.33)
+c.check("stats: nothing done -> no $ per done task (not a division by zero)",
+        O["_orch_stats_from"]([rows[1]])["cost_per_success"] is None and O["_orch_stats_from"]([])["first_pass"] is None
+        and O["_orch_stats_from"]([])["median_s"] is None)
 
 # watching a running agent: its transcript folder is named after its worktree
 c.check("the transcript folder Claude Code uses for a path (as seen live)",
@@ -1344,6 +1422,8 @@ c.check("answer read: JSON as is; none -> the stderr tail, shown in the error; n
 sp_ = []
 O["_orch_spawn"](["x"], rd, "line1\nline2", os.path.join(rd, "sp"), popen=lambda *a, **k: sp_.append(1) or type("P", (), {"pid": 7})())
 c.check("the prompt file is written byte for byte (\\n, not \\r\\n)", open(os.path.join(rd, "sp.in"), "rb").read() == b"line1\nline2")
+c.check("the pid is noted next to the output the moment the process exists (<base>.pid)",
+        O["_orch_pid_file"](os.path.join(rd, "sp")) == 7)
 shutil.rmtree(rd, ignore_errors=True)
 
 # ── scheduled runs: later + repeating (fake clock; nothing billed) ──
@@ -1743,5 +1823,346 @@ m = O["_orch_metrics"](hrun, htasks, [dict(e) for e in hdb.execute("SELECT * FRO
 c.check("metrics say part of the cost is an estimate", m["cost_est"] is True)
 hdb.close()
 shutil.rmtree(kd, ignore_errors=True)
+
+# ── a monitor killed while it starts an agent (audit FIND-007) ──
+# Before: 'running' + pid were saved only at the step's end. Killed between
+# the spawn and that commit, the task was still 'pending' after the restart:
+# its worktree (the live agent's folder) was removed and a second agent
+# started. Now 'starting' is committed before the spawn and the pid sits in
+# <base>.pid; the next step follows that process or, if none was started,
+# starts the task once.
+class Killed(BaseException):
+    """taskkill /F of the monitor: nothing after it runs, nothing more is committed."""
+
+
+repo = tempfile.mkdtemp()
+git("init", "-q", "-b", "main", cwd=repo)
+git("config", "user.email", "t@t", cwd=repo); git("config", "user.name", "t", cwd=repo)
+open(os.path.join(repo, "a.txt"), "w").write("a\n")
+git("add", "-A", cwd=repo); git("commit", "-qm", "init", cwd=repo)
+kcalls, kmode = [], {"dev": "kill-after-spawn", "dev2": "kill-before-spawn"}
+
+
+def kspawn(argv, cwd, stdin_text, base, env=None):
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    kind = os.path.basename(base).rsplit("-", 1)[0]
+    if kind == "plan":
+        answer(base, plan_of({"id": "dev", "role": "developer", "title": "Dev"},
+                             {"id": "dev2", "role": "developer", "title": "Dev two"}))
+        return 1
+    if kind == "supervise":
+        answer(base, finish("done"))
+        return 2
+    mode = kmode.pop(kind, "")
+    if mode == "kill-before-spawn":
+        raise Killed()
+    kcalls.append((kind, cwd))
+    write(kind + ".txt", kind + "\n")(cwd)
+    answer(base, done(result="wrote " + kind), cost=0.4)
+    pid = 4000 + len(kcalls)
+    open(base + ".pid", "w").write(str(pid))   # what the real _orch_spawn writes the moment the process exists
+    if mode == "kill-after-spawn":
+        raise Killed()
+    return pid
+
+
+kkw = dict(exe="claude.exe", spawn=kspawn, alive=lambda pid: False, kill=lambda pid: None)
+r = O["_orch_create"]({"goal": "Two developers, one crash each", "cwd": repo, "max_parallel": 1, "budget_usd": 10},
+                      exe="claude.exe", spawn=kspawn)
+krid = r["id"]
+
+
+def kstep():
+    conn = O["_orch_connect"]()
+    try:
+        O["_orch_step"](conn, krid, **kkw)
+    except Killed:
+        pass   # the process is gone: no rollback, no commit -- the connection just closes
+    finally:
+        conn.close()
+    conn = O["_orch_connect"]()
+    try:
+        return {t["id"]: t for t in O["_orch_load"](conn, krid)[1]}
+    finally:
+        conn.close()
+
+
+kstep()
+O["_orch_action"]("approve", {"id": krid})
+kt = kstep()
+c.check("killed right after the spawn: the task is saved as 'starting' with its folder and output base",
+        kt["dev"]["state"] == "starting" and kt["dev"]["attempt"] == 1 and kt["dev"]["job_base"]
+        and os.path.isdir(kt["dev"]["path"]) and kt["dev"]["pid"] is None)
+kt = kstep()
+c.check("restart: the agent's process is found through <base>.pid and followed -- not started twice",
+        len(kcalls) == 1 and kt["dev"]["state"] == "running" and kt["dev"]["pid"] == 4001 and kt["dev"]["attempt"] == 1)
+c.check("restart: its folder is still there (the first agent works in it)", os.path.isdir(kt["dev"]["path"]))
+kev = [dict(e) for e in O["_orch_get"](krid)["events"] if e["kind"] == "task_recovered"]
+c.check("restart: a 'task_recovered' event says so", len(kev) == 1 and "pid 4001" in kev[0]["message"])
+kt = kstep()
+c.check("its answer is read as usual: done, cost counted once, its commit kept",
+        kt["dev"]["state"] == "done" and abs(kt["dev"]["cost_usd"] - 0.4) < 1e-9 and kt["dev"]["commits"] == 1)
+c.check("dev2 then: killed before its process existed -> 'starting', no pid file",
+        kt["dev2"]["state"] == "starting" and not os.path.exists(kt["dev2"]["job_base"] + ".pid"))
+d2_path = kt["dev2"]["path"]
+kt = kstep()
+c.check("restart: never started -> started now, once, as attempt 1 (the lost start isn't counted)",
+        [k for k, _ in kcalls] == ["dev", "dev2"] and kt["dev2"]["state"] == "running" and kt["dev2"]["attempt"] == 1)
+c.check("its fresh worktree was made again for the new start", os.path.isdir(kt["dev2"]["path"]) and kt["dev2"]["path"] == d2_path)
+kt = kstep()
+kt = kstep()
+kv = O["_orch_get"](krid)
+c.check("the run finishes normally: review, exactly one agent per task",
+        kv["run"]["state"] == "review" and [k for k, _ in kcalls] == ["dev", "dev2"])
+c.check("no orphan worktree left", not [p for p in os.listdir(os.path.join(repo, ".claude", "worktrees"))
+                                         if os.path.isdir(os.path.join(repo, ".claude", "worktrees", p))])
+# a 'starting' task counts as running: no second start in the same step, and halting kills its process
+c.check("next: a 'starting' task holds its slot", O["_orch_next"]({"max_parallel": 1, "budget_usd": 10.0},
+                                                                [T("a", state="starting"), T("b")], 0) == [])
+hd = tempfile.mkdtemp()
+hdb = O["_orch_connect"](os.path.join(hd, "h.db"))
+hdb.execute("INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model, max_parallel, budget_usd) "
+            "VALUES ('s', 0, 0, 'g', ?, 'main', 'x', 'running', 'opus', 2, 10)", (hd,))
+O["_orch_insert_tasks"](hdb, "s", [dict(plan[0], id="st", role="developer", depends_on=[], budget_usd=1.0, model="sonnet")], 0)
+open(os.path.join(hd, "job.pid"), "w").write("777")
+hdb.execute("UPDATE tasks SET state='starting', job_base=?, started=? WHERE id='st'", (os.path.join(hd, "job"), time.time()))
+srun, stasks = O["_orch_load"](hdb, "s")
+stopped = []
+real_stop = g["_orch_stop"]
+g["_orch_stop"] = lambda pid, since=None, alive=None, kill=None: stopped.append(pid) or True
+try:
+    O["_orch_halt"](hdb, srun, stasks, time.time(), git=lambda args, cwd, timeout=None: (0, "", ""))
+finally:
+    g["_orch_stop"] = real_stop
+_, stasks = O["_orch_load"](hdb, "s")
+c.check("halt: a 'starting' task's process (from <base>.pid) is killed and the task closed",
+        stopped == [777] and stasks[0]["state"] == "skipped")
+hdb.close()
+shutil.rmtree(hd, ignore_errors=True)
+pf = os.path.join(data_dir, "pidfile-test")
+c.check("pid file: missing / junk -> None", O["_orch_pid_file"](pf) is None and O["_orch_pid_file"](None) is None)
+open(pf + ".pid", "w").write("x")
+c.check("pid file: not a number -> None", O["_orch_pid_file"](pf) is None)
+open(pf + ".pid", "w").write("123\n")
+c.check("pid file: read", O["_orch_pid_file"](pf) == 123)
+
+# ── verify: AOC runs your check on the done work before the review (audit FIND-008) ──
+vv = O["_orch_validate_verify"]
+c.check("verify command: optional, one line, not huge", vv("")[0] == "" and vv("  python -m pytest -q ")[0] == "python -m pytest -q"
+        and "one line" in vv("a\nb")[1] and "too long" in vv("x" * 1001)[1])
+vrepo = os.path.realpath(tempfile.mkdtemp())
+git("init", "-q", "-b", "main", cwd=vrepo); git("config", "user.email", "t@t", cwd=vrepo); git("config", "user.name", "t", cwd=vrepo)
+open(os.path.join(vrepo, "check.py"), "w").write(
+    "import sys, os\nok = os.path.exists('feature.txt') and open('feature.txt').read().strip() == 'good'\n"
+    "print('checking feature.txt:', 'ok' if ok else 'WRONG')\nsys.exit(0 if ok else 1)\n")
+git("add", "-A", cwd=vrepo); git("commit", "-qm", "init", cwd=vrepo)
+vcalls, vsup = [], [{"action": "retry", "reason": "the check fails", "report": "",
+                     "retry": [{"id": "feat", "feedback": "feature.txt must say good"}], "tasks": []}, finish("feature done, check passes")]
+vfeat = ["bad", "good"]
+
+
+def vspawn_agents(argv, cwd, stdin_text, base, env=None):
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    kind = os.path.basename(base).rsplit("-", 1)[0]
+    vcalls.append((kind, cwd, stdin_text))
+    if kind == "plan":
+        answer(base, plan_of({"id": "feat", "role": "developer", "title": "Feature"}))
+    elif kind == "supervise":
+        answer(base, vsup.pop(0), cost=0.05)
+    else:
+        open(os.path.join(cwd, "feature.txt"), "w").write(vfeat.pop(0) + "\n")
+        answer(base, done(result="wrote feature.txt"))
+    return 21
+
+
+vkw = dict(exe="claude.exe", spawn=vspawn_agents, alive=lambda pid: False, kill=lambda pid: None)
+
+
+def vload(rid):
+    conn = O["_orch_connect"]()
+    try:
+        return O["_orch_load"](conn, rid)[0]
+    finally:
+        conn.close()
+
+
+def vtick(rid, n=1):
+    for _ in range(n):
+        run_ = vload(rid)
+        if run_["job_kind"] == "verify":   # the real runner: wait for its exit code
+            for _ in range(600):
+                if os.path.exists(run_["job_base"] + ".code"):
+                    break
+                time.sleep(0.1)
+        conn = O["_orch_connect"](); O["_orch_step"](conn, rid, **vkw); conn.close()
+
+
+vr = O["_orch_create"]({"goal": "Add the feature file please", "cwd": vrepo, "verify": "python check.py"}, exe="claude.exe",
+                       spawn=vspawn_agents)
+vid = vr["id"]
+c.check("verify: stored on the run", vr["ok"] and O["_orch_get"](vid)["run"]["verify"] == "python check.py")
+vtick(vid)
+O["_orch_action"]("approve", {"id": vid})
+vtick(vid, 2)
+vrun = vload(vid)
+vpath = O["_orch_verify_path"](vrun)
+c.check("verify: the task done -> AOC runs the check first (no review yet), in a throwaway worktree with the work merged",
+        vrun["state"] == "supervising" and vrun["job_kind"] == "verify" and not any(k == "supervise" for k, _, _ in vcalls)
+        and open(os.path.join(vpath, "feature.txt")).read().strip() == "bad"
+        and git("rev-parse", "--abbrev-ref", "HEAD", cwd=vrepo).stdout.strip() == "main")
+vtick(vid)
+vrun = O["_orch_get"](vid)["run"]
+c.check("verify: failed -> exit code, the end of its output, a log line; the worktree is gone",
+        vrun["verify_state"] == "fail" and vrun["verify_code"] == 1 and "checking feature.txt: WRONG" in vrun["verify_tail"]
+        and vrun["verify_secs"] is not None and not os.path.exists(vpath)
+        and any(e["kind"] == "verify" and "failed (exit 1)" in e["message"] for e in O["_orch_get"](vid)["events"]))
+vtick(vid)
+sup1 = [p for k, _, p in vcalls if k == "supervise"]
+c.check("verify: the review sees it -- FAILED, the output, told the goal isn't met",
+        len(sup1) == 1 and "`python check.py` -> FAILED (exit 1)" in sup1[0] and "checking feature.txt: WRONG" in sup1[0]
+        and "the goal is not met yet" in sup1[0])
+vtick(vid, 6)
+vrun = O["_orch_get"](vid)["run"]
+sup = [p for k, _, p in vcalls if k == "supervise"]
+c.check("verify: after the retry the work is checked again -- passes, the second review sees PASSED, the run is in review",
+        len(sup) == 2 and "-> PASSED" in sup[1] and vrun["verify_state"] == "pass" and vrun["verify_code"] == 0
+        and vrun["verify_round"] == 1 and vrun["state"] == "review"
+        and sum(1 for e in O["_orch_get"](vid)["events"] if e["kind"] == "verify") == 2)
+c.check("verify: nothing left behind in the repo (no verify worktree, the repo still on main)",
+        "verify-wt" not in git("worktree", "list", cwd=vrepo).stdout and git("status", "--porcelain", cwd=vrepo).stdout == "")
+O["_orch_action"]("discard", {"id": vid})
+
+# a run with no change to test, a timeout, a cancel while it runs
+vfeat[:] = []
+vsup[:] = [finish("nothing to do")]
+
+
+def vspawn_nothing(argv, cwd, stdin_text, base, env=None):
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    kind = os.path.basename(base).rsplit("-", 1)[0]
+    vcalls.append((kind, cwd, stdin_text))
+    answer(base, plan_of({"id": "look", "role": "analyst", "title": "Look"}) if kind == "plan"
+           else vsup.pop(0) if kind == "supervise" else done(result="looked"))
+    return 22
+
+
+vkw["spawn"] = vspawn_nothing
+vid2 = O["_orch_create"]({"goal": "Only look at the code please", "cwd": vrepo, "verify": "python check.py"}, exe="claude.exe",
+                         spawn=vspawn_nothing)["id"]
+vtick(vid2); O["_orch_action"]("approve", {"id": vid2}); vtick(vid2, 4)
+vrun = O["_orch_get"](vid2)["run"]
+c.check("verify: no task changed anything -> not run, said so, straight on to the review",
+        vrun["verify_state"] == "skipped" and vrun["state"] == "review" and "NOT RUN: no task changed anything" in
+        [p for k, _, p in vcalls if k == "supervise"][-1])
+O["_orch_action"]("discard", {"id": vid2})
+
+trun = {"id": "t-verify", "repo": vrepo, "verify": "python check.py", "rounds": 0, "job_pid": 999999, "job_started": 1000.0,
+        "job_base": os.path.join(data_dir, "orch", "t-verify", "verify-1"), "job_kind": "verify"}
+tconn = O["_orch_connect"]()
+tconn.execute("INSERT INTO runs (id, repo, state, verify, job_kind, job_pid, job_base, job_started) VALUES (?,?,?,?,?,?,?,?)",
+              ("t-verify", vrepo, "supervising", "python check.py", "verify", 999999, trun["job_base"], 1000.0))
+os.makedirs(os.path.dirname(trun["job_base"]), exist_ok=True)
+open(trun["job_base"] + ".out", "w").write("still testing...\n")
+killed_v = []
+O["_orch_poll_verify"](tconn, trun, 1000.0 + 60, alive=lambda pid: True, kill=lambda pid: killed_v.append(pid))
+c.check("verify: still running within its time -> waits", O["_orch_load"](tconn, "t-verify")[0]["job_kind"] == "verify" and not killed_v)
+O["_orch_poll_verify"](tconn, trun, 1000.0 + O["_ORCH_VERIFY_TIMEOUT_S"] + 1, alive=lambda pid: True, kill=lambda pid: killed_v.append(pid))
+tr = O["_orch_load"](tconn, "t-verify")[0]
+c.check("verify: over its time -> its process tree killed, 'timeout', back to the run's next step",
+        killed_v == [999999] and tr["verify_state"] == "timeout" and "stopped after 20 minutes" in tr["verify_tail"]
+        and tr["state"] == "running" and not tr["job_kind"])
+c.check("verify: the review is told a timeout is no pass", "TIMED OUT" in O["_orch_verify_text"](tr)
+        and "the goal is not met yet" in O["_orch_verify_text"](tr) and O["_orch_verify_text"](dict(tr, rounds=1)) == "")
+tconn.execute("UPDATE runs SET state='supervising', job_kind='verify', job_pid=999999, job_started=? WHERE id='t-verify'", (time.time(),))
+tconn.commit()
+real_stop = g["_orch_stop"]
+g["_orch_stop"] = lambda pid, since=None, alive=None, kill=None: bool(pid)
+try:
+    tr, tts = O["_orch_load"](tconn, "t-verify")
+    O["_orch_halt"](tconn, tr, tts, time.time(), git=lambda args, cwd, timeout=None: (0, "", ""))
+finally:
+    g["_orch_stop"] = real_stop
+c.check("verify: cancel while it runs -> the runner is stopped, logged, no cost",
+        any(e["kind"] == "verify" and "stopped before it finished" in e["message"] and not e["cost_usd"]
+            for e in tconn.execute("SELECT * FROM events WHERE run_id='t-verify'").fetchall()))
+tconn.close()
+c.check("verify: the runner's process counts as a job (cancel can find it)", "python.exe" in O["_ORCH_JOB_EXES"])
+
+# where it comes from: schedules, entities, the one-agent comparison
+c.check("verify: a schedule keeps it and an edit names it", O["_orch_validate_repeat"](
+    {"goal": "Every day: tidy the docs", "cwd": vrepo, "schedule": {"type": "daily", "at": "08:00"}, "verify": "npm test"})[0]["verify"]
+        == "npm test" and ("verify", "verify command") in O["_ORCH_SCHEDULE_EDITABLE"])
+c.check("verify: an entity keeps it", O["_orch_validate_entity"](dict(base_ent, verify="pytest -q"))[0]["verify"] == "pytest -q"
+        and "one line" in O["_orch_validate_entity"](dict(base_ent, verify="a\nb"))[1])
+m0 = {"cost_total": 0.0, "cost_coordination": 0.0, "duration_s": None}
+st = O["_orch_stats_from"]([({"state": "merged", "verify_state": "pass"}, [], m0), ({"state": "discarded", "verify_state": "fail"}, [], m0),
+                            ({"state": "merged", "verify_state": "skipped"}, [], m0), ({"state": "merged"}, [], m0)])
+c.check("stats: how often the work passed your check (runs with a real check only)", st["verified_runs"] == 2
+        and st["verify_pass_rate"] == 0.5 and O["_orch_stats_from"]([])["verify_pass_rate"] is None)
+shutil.rmtree(vrepo, ignore_errors=True)
+
+# ── job files: a closed run's go 30 days after (audit FIND-010) ──
+D = 86400
+pick = O["_orch_prune_pick"]
+pf, pfiles = pick([("r-old", 0, True, []), ("r-new", 0, True, []), ("r-review", 0, True, []), ("r-gone", 100 * D - 31 * D, True, []),
+                   ("r-gone-new", 100 * D - 5 * D, True, []), ("pids.json", 0, False, []),
+                   ("entity-shop", 0, True, [("scout-1.out", 100 * D - 40 * D), ("scout-2.out", 100 * D - 1 * D),
+                                             ("scout-9.out", 100 * D - 40 * D)])],
+                  {"r-old": ("merged", 100 * D - 31 * D), "r-new": ("discarded", 100 * D - 29 * D), "r-review": ("review", 1.0)},
+                  ["entity-shop" + os.sep + "scout-9"], 100 * D)
+c.check("job files: a run closed 30+ days ago goes; one closed lately, one still in review, a recent orphan stay; a long-untouched orphan goes",
+        sorted(pf) == ["r-gone", "r-old"])
+c.check("job files: an entity's old scout files go one by one -- never the one it is reading, never its folder",
+        pfiles == [("entity-shop", "scout-1.out")])
+proot = tempfile.mkdtemp()
+pconn = O["_orch_connect"]()
+for rid_, st_, fin_ in (("p-old", "cancelled", time.time() - 40 * D), ("p-new", "merged", time.time() - D), ("p-run", "running", None)):
+    pconn.execute("INSERT INTO runs (id, state, finished, updated) VALUES (?,?,?,?)", (rid_, st_, fin_, time.time() - 50 * D))
+    os.makedirs(os.path.join(proot, rid_)); open(os.path.join(proot, rid_, "dev-1.in"), "w").write("prompt with secrets")
+pconn.commit(); pconn.close()
+pr = O["_orch_prune_jobs"](root=proot)
+c.check("job files: pruned on disk -- the old closed run's folder only", pr == {"folders": 1, "files": 0}
+        and sorted(os.listdir(proot)) == ["p-new", "p-run"])
+shutil.rmtree(proot, ignore_errors=True)
+
+# ── what a member may not do in orchestration (the owner may do all) ──
+mconn = O["_orch_connect"](os.path.join(data_dir, "member-check.db"))
+mconn.execute("INSERT INTO agents (id, data, updated) VALUES ('mailer', ?, 1)", (json.dumps(
+    {"id": "mailer", "name": "Mailer", "brief": "sends mail", "tools": ["Read"], "model": "sonnet", "budget_usd": 1.0,
+     "mcp": ["claude.ai Gmail"], "skills": [], "sensitive": False}),))
+mconn.execute("INSERT INTO runs (id, goal, repo, state, kind) VALUES ('rrepo', 'g', 'C:/code', 'running', 'repo')")
+mconn.execute("INSERT INTO runs (id, goal, repo, state, kind) VALUES ('rws', 'g', 'C:/ws', 'running', 'workspace')")
+mconn.execute("INSERT INTO schedules (id, data) VALUES ('srepo', ?)", (json.dumps({"cwd": "C:/code", "workspace": "", "team": []}),))
+mconn.execute("INSERT INTO schedules (id, data) VALUES ('sws', ?)", (json.dumps({"cwd": "", "workspace": "notes", "team": ["mailer"]}),))
+mr = lambda act, data: O["_orch_member_refusal"](act, data, mconn)
+c.check("member: merge, discard, a gate and Orchestrate's settings are the owner's",
+        all("only the owner" in mr(a, {"id": "rws"}) for a in ("merge", "discard", "gate", "settings")))
+c.check("member: may approve, cancel, edit a plan, judge, run / pause an entity or schedule",
+        not any(mr(a, {"id": "rrepo"}) for a in ("approve", "cancel", "plan", "judge", "entity_run", "entity_pause",
+                                                  "schedule_run", "schedule_pause", "start")))
+c.check("member: an agent with a shell or a connected service is the owner's to make",
+        "shell" in mr("agent_save", {"tools": ["Read", "Bash"]}) and "shell" in mr("agent_save", {"tools": ["PowerShell"]})
+        and "MCP" in mr("agent_save", {"tools": ["Read"], "mcp": ["claude.ai Gmail"]})
+        and mr("agent_save", {"tools": ["Read", "Edit", "Write", "WebSearch"]}) == "")
+c.check("member: runs in a workspace, not in a repository folder",
+        "workspace" in mr("create", {"goal": "x", "cwd": "C:/code"}) and mr("create", {"goal": "x", "workspace": "notes"}) == ""
+        and "workspace" in mr("entity_save", {"where": "repo", "cwd": "C:/code"}) and mr("entity_save", {"where": "workspace", "workspace": "n"}) == ""
+        and "workspace" in mr("schedule_save", {"cwd": "C:/code"}) and mr("schedule_save", {"workspace": "notes"}) == "")
+c.check("member: the built-in team (developer with its shell) is fine in a workspace; an MCP agent in the team isn't",
+        mr("create", {"workspace": "notes", "team": ["research", "developer", "qa"]}) == ""
+        and "Mailer" in mr("create", {"workspace": "notes", "team": ["research", "mailer"]})
+        and "Mailer" in mr("entity_save", {"where": "workspace", "workspace": "n", "team": ["mailer"]}))
+c.check("member: editing a schedule -- where it works and its team are the stored ones unless changed",
+        "workspace" in mr("schedule_save", {"id": "srepo", "goal": "now my goal", "workspace": "notes"})
+        and "Mailer" in mr("schedule_save", {"id": "sws", "goal": "new goal"})
+        and mr("schedule_save", {"id": "sws", "goal": "new goal", "team": ["research"]}) == "")
+mconn.execute("INSERT INTO schedules (id, data) VALUES ('sver', ?)", (json.dumps({"cwd": "", "workspace": "notes", "team": [], "verify": "pytest"}),))
+c.check("member: a verify command runs on the owner's PC -- a member can't set or change one, may keep the owner's",
+        "verify command" in mr("create", {"workspace": "notes", "verify": "rm -rf ."}) and mr("create", {"workspace": "notes", "verify": ""}) == ""
+        and "verify command" in mr("schedule_save", {"id": "sver", "verify": "evil"}) and mr("schedule_save", {"id": "sver", "verify": "pytest"}) == ""
+        and "verify command" in mr("entity_save", {"where": "workspace", "workspace": "n", "verify": "x"}))
+c.check("member: a one-agent comparison only of a workspace run",
+        "workspace" in mr("baseline", {"id": "rrepo"}) and mr("baseline", {"id": "rws"}) == "")
+mconn.close()
 
 c.finish()

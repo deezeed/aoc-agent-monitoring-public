@@ -76,6 +76,9 @@ _ORCH_RUN_BUDGET = (0.5, 50.0)   # $ per run, clamped
 _ORCH_PLANNER_BUDGET = 1.0
 _ORCH_LATER_MAX_DAYS = 60        # a run for later starts within this
 _orch_lock = threading.RLock()
+# when the engine step in progress began (0 = none): a code reload waits for
+# it (_restart_blockers) -- a step starts agents and git worktrees
+_orch_stepping = [0]
 
 _ORCH_RESULT_SCHEMA = {
     "type": "object",
@@ -585,6 +588,66 @@ def _orch_catalog(fresh=False):
             "scanning": c["scanning"] or not c["at"], "error": c["error"]}
 
 
+def _orch_restore_backup(filename):
+    """Restore orchestration.db from backups/<filename> (POST /restore_backup
+    routes orchestration_*.db here). Refused while anything runs -- a live
+    agent, planner, supervisor or scout would write into, or be orphaned
+    by, the swapped DB. Under _orch_lock so no tick starts one meanwhile.
+    The current DB is first saved as orchestration_PRE_RESTORE_<ts>.db;
+    the copy goes through sqlite's .backup() into the live file, so open
+    connections see the restored pages instead of a file swapped under
+    them."""
+    backup_dir = os.path.join(AOC_DIR, "backups")
+    if os.path.basename(filename) != filename or filename.endswith("_CORRUPT.db"):
+        return {"ok": False, "error": "invalid filename"}
+    src_path = os.path.join(backup_dir, filename)
+    if not os.path.isfile(src_path):
+        return {"ok": False, "error": "backup file not found"}
+    try:
+        src = sqlite3.connect(src_path)
+        try:
+            check = src.execute("PRAGMA integrity_check").fetchall()
+            has_runs = src.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone()
+        finally:
+            src.close()
+    except Exception as e:
+        return {"ok": False, "error": f"unreadable backup: {e}"}
+    if check != [("ok",)] or not has_runs:
+        return {"ok": False, "error": "backup is not a healthy orchestration database"}
+    with _orch_lock:
+        pre_name = ""
+        if os.path.exists(ORCH_DB):
+            conn = _orch_connect()
+            try:
+                marks = ",".join("?" * len(_ORCH_ACTIVE))
+                busy = (conn.execute(f"SELECT COUNT(*) FROM runs WHERE state IN ({marks}) OR job_pid IS NOT NULL",
+                                     _ORCH_ACTIVE).fetchone()[0]
+                        + conn.execute("SELECT COUNT(*) FROM tasks WHERE state IN ('running','starting')").fetchone()[0]
+                        + conn.execute("SELECT COUNT(*) FROM entities WHERE job_pid IS NOT NULL").fetchone()[0])
+                if busy:
+                    return {"ok": False, "error": "orchestration is busy -- cancel or wait for running runs, "
+                                                  "agents and scouts, then restore"}
+                pre_name = f"orchestration_PRE_RESTORE_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.db"
+                if not _snapshot_sqlite(conn, os.path.join(backup_dir, pre_name)):
+                    return {"ok": False, "error": "could not save a healthy copy of the current database first"}
+            finally:
+                conn.close()
+        try:
+            src = sqlite3.connect(src_path)
+            dst = sqlite3.connect(ORCH_DB, timeout=30)
+            try:
+                src.backup(dst)
+                check = dst.execute("PRAGMA integrity_check").fetchall()
+            finally:
+                dst.close()
+                src.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e), "pre_restore_backup": pre_name}
+        if check != [("ok",)]:
+            return {"ok": False, "error": "restored database failed integrity check", "pre_restore_backup": pre_name}
+        _orch_connect().close()  # older backup -> add the columns this version expects
+    return {"ok": True, "pre_restore_backup": pre_name}
+
 # ── storage ───────────────────────────────────────────────────────────────
 def _orch_connect(path=None):
     conn = sqlite3.connect(path or ORCH_DB, timeout=10)
@@ -634,7 +697,10 @@ def _orch_connect(path=None):
                              ("runs", "start_at", "REAL"), ("runs", "schedule_id", "TEXT DEFAULT ''"),
                              ("tasks", "cost_est", "INTEGER DEFAULT 0"), ("events", "cost_est", "INTEGER DEFAULT 0"),
                              ("tasks", "merge_state", "TEXT DEFAULT ''"),
-                             ("entity_events", "cost_est", "INTEGER DEFAULT 0")):
+                             ("entity_events", "cost_est", "INTEGER DEFAULT 0"),
+                             ("runs", "verify", "TEXT DEFAULT ''"), ("runs", "verify_state", "TEXT DEFAULT ''"),
+                             ("runs", "verify_code", "INTEGER"), ("runs", "verify_tail", "TEXT DEFAULT ''"),
+                             ("runs", "verify_secs", "REAL"), ("runs", "verify_round", "INTEGER DEFAULT -1")):
         if col not in have[table]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     return conn
@@ -832,12 +898,12 @@ def _orch_next(run, tasks, spent):
         if bad:
             acts.append(("block", t["id"], "input task(s) did not finish: " + ", ".join(bad)))
             state[t["id"]] = "blocked"
-    running = sum(1 for t in tasks if t["state"] == "running")
+    running = sum(1 for t in tasks if t["state"] in ("running", "starting"))
     slots = max(0, int(run.get("max_parallel") or 1) - running)
     # a running manager's cost_usd is its team's spend so far, already in `spent`: only the rest of its
     # budget is still to come. (A plain task's cost_usd is its earlier attempts': this one may use it all.)
     reserved = spent + sum(max(0.0, t["budget_usd"] - float(t.get("cost_usd") or 0)) if t["role"] == "manager"
-                           else t["budget_usd"] for t in tasks if t["state"] == "running")
+                           else t["budget_usd"] for t in tasks if t["state"] in ("running", "starting"))
     for t in tasks:
         if state[t["id"]] != "pending" or not all(state.get(d) == "done" for d in t["depends_on"]):
             continue
@@ -855,7 +921,7 @@ def _orch_next(run, tasks, spent):
         state[t["id"]] = "running"
         slots -= 1
         reserved += t["budget_usd"]
-    if not any(s in ("pending", "running", "gate") for s in state.values()):
+    if not any(s in ("pending", "running", "starting", "gate") for s in state.values()):
         # skipped by the budget just now -> nothing left anyway; a pending
         # task waiting on a running one keeps the run going
         acts.append(("supervise",))
@@ -1241,6 +1307,9 @@ def _orch_supervise_prompt(run, tasks, last_round):
                      "retrying that task can't help. Retry one of the conflicting tasks with feedback to build its "
                      "change so it can't collide, or finish and tell the reader which tasks conflict -- at merge time "
                      "they can keep one of them.")
+    verify = _orch_verify_text(run)
+    if verify:
+        lines.append(verify)
     if last_round:
         lines.append("This is the LAST review round: you must answer finish or fail.")
     return "\n".join(lines)
@@ -1329,7 +1398,8 @@ def _orch_view(run, tasks, events, now=None, children=None, parent=None, team_co
                                              "max_parallel", "budget_usd", "plan_summary", "single_agent", "report",
                                              "error", "rounds", "finished", "mode", "approve_teams", "parent_id",
                                              "parent_task", "team", "kind", "entity_id", "baseline_of", "verdict", "start_at",
-                                             "schedule_id")},
+                                             "schedule_id", "verify", "verify_state", "verify_code", "verify_tail",
+                                             "verify_secs", "verify_round", "job_kind")},
             "tasks": [dict({k: t.get(k) for k in ("id", "role", "title", "instructions", "done_criteria", "depends_on",
                                                    "model", "budget_usd", "state", "attempt", "feedback", "branch",
                                                    "started", "finished", "cost_usd", "turns", "session_id", "output",
@@ -1356,9 +1426,26 @@ def _orch_spawn(argv, cwd, stdin_text, base, popen=None, env=None):
                                         creationflags=_NO_WINDOW | (0x00000200 if os.name == "nt" else 0))
     finally:
         fin.close(), fout.close(), ferr.close()
+    # next to its output, the moment it exists: a monitor killed before it
+    # noted the pid in the DB finds the process here (_orch_resume_start)
+    try:
+        with open(base + ".pid", "w", encoding="utf-8") as f:
+            f.write(str(p.pid))
+    except OSError:
+        pass
     _own_claude_pids.add(p.pid)
     _orch_pid_register(p.pid)
     return p.pid
+
+
+def _orch_pid_file(base):
+    """The pid _orch_spawn noted in <base>.pid, or None."""
+    try:
+        with open(str(base) + ".pid", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        return pid if pid > 0 else None
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 # ── every AOC's workers, machine-wide ─────────────────────────────────────
@@ -1481,16 +1568,20 @@ def _orch_kill(pid):
         _log_bg_error("orchestration kill", e)
 
 
+_ORCH_JOB_EXES = ("claude.exe", "python.exe", "pythonw.exe")   # an agent / planner, or the verify runner
+
+
 def _orch_alive(pid):
-    """Is that claude.exe still running? A process list that could not be
-    read is "don't know", taken as running: read as gone, an agent still at
-    work would be judged on its half-written answer (and failed or retried)."""
+    """Is that claude.exe (or the verify runner) still running? A process
+    list that could not be read is "don't know", taken as running: read as
+    gone, an agent still at work would be judged on its half-written answer
+    (and failed or retried)."""
     if not pid:
         return False
     procs = _snapshot_processes()
     if procs is None:
         return True
-    return any(p == pid and exe == "claude.exe" for p, exe in procs)
+    return any(p == pid and exe in _ORCH_JOB_EXES for p, exe in procs)
 
 
 _ORCH_PID_SLACK_S = 120   # a process we start is up within this of the time we note for it
@@ -1672,6 +1763,18 @@ def _orch_start_task(conn, run, task, tasks, exe, now, spawn=None, git=None):
         return
     inputs = [t for t in tasks if t["id"] in task["depends_on"]]
     base = os.path.join(ORCH_DIR, run["id"], f"{task['id']}-{attempt}")
+    # Saved BEFORE the process exists (audit FIND-007): a monitor killed
+    # between the spawn and the step's commit left the task 'pending', and
+    # the next start removed the worktree the first agent was still working
+    # in and started a second one. Now a restart finds 'starting' and
+    # <base>.pid -> follows that process (_orch_resume_start).
+    try:
+        os.remove(base + ".pid")
+    except OSError:
+        pass
+    _orch_set_task(conn, run["id"], task["id"], state="starting", attempt=attempt, branch=branch, path=path, pid=None,
+                   job_base=base, started=now, finished=None, error="", output="", commits=0)
+    conn.commit()
     try:
         agent = _orch_task_agent(task)
         # claude.ai connectors only load without the API key: such an agent runs on your subscription
@@ -1684,11 +1787,33 @@ def _orch_start_task(conn, run, task, tasks, exe, now, spawn=None, git=None):
                        finished=now)
         _orch_event(conn, run["id"], "task_failed", f"could not start claude: {e}", task["id"], now=now)
         return
-    _orch_set_task(conn, run["id"], task["id"], state="running", attempt=attempt, branch=branch, path=path, pid=pid,
-                   job_base=base, started=now, finished=None, error="", output="", commits=0)
+    _orch_set_task(conn, run["id"], task["id"], state="running", pid=pid)
+    conn.commit()
     _orch_event(conn, run["id"], "task_started",
                 f"{_orch_task_agent(task).get('name') or task['role']} agent ({task['model']}, ${task['budget_usd']:.2f}), "
                 f"attempt {attempt}",
+                task["id"], now=now)
+
+
+def _orch_resume_start(conn, run, task, now, git=None):
+    """A task still 'starting' at the top of a step: the monitor that started
+    it died between saving that and saving the pid (inside one step nothing
+    else ever sees the state). <base>.pid exists -> the agent runs (or ran):
+    follow it as running, its answer and cost are read as usual. No pid
+    file -> it never started: back to pending with the same attempt, its
+    fresh worktree removed (no process is in it)."""
+    pid = _orch_pid_file(task.get("job_base"))
+    if pid:
+        _orch_set_task(conn, run["id"], task["id"], state="running", pid=pid)
+        _orch_event(conn, run["id"], "task_recovered",
+                    f"AOC restarted while this agent was starting -- its process (pid {pid}) is followed again, "
+                    "not started twice", task["id"], now=now)
+        return
+    if task.get("path") or task.get("branch"):
+        _wt_remove(run["repo"], task.get("path") or "", task.get("branch") or "", git)
+    _orch_set_task(conn, run["id"], task["id"], state="pending", attempt=max(0, int(task["attempt"] or 0) - 1),
+                   branch="", path="", job_base="", started=None, pid=None)
+    _orch_event(conn, run["id"], "task_recovered", "AOC restarted before this agent started -- it starts again",
                 task["id"], now=now)
 
 
@@ -1970,6 +2095,177 @@ def _orch_llm_budget(run, spent):
     return round(min(_ORCH_PLANNER_BUDGET, max(0.05, float(run.get("budget_usd") or 0) - float(spent or 0))), 2)
 
 
+# ── verify: AOC itself runs your check before the review (audit FIND-008) ──
+# A run may carry a verify command (e.g. `python -m pytest -q`). When its
+# tasks are done, before the orchestrator's review, AOC makes a throwaway
+# worktree -- the run's base commit with every done task's branch merged in
+# plan order, the way merge would -- and runs the command there through a
+# small detached runner (it outlives a monitor reload, like an agent), which
+# writes the exit code next to the output. Exit 0 = pass. The result (and the
+# end of the output) goes to the orchestrator's review, the merge screen and
+# the stats; a retry round is verified again. The command is the owner's
+# (members can't set one): it runs on this PC with your rights, no sandbox.
+_ORCH_VERIFY_TIMEOUT_S = 20 * 60
+_ORCH_VERIFY_MAX_LEN = 1000
+_ORCH_VERIFY_TAIL = 4000
+_ORCH_VERIFY_RUNNER = ("import subprocess, sys, time\n"
+                       "t = time.time()\n"
+                       "r = subprocess.run(sys.argv[1], shell=True)\n"
+                       "open(sys.argv[2], 'w').write('%d %.1f' % (r.returncode, time.time() - t))\n")
+
+
+def _orch_validate_verify(value):
+    """Pure: a verify command from a form -> (command, None) or (None, error). '' = none."""
+    v = str(value or "").strip()
+    if "\n" in v or "\r" in v:
+        return None, "the verify command is one line (join several with &&)"
+    if len(v) > _ORCH_VERIFY_MAX_LEN:
+        return None, f"the verify command is too long ({_ORCH_VERIFY_MAX_LEN} characters max)"
+    return v, None
+
+
+def _orch_verify_path(run):
+    return os.path.join(ORCH_DIR, run["id"], "verify-wt")
+
+
+def _orch_verify_cleanup(run, git=None):
+    """Remove the run's verify worktree (never its branches: it has none)."""
+    git = git or _wt_git
+    path = _orch_verify_path(run)
+    if os.path.isdir(path):
+        git(["worktree", "remove", "--force", path], run["repo"], timeout=60)
+        if os.path.isdir(path):
+            import shutil
+            shutil.rmtree(path, ignore_errors=True)
+        git(["worktree", "prune"], run["repo"])
+
+
+def _orch_verify_spawn(command, cwd, base, popen=None):
+    """Start the detached verify runner: output (stdout + stderr) in
+    <base>.out, '<exit code> <seconds>' in <base>.code when it ends. -> pid."""
+    import sys as _sys
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    py = os.path.join(os.path.dirname(_sys.executable), "python.exe")
+    py = py if os.path.exists(py) else _sys.executable
+    fout = open(base + ".out", "wb")
+    try:
+        p = (popen or subprocess.Popen)([py, "-c", _ORCH_VERIFY_RUNNER, command, base + ".code"], cwd=cwd,
+                                        stdin=subprocess.DEVNULL, stdout=fout, stderr=subprocess.STDOUT,
+                                        creationflags=_NO_WINDOW | (0x00000200 if os.name == "nt" else 0))
+    finally:
+        fout.close()
+    try:
+        with open(base + ".pid", "w", encoding="utf-8") as f:
+            f.write(str(p.pid))
+    except OSError:
+        pass
+    return p.pid
+
+
+def _orch_verify_read(base):
+    """Pure-ish: what the runner left -> (exit code or None, seconds or None, output tail)."""
+    code = secs = None
+    try:
+        with open(base + ".code", encoding="utf-8") as f:
+            parts = f.read().split()
+        code, secs = int(parts[0]), float(parts[1])
+    except (OSError, ValueError, IndexError, TypeError):
+        pass
+    try:
+        with open(base + ".out", "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - _ORCH_VERIFY_TAIL * 2))
+            tail = f.read().decode("utf-8", errors="replace")[-_ORCH_VERIFY_TAIL:]
+    except OSError:
+        tail = ""
+    return code, secs, tail
+
+
+def _orch_verify_record(conn, run, now, state, tail, code=None, secs=None):
+    """Note a verify result for this review round."""
+    _orch_set_run(conn, run["id"], now=now, verify_state=state, verify_code=code, verify_tail=str(tail or "")[-_ORCH_VERIFY_TAIL:],
+                  verify_secs=secs, verify_round=int(run.get("rounds") or 0))
+    word = {"pass": "passed", "fail": f"failed (exit {code})", "timeout": "timed out", "conflict": "not run: the tasks' work conflicts",
+            "skipped": "not run: no task changed anything", "error": "could not run"}.get(state, state)
+    last = [ln for ln in str(tail or "").strip().splitlines() if ln.strip()][-1:] or [""]
+    _orch_event(conn, run["id"], "verify", f"`{run['verify']}` {word}" + (f" in {secs:.0f} s" if secs is not None else "")
+                + (f" -- {last[0][:300]}" if state != "pass" and last[0] else ""), now=now)
+
+
+def _orch_start_verify(conn, run, tasks, now, git=None, spawn=None):
+    """Before the review: merge the done tasks' work into a throwaway
+    worktree and start the verify command there. -> True when it runs (the
+    run waits for it as its job), False when the result is already noted
+    (nothing to test, a conflict, git failed)."""
+    git = git or _wt_git
+    mergeable = _orch_mergeable(tasks)
+    ids = [i for i in (_orch_topo(tasks) or [t["id"] for t in tasks]) if i in mergeable]
+    if not ids:
+        _orch_verify_record(conn, run, now, "skipped", "")
+        return False
+    by_id = {t["id"]: t for t in tasks}
+    path = _orch_verify_path(run)
+    _orch_verify_cleanup(run, git)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rc, _, er = git(["worktree", "add", "--detach", path, run["base_sha"]], run["repo"], timeout=120)
+    if rc != 0:
+        _orch_verify_record(conn, run, now, "error", "could not make the test folder: " + _wt_err(er, "git worktree add failed"))
+        return False
+    for i in ids:
+        rc, _, er = git(["-c", "user.name=AOC", "-c", "user.email=aoc@localhost", "merge", "--no-ff", "--no-edit", "-m",
+                         f"verify: {by_id[i]['branch']}", by_id[i]["branch"]], path, timeout=120)
+        if rc != 0:
+            git(["merge", "--abort"], path)
+            _orch_verify_cleanup(run, git)
+            _orch_verify_record(conn, run, now, "conflict", f"'{i}' conflicts with the tasks merged before it: "
+                                + _wt_err(er, "git merge failed"))
+            return False
+    base = os.path.join(ORCH_DIR, run["id"], f"verify-{int(now)}")
+    pid = (spawn or _orch_verify_spawn)(run["verify"], path, base)
+    _orch_set_run(conn, run["id"], now=now, state="supervising", job_kind="verify", job_pid=pid, job_base=base, job_started=now)
+    _orch_event(conn, run["id"], "verify_started", f"`{run['verify']}` on {len(ids)} task(s)' work merged", now=now)
+    return True
+
+
+def _orch_poll_verify(conn, run, now, alive=None, kill=None, git=None):
+    """The verify runner: still running, or its result -> back to the run's
+    next step (the review)."""
+    alive, kill = alive or _orch_alive, kill or _orch_kill
+    base = run["job_base"]
+    code, secs, tail = _orch_verify_read(base)
+    running = code is None and alive(run["job_pid"]) and _orch_ours(run["job_pid"], run["job_started"])
+    if running and now - (run["job_started"] or now) <= _ORCH_VERIFY_TIMEOUT_S:
+        return
+    timed_out = running and _orch_stop(run["job_pid"], run["job_started"], alive, kill)
+    if timed_out:
+        state, tail = "timeout", tail + f"\n(stopped after {_ORCH_VERIFY_TIMEOUT_S // 60} minutes)"
+    elif code is None:
+        state, tail = "error", tail + "\n(the verify process ended without an exit code)"
+    else:
+        state = "pass" if code == 0 else "fail"
+    _orch_set_run(conn, run["id"], now=now, state="running", job_kind="", job_pid=None, job_base="", job_started=None)
+    _orch_verify_record(conn, dict(run, job_base=""), now, state, tail, code, secs)
+    _orch_verify_cleanup(run, git)
+
+
+def _orch_verify_text(run):
+    """Pure: the verify result for the orchestrator's review ('' = none this round)."""
+    if not run.get("verify") or int(run.get("verify_round") if run.get("verify_round") is not None else -1) \
+            != int(run.get("rounds") or 0):
+        return ""
+    st = run.get("verify_state") or ""
+    head = {"pass": "PASSED", "fail": f"FAILED (exit {run.get('verify_code')})", "timeout": "TIMED OUT",
+            "conflict": "NOT RUN: the tasks' work conflicts", "skipped": "NOT RUN: no task changed anything",
+            "error": "COULD NOT RUN"}.get(st, st.upper())
+    lines = ["", f"VERIFY (run by AOC itself on all done tasks' work merged, not by an agent): `{run['verify']}` -> {head}"]
+    if (run.get("verify_tail") or "").strip():
+        lines += ["last output:", _orch_clip(str(run["verify_tail"])[-2500:], 2600)]
+    if st in ("fail", "timeout", "conflict"):
+        lines.append("The check did not pass, so the goal is not met yet: retry the task(s) at fault with the failure as "
+                     "feedback, or -- in the last round -- finish / fail and say plainly in the report that the check fails.")
+    return "\n".join(lines)
+
+
 def _orch_start_llm(conn, run, kind, prompt, schema, exe, now, spawn=None, read_tools=False, budget=None, cwd=None):
     """Start the planner / supervisor. False = not now (the MCP server list
     the subscription needs isn't known yet)."""
@@ -2079,11 +2375,15 @@ def _orch_team_ids(conn, run):
     return [a["id"] for a in _orch_team(run, _orch_library(conn))]
 
 
-def _orch_step(conn, run_id, now=None, exe=None, spawn=None, alive=None, read=None, kill=None, git=None):
-    """One engine tick for one run."""
+def _orch_step(conn, run_id, now=None, exe=None, spawn=None, alive=None, read=None, kill=None, git=None, vspawn=None):
+    """One engine tick for one run. vspawn: starts the verify runner (tests)."""
     now = now or time.time()
     run, tasks = _orch_load(conn, run_id)
     if not run or run["state"] not in _ORCH_ACTIVE:
+        return
+    if run["job_kind"] == "verify":
+        _orch_poll_verify(conn, run, now, alive, kill, git)
+        conn.commit()
         return
     if run["job_kind"]:
         _orch_poll_llm(conn, run, tasks, now, alive, read, kill)
@@ -2100,7 +2400,9 @@ def _orch_step(conn, run_id, now=None, exe=None, spawn=None, alive=None, read=No
     if run["state"] != "running":
         return
     for t in tasks:
-        if t["state"] == "running" and t["role"] == "manager":
+        if t["state"] == "starting":
+            _orch_resume_start(conn, run, t, now, git)
+        elif t["state"] == "running" and t["role"] == "manager":
             _orch_poll_manager(conn, run, t, tasks, now, git)
         elif t["state"] == "running":
             _orch_poll_task(conn, run, t, tasks, now, alive, read, kill, git)
@@ -2124,6 +2426,14 @@ def _orch_step(conn, run_id, now=None, exe=None, spawn=None, alive=None, read=No
             run, tasks = _orch_load(conn, run_id)
             t = next(t for t in tasks if t["id"] == a[1])
             (_orch_start_manager if t["role"] == "manager" else _orch_start_task)(conn, run, t, tasks, exe, now, spawn, git)
+        elif a[0] == "supervise" and run.get("verify") and not run.get("parent_id") \
+                and int(run.get("verify_round") if run.get("verify_round") is not None else -1) != int(run.get("rounds") or 0):
+            # your check first (free, no tokens): the review then knows whether the work passes it
+            run, tasks = _orch_load(conn, run_id)
+            if _orch_start_verify(conn, run, tasks, now, git, vspawn):
+                break
+            run, tasks = _orch_load(conn, run_id)
+            acts.append(("supervise",))   # the result is noted: go on to the review now
         elif a[0] == "supervise" and run.get("baseline_of"):
             # the one-agent comparison: no orchestrator review (that's the point) -- its answer is the report
             run, tasks = _orch_load(conn, run_id)
@@ -2165,12 +2475,15 @@ def _orch_tick(now=None):
         conn = _orch_connect()
         try:
             for (rid,) in conn.execute("SELECT id FROM runs WHERE state IN ('planning','running','supervising')").fetchall():
+                _orch_stepping[0] = time.time()
                 try:
                     _orch_step(conn, rid, now)
                 except Exception as e:
                     # undo what the step half-wrote: the next run's commit would otherwise save it
                     conn.rollback()
                     _log_bg_error("orchestration step", e)
+                finally:
+                    _orch_stepping[0] = 0
             # runs whose start time has come (also one missed while AOC was off: it starts now, once)
             for (rid,) in conn.execute("SELECT id FROM runs WHERE state='scheduled' AND start_at <= ?",
                                        (now or time.time(),)).fetchall():
@@ -2208,17 +2521,46 @@ def _orch_tick(now=None):
 
 
 # ── Stats across runs (PDF ch. 9: measure before adding agents) ───────────
+def _orch_quantile(xs, q):
+    """Pure: the q-quantile (0..1) of xs, linear between the two nearest
+    values (the median of [1, 2, 3, 10] is 2.5) -> None for no values."""
+    xs = sorted(xs)
+    if not xs:
+        return None
+    i = (len(xs) - 1) * q
+    lo = int(i)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (i - lo)
+
+
+_ORCH_ENDED = ("review", "merged", "discarded", "failed", "cancelled")
+
+
 def _orch_stats_from(rows):
     """Pure: [(run, tasks, metrics)] of top-level runs -> totals, and per
     agent, per model and per kind of run (one team / hierarchical / an
-    entity's): how often it worked, what it cost, how long it took."""
+    entity's): how often it worked, what it cost, how long it took.
+    Plus what tells whether a change helped (PDF ch. 11, audit FIND-014):
+    the cost of one successful task (everything spent, coordination and
+    failed attempts included, / tasks done), first-pass success (done on
+    attempt 1 / finished tasks), retries per task, your interventions per
+    run, and the median / p90 / IQR of an ended run's time -- a few slow
+    runs move an average, not a median. A manager counts once through its
+    team's tasks, not as a task of its own."""
     def bucket():
         return {"n": 0, "done": 0, "failed": 0, "cost": 0.0, "secs": 0.0, "timed": 0, "retries": 0}
     agents, models, kinds = {}, {}, {}
     tot = {"runs": 0, "merged": 0, "discarded": 0, "failed": 0, "cancelled": 0, "cost": 0.0, "coordination": 0.0,
            "secs": 0.0}
+    q = {"tasks": 0, "done": 0, "first": 0, "retries": 0, "human": 0, "durations": [], "verified": 0, "verify_pass": 0}
     for run, tasks, m in rows:
         tot["runs"] += 1
+        if run.get("verify_state") in ("pass", "fail", "timeout", "conflict"):   # its last check of the work
+            q["verified"] += 1
+            q["verify_pass"] += run["verify_state"] == "pass"
+        q["human"] += int(m.get("human_interventions") or 0)
+        if run["state"] in _ORCH_ENDED and m.get("duration_s") is not None:
+            q["durations"].append(float(m["duration_s"]))
         tot["cost"] += m["cost_total"]
         tot["coordination"] += m["cost_coordination"]
         tot["secs"] += m["duration_s"] or 0
@@ -2233,6 +2575,11 @@ def _orch_stats_from(rows):
         for t in tasks:
             if t["state"] not in ("done", "failed", "blocked"):
                 continue
+            if t["role"] != "manager":
+                q["tasks"] += 1
+                q["done"] += t["state"] == "done"
+                q["first"] += t["state"] == "done" and int(t.get("attempt") or 1) <= 1
+                q["retries"] += max(0, int(t.get("attempt") or 1) - 1)
             name = "Manager" if t["role"] == "manager" else (_orch_task_agent(t).get("name") or t["role"])
             for b in (agents.setdefault(name, bucket()), models.setdefault(t.get("model") or "?", bucket())):
                 b["n"] += 1
@@ -2248,7 +2595,18 @@ def _orch_stats_from(rows):
                      avg_cost=round(b["cost"] / b["n"], 4) if b["n"] else 0, avg_s=round(b["secs"] / b["timed"], 1) if b["timed"] else None,
                      retries=b["retries"]) for k, b in sorted(d.items(), key=lambda kv: -kv[1]["n"])]
     ended = tot["merged"] + tot["discarded"]
-    return {"runs": tot["runs"], "merged": tot["merged"], "discarded": tot["discarded"], "failed": tot["failed"],
+    d = q["durations"]
+    p25, p75 = _orch_quantile(d, 0.25), _orch_quantile(d, 0.75)
+    r1 = lambda x: None if x is None else round(x, 1)
+    quality = {"tasks": q["tasks"], "tasks_done": q["done"],
+               "cost_per_success": round(tot["cost"] / q["done"], 4) if q["done"] else None,
+               "first_pass": round(q["first"] / q["tasks"], 3) if q["tasks"] else None,
+               "retry_rate": round(q["retries"] / q["tasks"], 3) if q["tasks"] else None,
+               "human_per_run": round(q["human"] / tot["runs"], 2) if tot["runs"] else None,
+               "ended_runs": len(d), "median_s": r1(_orch_quantile(d, 0.5)), "p90_s": r1(_orch_quantile(d, 0.9)),
+               "iqr_s": r1(p75 - p25) if d else None, "verified_runs": q["verified"],
+               "verify_pass_rate": round(q["verify_pass"] / q["verified"], 3) if q["verified"] else None}
+    return {**quality, "runs": tot["runs"], "merged": tot["merged"], "discarded": tot["discarded"], "failed": tot["failed"],
             "cancelled": tot["cancelled"], "kept_rate": round(tot["merged"] / ended, 3) if ended else None,
             "cost": round(tot["cost"], 4), "avg_cost": round(tot["cost"] / tot["runs"], 4) if tot["runs"] else 0,
             "coordination_share": round(tot["coordination"] / tot["cost"], 3) if tot["cost"] else 0,
@@ -2282,20 +2640,86 @@ def _orch_stats(days=90, now=None):
         conn.close()
 
 
+# ── What a member may not do (the owner may do all) ───────────────────────
+# Members work in workspaces (AOC's own folders) with agents that use no
+# connected service: a repository folder is the owner's code, and an MCP
+# agent runs on the owner's accounts (mail, drive, shop). Merging, discarding
+# and a sensitive agent's gate are the owner's decisions (audit FIND-003/004).
+# What the owner set up (a repo run, entity or schedule) members may still
+# approve, run now, pause or cancel -- not edit.
+_ORCH_OWNER_ACTS = {"merge": "merge results", "discard": "discard results", "gate": "allow or skip a gated task",
+                    "settings": "change Orchestrate's settings"}
+
+
+def _orch_member_refusal(act, data, conn=None):
+    """Why a member may not do this /orch/<act> ('' = they may)."""
+    if act in _ORCH_OWNER_ACTS:
+        return "only the owner can " + _ORCH_OWNER_ACTS[act]
+    data = data if isinstance(data, dict) else {}
+    if act == "agent_save":
+        if set(data.get("tools") or []) & set(_ORCH_SHELL_TOOLS) or data.get("mcp"):
+            return "only the owner can give an agent a shell (Bash / PowerShell) or a connected service (MCP)"
+        return ""
+    if act not in ("create", "schedule_save", "entity_save", "baseline"):
+        return ""
+    own = conn is None
+    conn = conn or _orch_connect()
+    try:
+        # a verify command runs on this PC with the owner's rights: only the owner sets or changes one
+        if act != "baseline" and "verify" in data:
+            stored = ""
+            if act == "schedule_save" and data.get("id"):
+                stored = ((_orch_schedule_load(conn, str(data["id"]))[1]) or {}).get("verify") or ""
+            elif act == "entity_save" and (data.get("old_id") or data.get("id")):
+                stored = ((_orch_entity_load(conn, str(data.get("old_id") or data.get("id")))[1]) or {}).get("verify") or ""
+            if str(data.get("verify") or "").strip() != stored:
+                return "only the owner can set a verify command (it runs on the owner's PC)"
+        team = data.get("team") or []
+        if act == "baseline":
+            run = _orch_load(conn, str(data.get("id") or ""))[0]
+            in_repo = bool(run) and (run.get("kind") or "repo") != "workspace"
+        elif act == "entity_save":
+            in_repo = data.get("where") != "workspace"
+        elif act == "schedule_save" and data.get("id"):
+            sch, old = _orch_schedule_load(conn, str(data["id"]))
+            in_repo = bool(sch) and not old.get("workspace")
+            team = data["team"] if "team" in data else (old or {}).get("team") or []
+        else:
+            in_repo = not str(data.get("workspace") or "").strip()
+        if in_repo:
+            return "members work in workspaces -- only the owner can use a repository folder"
+        lib = _orch_library(conn)
+        mcp = [lib[a]["name"] for a in team if a in lib and lib[a].get("mcp")]
+        if mcp:
+            return "only the owner can use agents with connected services (MCP): " + ", ".join(mcp)
+        return ""
+    finally:
+        if own:
+            conn.close()
+
+
 # ── What waits for you (Inbox, sidebar badge, toast + phone push) ─────────
 ORCH_NOTIFIED_FILE = os.path.join(AOC_DATA_DIR, "orch_notified.json")
 _orch_attention_state = {"items": [], "notified": None}
 
 
 def _orch_attention_items(conn):
-    """Plans to approve (not an entity's: it approves its own), team plans
-    you approve yourself, sensitive tasks at their gate, results to merge."""
+    """Plans to approve (an entity's only when it proposes: else it approves
+    its own), team plans you approve yourself, sensitive tasks at their gate,
+    results to merge."""
     items = []
+    proposing = set()
+    for e in conn.execute("SELECT id, data FROM entities").fetchall():
+        try:
+            if _orch_entity_autonomy(json.loads(e["data"])) == "propose":
+                proposing.add(e["id"])
+        except (ValueError, TypeError):
+            pass
     for r in conn.execute("SELECT id, goal, state, parent_id, parent_task, entity_id, updated, approve_teams FROM runs "
                           "WHERE state IN ('plan_ready', 'review')").fetchall():
         r = dict(r)
         kind = None
-        if r["state"] == "plan_ready" and not r["entity_id"]:
+        if r["state"] == "plan_ready" and (not r["entity_id"] or r["entity_id"] in proposing):
             kind = ("team_plan" if r["approve_teams"] else None) if r["parent_id"] else "plan"
         elif r["state"] == "review" and not r["parent_id"]:
             kind = "review"
@@ -2363,12 +2787,88 @@ def _orch_attention_refresh(conn, notify=None, now=None):
     return items
 
 
+# ── retention of job files (audit FIND-010) ──────────────────────────────
+# ORCH_DIR/<run>/ holds every prompt and answer of a run's planner, agents,
+# reviews and checks (.in / .out / .err) -- whole prompts and outputs, which
+# may carry data from connected services. Nothing reads them once a run is
+# over (its results live in orchestration.db), so a closed run's folder goes
+# 30 days after it closed; a folder whose run is gone, once untouched that
+# long; an entity's old scout files one by one (never the one it's reading).
+_ORCH_JOB_KEEP_DAYS = 30
+_ORCH_JOB_CLOSED = ("merged", "discarded", "failed", "cancelled")
+
+
+def _orch_prune_pick(entries, runs, active, now, days=_ORCH_JOB_KEEP_DAYS):
+    """Pure: what to delete. entries = [(name, mtime, is_dir, files)] of
+    ORCH_DIR, files = [(name, mtime)] of an entity folder; runs = {id: (state,
+    closed at)}; active = job bases still in use. -> (folders, entity files
+    as (folder, file))."""
+    cut = now - days * 86400
+    folders, files = [], []
+    for name, mtime, is_dir, inner in entries:
+        if not is_dir:
+            continue
+        if name.startswith("entity-"):
+            files += [(name, f) for f, fm in inner if fm < cut
+                      and not any(os.path.join(name, f).startswith(a) for a in active)]
+            continue
+        if name in runs:
+            state, closed = runs[name]
+            if state in _ORCH_JOB_CLOSED and closed and closed < cut:
+                folders.append(name)
+        elif mtime < cut:
+            folders.append(name)
+    return folders, files
+
+
+def _orch_prune_jobs(now=None, root=None):
+    """Delete what _orch_prune_pick picks. -> {folders, files} deleted."""
+    import shutil
+    now, root = now or time.time(), root or ORCH_DIR
+    if not os.path.isdir(root) or not os.path.exists(ORCH_DB):
+        return {"folders": 0, "files": 0}
+    with _orch_lock:
+        conn = _orch_connect()
+        try:
+            runs = {r["id"]: (r["state"], r["finished"] or r["updated"])
+                    for r in conn.execute("SELECT id, state, finished, updated FROM runs")}
+            active = [os.path.relpath(b, root) for (b,) in conn.execute(
+                "SELECT job_base FROM entities WHERE COALESCE(job_base,'')<>''")]
+        finally:
+            conn.close()
+    entries = []
+    for name in os.listdir(root):
+        p = os.path.join(root, name)
+        try:
+            inner = [(f, os.path.getmtime(os.path.join(p, f))) for f in os.listdir(p)] if name.startswith("entity-") \
+                and os.path.isdir(p) else []
+            entries.append((name, os.path.getmtime(p), os.path.isdir(p), inner))
+        except OSError:
+            continue
+    folders, files = _orch_prune_pick(entries, runs, active, now)
+    for name in folders:
+        shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+    for folder, f in files:
+        try:
+            os.remove(os.path.join(root, folder, f))
+        except OSError:
+            pass
+    return {"folders": len(folders), "files": len(files)}
+
+
 def _orch_worker():
+    pruned = 0.0
     while True:
         try:
             _orch_tick()
         except Exception as e:
             _log_bg_error("orchestration worker", e)
+        if time.time() - pruned > 86400:   # at start, then once a day
+            pruned = time.time()
+            try:
+                _orch_prune_jobs()
+            except Exception as e:
+                _log_bg_error("orchestration job retention", e)
         time.sleep(3)
 
 
@@ -2443,8 +2943,9 @@ def _orch_workspaces(root=None):
 # allow, a scout (`claude -p`, read-only tools in its folder) reads the
 # mission, the entity's memory and its recent runs and either names the next
 # concrete goal or says there's nothing to do now. A goal becomes an ordinary
-# run, whose plan the entity approves itself (within its per-run budget);
-# merging / accepting the results stays yours. Every finished run goes into
+# run. Its autonomy says who approves that run's plan: "execute" = the entity
+# itself (within its per-run budget), "propose" = you (the plan waits in the
+# Inbox). Merging / accepting the results always stays yours. Every finished run goes into
 # the entity's memory (goal, outcome -- you kept or dropped it -- cost,
 # summary), which the next scout reads.
 _ORCH_ENTITY_BUDGET_RUN = (0.5, 20.0)
@@ -2453,6 +2954,9 @@ _ORCH_ENTITY_BUDGET_MONTH = (1.0, 2000.0)
 _ORCH_ENTITY_MEMORY = 15            # finished runs remembered
 _ORCH_ENTITY_LIMIT_PCT = 90.0       # pause while a plan-limit window is this full
 _ORCH_ENTITY_SCOUT_BUDGET = 0.5
+_ORCH_AUTONOMY = ("propose", "execute")
+# an agent that can act beyond its worktree: run commands or use a connected service
+_ORCH_SHELL_TOOLS = ("Bash", "PowerShell")
 _ORCH_SCOUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -2528,6 +3032,9 @@ def _orch_validate_entity(data):
         cooldown = min(max(int(data.get("cooldown_min") or 10), 1), 24 * 60)
     except (TypeError, ValueError):
         return None, "bad number"
+    verify, err = _orch_validate_verify(data.get("verify"))
+    if err:
+        return None, err
     b_run = _orch_clamp(data.get("budget_run"), _ORCH_ENTITY_BUDGET_RUN, 3.0)
     b_day = _orch_clamp(data.get("budget_day"), _ORCH_ENTITY_BUDGET_DAY, 10.0)
     b_month = _orch_clamp(data.get("budget_month"), _ORCH_ENTITY_BUDGET_MONTH, 100.0)
@@ -2538,7 +3045,22 @@ def _orch_validate_entity(data):
             "team": [str(a) for a in (data.get("team") or [])][:20], "model": model,
             "mode": "hierarchical" if data.get("mode") == "hierarchical" else "flat", "max_parallel": par,
             "budget_run": b_run, "budget_day": b_day, "budget_month": b_month, "schedule": out_sched,
-            "loop": data.get("loop") is True, "cooldown_min": cooldown}, None
+            "loop": data.get("loop") is True, "cooldown_min": cooldown, "verify": verify,
+            "autonomy": data.get("autonomy") if data.get("autonomy") in _ORCH_AUTONOMY else None}, None
+
+
+def _orch_entity_autonomy(cfg):
+    """Pure: who approves an entity's plans. An entity saved before autonomy
+    existed keeps what it did then: it approves them itself."""
+    a = (cfg or {}).get("autonomy")
+    return a if a in _ORCH_AUTONOMY else "execute"
+
+
+def _orch_entity_default_autonomy(agents):
+    """Pure: a new entity whose team can run commands or use a connected
+    service proposes its plans (you approve); a read-only team executes."""
+    risky = any(set(a.get("tools") or []) & set(_ORCH_SHELL_TOOLS) or a.get("mcp") for a in agents or [])
+    return "propose" if risky else "execute"
 
 
 def _orch_entity_due(cfg, ent, last_end, now):
@@ -2644,7 +3166,7 @@ def _orch_entity_load(conn, eid):
         ent["memory"] = json.loads(ent.get("memory") or "[]")
     except ValueError:
         ent["memory"] = []
-    return ent, dict(cfg, id=eid)
+    return ent, dict(cfg, id=eid, autonomy=_orch_entity_autonomy(cfg))
 
 
 def _orch_entity_event(conn, eid, kind, message="", cost=0.0, run_id="", now=None, est=False):
@@ -2720,7 +3242,7 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
             return
         body = {"goal": str(d["goal"]).strip()[:8000], "model": cfg["model"], "max_parallel": cfg["max_parallel"],
                 "budget_usd": cfg["budget_run"], "mode": d.get("mode") if d.get("mode") in _ORCH_MODES else cfg["mode"],
-                "team": cfg["team"], "entity_id": eid}
+                "team": cfg["team"], "entity_id": eid, "verify": cfg.get("verify") or ""}
         body.update({"workspace": cfg["workspace"]} if cfg["where"] == "workspace" else {"cwd": cfg["cwd"]})
         r = _orch_create(body, now=now, exe=exe, spawn=spawn, git=git, conn=conn)
         if not r.get("ok"):
@@ -2733,14 +3255,18 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
         return
     active = next((r for r in runs if r["state"] in _ORCH_RUN_ACTIVE), None)
     if active:
-        if active["state"] == "plan_ready":
+        note = ""
+        if active["state"] == "plan_ready" and cfg["autonomy"] == "execute":
             run, tasks = _orch_load(conn, active["id"])
             _orch_set_run(conn, active["id"], now=now, state="running")
             _orch_event(conn, active["id"], "approved", f"plan approved by entity '{cfg['name']}' "
                         f"(within its ${cfg['budget_run']:.2f} per run): {len(tasks)} task(s)", now=now)
-        state = "waiting_you" if active["state"] == "review" else "running"
-        if ent.get("state") != state:
-            _orch_entity_set(conn, eid, now=now, state=state, note="")
+            active["state"] = "running"
+        elif active["state"] == "plan_ready":
+            note = "its plan waits for your approval (Inbox)"
+        state = "waiting_you" if active["state"] in ("review", "plan_ready") else "running"
+        if (ent.get("state"), ent.get("note") or "") != (state, note):
+            _orch_entity_set(conn, eid, now=now, state=state, note=note)
         return
     if ent.get("paused") and not ent.get("run_now"):
         if ent.get("state") != "paused":
@@ -2871,6 +3397,9 @@ def _orch_create(data, now=None, exe=None, spawn=None, git=None, conn=None):
     start_at, err = _orch_start_at(data.get("start_at"), now)
     if err:
         return {"ok": False, "error": err}
+    verify, err = _orch_validate_verify(data.get("verify"))
+    if err:
+        return {"ok": False, "error": err}
     exe = exe or _find_claude_exe()
     if not exe:
         return {"ok": False, "error": "Claude Code (claude) not found on this PC"}
@@ -2897,13 +3426,13 @@ def _orch_create(data, now=None, exe=None, spawn=None, git=None, conn=None):
             while conn.execute("SELECT 1 FROM runs WHERE id=?", (rid,)).fetchone():
                 rid += "x"
             conn.execute("""INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model,
-                            max_parallel, budget_usd, mode, approve_teams, team, kind, entity_id, start_at, schedule_id)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            max_parallel, budget_usd, mode, approve_teams, team, kind, entity_id, start_at, schedule_id, verify)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                          (rid, now, now, goal, facts["repo"], facts["base"], facts["base_sha"],
                           "planning" if start_at is None else "scheduled", model, par, budget, mode,
                           1 if data.get("approve_teams") is True else 0, json.dumps(team), kind,
                           re.sub(r"[^a-z0-9-]", "", str(data.get("entity_id") or ""))[:32], start_at,
-                          re.sub(r"[^a-z0-9-]", "", str(data.get("schedule_id") or ""))[:32]))
+                          re.sub(r"[^a-z0-9-]", "", str(data.get("schedule_id") or ""))[:32], verify))
             # a scheduled or entity run is started by AOC, not by you (found live: it showed "1 of your actions")
             _orch_event(conn, rid, "created", goal[:500], human=not (data.get("schedule_id") or data.get("entity_id")),
                         now=now)
@@ -2981,7 +3510,10 @@ def _orch_cleanup(run, tasks, git=None, keep_merged=False):
     reboot may be someone else's now), remove every worktree and branch of
     the run. -> {"tasks": ids of the tasks killed, "job": planner/reviewer killed?}."""
     git = git or _wt_git
-    killed = {"tasks": {t["id"] for t in tasks if t.get("pid") and _orch_stop(t["pid"], t.get("started"))},
+    pids = {t["id"]: t.get("pid") or (_orch_pid_file(t.get("job_base")) if t["state"] == "starting" else None)
+            for t in tasks}
+    started = {t["id"]: t.get("started") for t in tasks}
+    killed = {"tasks": {tid for tid, pid in pids.items() if pid and _orch_stop(pid, started[tid])},
               "job": bool(run.get("job_pid")) and _orch_stop(run["job_pid"], run.get("job_started"))}
     for t in tasks:
         if t.get("path") and os.path.isdir(t["path"]):
@@ -2989,6 +3521,7 @@ def _orch_cleanup(run, tasks, git=None, keep_merged=False):
         if t.get("branch"):
             git(["branch", "-d" if keep_merged else "-D", t["branch"]], run["repo"])
     git(["worktree", "prune"], run["repo"])
+    _orch_verify_cleanup(run, git)
     return killed
 
 
@@ -3002,7 +3535,7 @@ def _orch_halt(conn, run, tasks, now, git=None, why="cancelled"):
     job_budget = _orch_llm_budget(run, _orch_spent(conn, run["id"]))
     killed = _orch_cleanup(run, tasks, git)
     for t in tasks:
-        if t["state"] not in ("pending", "running", "gate"):
+        if t["state"] not in ("pending", "running", "starting", "gate"):
             if t.get("branch"):
                 _orch_set_task(conn, run["id"], t["id"], branch="")
             continue
@@ -3015,7 +3548,9 @@ def _orch_halt(conn, run, tasks, now, git=None, why="cancelled"):
             cost = _orch_spent(conn, t["child_id"])   # its team's spend, its own kills included (closed first)
         _orch_set_task(conn, run["id"], t["id"], state="skipped", pid=None, error=why, finished=now, cost_usd=cost,
                        cost_est=est, branch="")
-    if killed["job"]:
+    if killed["job"] and run.get("job_kind") == "verify":
+        _orch_event(conn, run["id"], "verify", f"stopped before it finished ({why})", now=now)
+    elif killed["job"]:
         used, note = _orch_killed_cost(job_budget, run.get("job_base"))
         _orch_event(conn, run["id"], "plan_failed" if run.get("job_kind") == "plan" else "supervise",
                     f"stopped before it answered ({why}) -- {note}", cost=used, now=now, est=True)
@@ -3294,10 +3829,11 @@ def _orch_baseline(data, now=None):
                 return {"ok": False, "error": "this run already has its one-agent version"}
             budget = round(min(float(run["budget_usd"]), 20.0), 2)
             conn.execute("""INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model, max_parallel,
-                            budget_usd, plan_summary, mode, team, kind, baseline_of)
-                            VALUES (?,?,?,?,?,?,?,'running',?,1,?,?,'flat','["developer"]',?,?)""",
+                            budget_usd, plan_summary, mode, team, kind, baseline_of, verify)
+                            VALUES (?,?,?,?,?,?,?,'running',?,1,?,?,'flat','["developer"]',?,?,?)""",
                          (bid, now, now, run["goal"], run["repo"], run["base"], run["base_sha"], run["model"], budget,
-                          "One developer does the whole goal alone, for comparison.", run.get("kind") or "repo", rid))
+                          "One developer does the whole goal alone, for comparison.", run.get("kind") or "repo", rid,
+                          run.get("verify") or ""))
             _orch_insert_tasks(conn, bid, [{"id": "solo", "role": "developer", "title": "The whole goal, alone",
                                             "instructions": run["goal"] + "\n\nDo the whole goal yourself: there is no "
                                             "team, no plan and no review after you.",
@@ -3527,6 +4063,9 @@ def _orch_entity_save(data, now=None):
         try:
             lib = _orch_library(conn)
             cfg["team"] = [a for a in cfg["team"] if a in lib] or list(_ORCH_AGENT_ROLES)
+            if cfg["autonomy"] is None:
+                prev = _orch_entity_load(conn, old or cfg["id"])[1]
+                cfg["autonomy"] = prev["autonomy"] if prev else _orch_entity_default_autonomy([lib[a] for a in cfg["team"]])
             if old and old != cfg["id"]:
                 if conn.execute("SELECT 1 FROM entities WHERE id=?", (cfg["id"],)).fetchone():
                     return {"ok": False, "error": f"an entity called '{cfg['id']}' already exists"}
@@ -3642,7 +4181,10 @@ def _orch_validate_repeat(data):
     b_month = _orch_clamp(data.get("budget_month"), _ORCH_ENTITY_BUDGET_MONTH, max(100.0, b_day))
     if b_run > b_day or b_day > b_month:
         return None, "budgets must grow: per run <= per day <= per month"
-    return {"goal": goal, "cwd": cwd, "workspace": ws, "model": model, "max_parallel": par, "budget_usd": b_run,
+    verify, err = _orch_validate_verify(data.get("verify"))
+    if err:
+        return None, err
+    return {"verify": verify, "goal": goal, "cwd": cwd, "workspace": ws, "model": model, "max_parallel": par, "budget_usd": b_run,
             "mode": mode, "approve_teams": mode == "hierarchical" and data.get("approve_teams") is True,
             "team": [str(a) for a in (data.get("team") or [])][:20], "schedule": sched,
             "budget_day": b_day, "budget_month": b_month, "auto_approve": data.get("auto_approve") is True}, None
@@ -3738,7 +4280,8 @@ def _orch_schedule_fire(conn, sch, cfg, last, why, now, exe=None, spawn=None, gi
     if not _orch_proc_env()[2]:
         return None, None   # the MCP server list isn't known yet (scanning): fire next tick
     body = {k: cfg[k] for k in ("goal", "model", "max_parallel", "budget_usd", "mode", "approve_teams", "team")}
-    body.update({"workspace": cfg["workspace"]} if cfg.get("workspace") else {"cwd": cfg["cwd"]}, schedule_id=sid)
+    body.update({"workspace": cfg["workspace"]} if cfg.get("workspace") else {"cwd": cfg["cwd"]}, schedule_id=sid,
+                verify=cfg.get("verify") or "")
     res = _orch_create(body, now=now, exe=exe, spawn=spawn, git=git, conn=conn)
     if not res.get("ok"):
         err = str(res.get("error") or "failed")
@@ -3852,7 +4395,7 @@ def _orch_schedule_save(data, now=None, git=None):
 _ORCH_SCHEDULE_EDITABLE = (("goal", "goal"), ("schedule", "timing"), ("team", "team"), ("model", "orchestrator"),
                            ("max_parallel", "parallel agents"), ("mode", "structure"), ("approve_teams", "team plans"),
                            ("budget_usd", "run budget"), ("budget_day", "day cap"), ("budget_month", "month cap"),
-                           ("auto_approve", "approves its plans"))
+                           ("auto_approve", "approves its plans"), ("verify", "verify command"))
 
 
 def _orch_schedule_edit(sid, data, now):
