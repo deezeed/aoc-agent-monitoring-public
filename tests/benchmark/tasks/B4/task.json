@@ -1,0 +1,10 @@
+{
+  "id": "B4",
+  "category": "Data",
+  "title": "Clean a messy CSV and save an aggregation",
+  "goal": "Write clean_sales.py, run as `python clean_sales.py <input.csv> <output.csv>`. The input has the columns date,region,amount (see data/sales.csv). Cleaning rules: trim whitespace around every value; region is case-insensitive and is written in Title Case; amount may use a decimal comma (12,50), a euro sign and spaces, also as a thousands separator (\"€ 7.00\", \"1 000,00\"); a row whose amount is empty or not a number is skipped; rows that are exactly the same after cleaning count once. The output has the header region,total,count -- one row per region, sorted by region name, total with exactly 2 decimals. Then run it on data/sales.csv and commit the result as out/by_region.csv. Standard library only. Do not change data/, expected/ or check_output.py.",
+  "verify": "python clean_sales.py data/sales.csv out/check.csv && python check_output.py out/check.csv expected/by_region.csv && python check_output.py out/by_region.csv expected/by_region.csv",
+  "hidden": "python clean_sales.py _hidden/sales2.csv _hidden/out2.csv && python check_output.py _hidden/out2.csv _hidden/expected2.csv",
+  "protected": ["data/sales.csv", "expected/by_region.csv", "check_output.py"],
+  "budget_usd": 1.5
+}

@@ -1,5 +1,19 @@
 /* ── auth token injected by server ── */
 window._AOC_TOKEN = '__AOC_TOKEN_PLACEHOLDER__';
+/* the ?token= of a link (phone, LAN) leaves the address bar once the page has
+   it: the page sends it as a header, and it stays out of history (audit
+   FIND-005). Kept in this browser for a refresh: `/` without a token answers
+   with a page that comes back with it (_relogin_page). */
+(()=>{
+  try{
+    const u=new URL(location.href);
+    if(u.searchParams.has('token')){
+      if(window._AOC_TOKEN) localStorage.setItem('aoc_token',window._AOC_TOKEN);
+      u.searchParams.delete('token');
+      history.replaceState(history.state,'',u.pathname+(u.search||'')+u.hash);
+    }
+  }catch(e){}
+})();
 /* ── license tier injected by server (same pattern as the token above) ── */
 window._AOC_IS_PRO = __AOC_IS_PRO_PLACEHOLDER__;
 /* wrapper always installed (not gated on a token existing at load time) — a

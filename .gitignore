@@ -22,3 +22,6 @@ monitor_err.txt
 installer/build/
 installer/cache/
 monitor-*.pid
+
+# benchmark results (tests/benchmark/bench.py)
+tests/benchmark/results/

@@ -16,7 +16,7 @@ tmp = os.path.realpath(tempfile.mkdtemp(prefix="aoc_wts_"))
 reg = os.path.join(tmp, "data", "worktrees.json")
 ns = exec_functions(["_load_json_file", "_parse_porcelain_z",
                      "WORKTREES_FILE", "_wt_lock", "_wt_status_cache",
-                     "_wt_git", "_wt_err", "_wt_load", "_wt_save", "_wt_remove", "_wt_shortstat", "_wt_sessions_in",
+                     "_WT_IDENTITY", "_wt_needs_identity", "_wt_git", "_wt_err", "_wt_load", "_wt_save", "_wt_remove", "_wt_shortstat", "_wt_sessions_in",
                      "_WT_STRANDED_IDLE_S", "_WT_STRANDED_CACHE_S", "_WT_STRANDED_MAX_DIRS", "_WT_WIP_MESSAGE",
                      "_wt_stranded_cache", "_wt_repo_root_cache", "_wt_porcelain", "_wt_stranded_id", "_wt_in_claude_dir",
                      "_wt_stranded_reason", "_fmt_idle", "_wt_main_of", "_wt_stranded_facts", "_wt_stranded_scan",

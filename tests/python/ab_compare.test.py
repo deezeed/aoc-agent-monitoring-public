@@ -32,7 +32,7 @@ ns = exec_functions(
     ["_MODEL_PRICING", "_model_pricing", "_LAUNCH_MODELS", "_launch_validate", "_load_json_file", "_parse_numstat",
      "_AB_MODELS", "_AB_LABELS", "_AB_PROMPT_MAX", "_AB_BUDGET_DEFAULT", "_AB_BUDGET_MAX", "_AB_TIMEOUT_S", "_AB_KEEP",
      "_AB_DIFF_MAX", "_AB_FINAL_MAX", "_AB_STARTUP_TOKENS", "_AB_NO_TOOLS",
-     "_ab_validate", "_ab_estimate", "_ab_quote", "_ab_argv", "_ab_parse_stream", "_wt_git", "_wt_err", "_wt_remove", "_ab_git", "_ab_repo", "_ab_wt_add",
+     "_ab_validate", "_ab_estimate", "_ab_quote", "_ab_argv", "_ab_parse_stream", "_WT_IDENTITY", "_wt_needs_identity", "_wt_git", "_wt_err", "_wt_remove", "_ab_git", "_ab_repo", "_ab_wt_add",
      "_ab_wt_remove", "_ab_wt_snapshot", "_ab_load", "_ab_save", "_ab_update", "_ab_overall", "_ab_run_one",
      "_ab_start", "_ab_get", "_ab_list", "_ab_stop", "_ab_discard", "_ab_keep"],
     {"os": os, "json": json, "re": re, "time": time, "threading": threading, "subprocess": subprocess,

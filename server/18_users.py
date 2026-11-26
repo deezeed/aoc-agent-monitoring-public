@@ -164,6 +164,141 @@ def _tokenless_owner_ok(host, origin, fetch_site, fetch_mode, method, path, port
     return True
 
 
+# ── A Claude Code agent is not the owner (audit FIND-016) ──
+# Found in the audit: with no token, any program on this PC was the owner --
+# so an agent's `curl -X POST localhost:5151/danger_guard -d '{"mode":"off"}'`
+# switched off the very guard that holds its commands, and /auth/info handed
+# it the owner's token. Browser headers can't tell an agent apart (curl sends
+# any header it likes), its process can: a request whose program runs under
+# Claude Code's CLI is the agent -- it may read like a viewer, and changes
+# need the token (AOC's hooks send it; an agent reading aoc_token.txt is held
+# by the danger guard's aoc_self rule). The live AOC only: previews are
+# driven by tests and smoke runs from Claude sessions.
+_AGENT_USER = {"id": "agent", "name": "Claude Code agent (no token)", "role": "viewer", "background": True}
+# AOC's hooks run under Claude Code too, and send no token while the owner
+# has none set (it is optional): what they post stays open. Planting a status
+# row or a prompt is all an agent gets from these.
+_AGENT_POST = {"/update", "/permission/request", "/reply/request"}
+_AGENT_GET = {"/permission/poll", "/reply/poll"}
+
+
+def _agent_allowed(method, path):
+    """Pure: may a Claude Code agent without the token do this? Read like a
+    viewer, plus what AOC's own hooks call."""
+    if method == "GET" and path in _AGENT_GET:
+        return True
+    if method == "POST" and path in _AGENT_POST:
+        return True
+    return _user_allowed("viewer", method, path)
+
+
+def _agent_guard_on():
+    return not AOC_PREVIEW or os.environ.get("AOC_AGENT_GUARD") in ("1", "all")
+
+
+def _agent_guard_all():
+    """A preview with AOC_AGENT_GUARD=all takes every tokenless caller for an
+    agent (tests check the refusals end to end). It only takes rights away,
+    and never in the live AOC."""
+    return AOC_PREVIEW and os.environ.get("AOC_AGENT_GUARD") == "all"
+
+
+def _is_agent_proc(name, exe, cmdline=""):
+    """Pure: is this process Claude Code (the CLI, which runs agents and their
+    shells) rather than the Claude desktop app (whose built-in browser may
+    show this dashboard)?"""
+    name, exe = str(name or "").lower(), str(exe or "").lower().replace("/", "\\")
+    if name == "claude.exe":
+        desktop = "\\anthropicclaude\\" in exe or ("\\windowsapps\\" in exe and "claude-code" not in exe)
+        return not desktop
+    if name in ("node.exe", "node", "bun.exe"):
+        return "claude-code" in str(cmdline or "").lower().replace("/", "\\")
+    return False
+
+
+def _loopback_caller_pid(client_port, server_port, conns=None):
+    """The pid of the program on this PC whose TCP connection this is (its
+    side: local port = client_port, remote port = ours). None if not found."""
+    if conns is None:
+        import psutil
+        conns = psutil.net_connections("tcp")
+    for c in conns:
+        if c.laddr and c.raddr and c.laddr.port == client_port and c.raddr.port == server_port and c.pid:
+            return c.pid
+    return None
+
+
+def _agent_caller(client_port, server_port=None, conns=None, proc_fn=None) -> str:
+    """'' or the Claude Code process (name + pid) the caller runs under.
+    Fails open ('' -- the owner, as before) when the caller can't be found:
+    psutil missing or the program already gone."""
+    try:
+        pid = _loopback_caller_pid(client_port, server_port or PORT, conns)
+        if not pid:
+            return ""
+        if proc_fn is None:
+            import psutil
+            proc_fn = psutil.Process
+        p = proc_fn(pid)
+        chain = [p] + list(p.parents())
+    except Exception:
+        return ""
+    for q in chain[:40]:
+        try:
+            name, exe = q.name(), q.exe()
+            cmd = " ".join(q.cmdline()) if name.lower() in ("node.exe", "node", "bun.exe") else ""
+        except Exception:
+            continue
+        if _is_agent_proc(name, exe, cmd):
+            return f"{name} (pid {q.pid})"
+    return ""
+
+
+# ── Who on the network may even connect (audit FIND-005) ──
+# The server listens on every interface (phone, Remote Machines and invited
+# people reach it over the LAN), but without the token or a person nobody
+# from another device can get in -- they only got a 401. Now such a
+# connection is closed before AOC reads a byte of it, as if it listened on
+# 127.0.0.1 only, and it opens by itself once there is a token or a person.
+_lan_cache = {"t": 0.0, "open": False}
+
+
+def _lan_open(token, users_doc, now=None) -> bool:
+    """Pure: may other devices connect -- a token, an active person, or an
+    invite still waiting to be used?"""
+    now = now or time.time()
+    d = users_doc or {}
+    return bool(token) or any(not u.get("disabled") for u in d.get("users") or []) or \
+        any(not i.get("used_by") and i.get("expires", 0) > now for i in d.get("invites") or [])
+
+
+def _connection_allowed(client_ip, now=None, ttl=5.0) -> bool:
+    """A new connection: from this PC always; from elsewhere only while
+    _lan_open (people.json read at most every `ttl` s)."""
+    ip = str(client_ip or "")
+    if ip.startswith("127.") or ip in ("::1", "localhost"):
+        return True
+    now = now or time.time()
+    if now - _lan_cache["t"] > ttl:
+        _lan_cache.update(t=now, open=_lan_open(_auth_token, _users_load(), now))
+    return _lan_cache["open"]
+
+
+def _relogin_page() -> str:
+    """Pure: what `/` without a token gets. The dashboard drops ?token= from
+    the address bar and keeps it in this browser (localStorage, this origin
+    only) -- so a refresh on the phone comes back here and goes on with it.
+    A token that no longer works is forgotten, not retried."""
+    return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            "<title>AOC</title><body style='font:15px system-ui;padding:24px'>"
+            "<p id=m>Unauthorized - token required</p><script>"
+            "try{const t=localStorage.getItem('aoc_token');"
+            "if(t&&!new URLSearchParams(location.search).has('token')){location.replace('/?token='+encodeURIComponent(t));}"
+            "else if(t){localStorage.removeItem('aoc_token');"
+            "document.getElementById('m').textContent='This link no longer works -- open a new one from AOC on your PC.';}"
+            "}catch(e){}</script>")
+
+
 def _current_user():
     """The person this request runs as (the owner for background work)."""
     return getattr(_req_ctx, "user", None) or {"id": "owner", "name": "Owner", "role": "owner", "background": True}

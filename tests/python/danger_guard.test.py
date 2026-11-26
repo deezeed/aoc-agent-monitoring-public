@@ -32,10 +32,14 @@ ns = exec_functions(
      "_DANGER_RULE_IDS", "_DANGER_TEXT_HEADS", "_DANGER_RM_HEADS", "_DANGER_SQL", "_danger_cfg_cache",
      "_load_json_file", "_sanitize_danger_guard", "_load_danger_guard", "_save_danger_guard",
      "_danger_unquote", "_danger_broad_path", "_danger_rm_hit", "_danger_git_hits", "_danger_db_hit",
-     "_danger_disk_hit", "_danger_check", "_danger_reply", "_danger_open", "_danger_wait", "_danger_decision",
+     "_danger_disk_hit", "_DANGER_PREFIXES", "_DANGER_SH", "_DANGER_PS", "_DANGER_SQL_CLIENTS", "_DANGER_LISTERS", "_DANGER_FIND_PICK",
+     "_DANGER_CODE_RM", "_DANGER_HOME_EXPR", "_DANGER_AOC_ROUTES", "_DANGER_AOC_FILES", "_DANGER_AOC_READ_OK", "_DANGER_READ_MAX",
+     "_danger_rm_parse", "_danger_remote_hit", "_danger_find_hit", "_danger_first_arg", "_danger_code_hit",
+     "_danger_http_read", "_danger_aoc_hit", "_danger_expand", "_danger_sql_inputs", "_danger_read_file",
+     "_danger_check", "_danger_reply", "_danger_open", "_danger_wait", "_danger_decision",
      "_danger_hook", "_danger_hook_installed", "_danger_view"],
     {"os": os, "json": json, "re": re, "time": time, "threading": threading, "_secrets": _secrets, "_socket": _socket,
-     "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "_perm_lock": threading.Lock(), "_perm_requests": {},
+     "AOC_DATA_DIR": os.path.join(data_dir, "AOC"), "_perm_lock": threading.Lock(), "_perm_requests": {}, "_perm_decided_by": {},
      "_status_cond": _Cond(), "_status_version": [0],
      "_push_session_name": lambda sid, cwd="": "Sess " + str(sid),
      "_push_notify": lambda *a, **k: pushes.append((a, k)) or 1,
@@ -125,6 +129,81 @@ c.check("mode off -> nothing", ids("rm -rf /", cfg=san({"mode": "off"})) == [])
 pc = san({"patterns": [r"\bkubectl\s+delete\b"]})
 c.check("custom pattern (case-insensitive)", ids("KUBECTL delete ns prod", cfg=pc) == ["pattern"] and ids("kubectl get pods", cfg=pc) == [])
 c.check("empty / None command", chk("", "Bash", CFG) == [] and chk(None, "Bash", CFG) == [])
+
+# ── wrappers, find, code, remote, AOC itself (audit FIND-017 / FIND-016) ──
+# Before: only the direct form counted -- 31 of 65 dangerous variants went
+# through (docs audit probe), e.g. powershell -Command "Remove-Item -Recurse ~".
+for sh_, cmd in [("Bash", "bash -c 'rm -rf ~'"), ("Bash", 'sh -c "rm -rf /"'), ("Bash", "eval 'rm -rf ~'"),
+                 ("Bash", "cmd /c rd /s /q C:\\"), ("Bash", 'powershell -Command "Remove-Item -Recurse -Force C:\\Users\\marek"'),
+                 ("Bash", "pwsh -NoProfile -c 'Remove-Item -Recurse -Force ~'"), ("PowerShell", 'cmd /c "rd /s /q C:\\Users\\marek"'),
+                 ("PowerShell", "Invoke-Expression 'Remove-Item -Recurse ~'"),
+                 ("PowerShell", "Start-Process powershell -ArgumentList 'Remove-Item -Recurse ~'"),
+                 ("PowerShell", "powershell -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAAfgA="),
+                 ("Bash", "env rm -rf ~"), ("Bash", "command rm -rf ~"), ("Bash", "nohup rm -rf ~ &"), ("Bash", "time rm -rf ~"),
+                 ("Bash", "VAR=1 rm -rf ~"), ("Bash", "sudo -u root rm -rf /etc"), ("Bash", "ls | xargs rm -rf"),
+                 ("Bash", "rm -rf $(pwd)"), ("Bash", "find ~ -delete"), ("Bash", "find / -name '*' -exec rm -rf {} +"),
+                 ("PowerShell", "Get-ChildItem C:\\ | Remove-Item -Recurse -Force"),
+                 ("PowerShell", "[IO.Directory]::Delete('C:\\Users\\marek', $true)"),
+                 ("Bash", "python -c \"import shutil; shutil.rmtree('C:/Users/marek')\""),
+                 ("Bash", "python -c \"import shutil, os; shutil.rmtree(os.path.expanduser('~'))\""),
+                 ("Bash", "node -e \"require('fs').rmSync(process.env.HOME,{recursive:true})\"")]:
+    c.check(f"wrapped / other delete: {cmd[:50]}", ids(cmd, sh_) == ["rm_broad"])
+c.check("wrapped: the inner command is the reported part",
+        chk("bash -c 'git push --force'", "Bash", CFG)[0]["part"] == "git push --force")
+c.check("wrapped SQL", ids("bash -c \"psql -c 'DROP TABLE users'\"") == ["sql_destroy"]
+        and ids("echo 'DROP TABLE users;' | psql") == ["sql_destroy"])
+sqld = tempfile.mkdtemp(prefix="aoc_dg_sql_")
+open(os.path.join(sqld, "drop.sql"), "w").write("-- reset\nDROP TABLE users;\n")
+open(os.path.join(sqld, "schema.sql"), "w").write("CREATE TABLE users (id int);\n")
+c.check("SQL from a file fed to the client, read from the session's folder",
+        sorted({h["id"] for h in chk("psql < drop.sql", "Bash", CFG, cwd=sqld)}) == ["sql_destroy"]
+        and sorted({h["id"] for h in chk("psql -f drop.sql", "Bash", CFG, cwd=sqld)}) == ["sql_destroy"]
+        and chk("psql < schema.sql", "Bash", CFG, cwd=sqld) == [] and chk("psql < missing.sql", "Bash", CFG, cwd=sqld) == [])
+for cmd in ["gh repo delete o/r --yes", "gh api -X DELETE repos/o/r", "git filter-branch --force --tree-filter x HEAD",
+            "git filter-repo --path secrets --invert-paths", "vercel remove my-app --yes", "railway down",
+            "aws s3 rm s3://bucket --recursive", "terraform destroy -auto-approve"]:
+    c.check(f"remote delete: {cmd}", ids(cmd) == ["remote_delete"])
+for sh_, cmd in [("Bash", "curl -X POST -d '{\"mode\":\"off\"}' http://127.0.0.1:5151/danger_guard"),
+                 ("Bash", "curl -s localhost:5151/auth/info"), ("Bash", "cat ~/AppData/Local/Programs/AOC/aoc_token.txt"),
+                 ("PowerShell", "Invoke-RestMethod -Method Post http://localhost:5151/permission/decide -Body $b"),
+                 ("PowerShell", "Get-Content $env:LOCALAPPDATA\\AOC\\danger_guard.json"),
+                 ("Bash", "curl -X POST localhost:5151/orch/merge -d '{}'")]:
+    c.check(f"touches AOC's switches: {cmd[:50]}", ids(cmd, sh_) == ["aoc_self"])
+for sh_, cmd in [("Bash", "curl -s http://127.0.0.1:5151/orch/settings"), ("Bash", "curl -sS localhost:5151/danger_guard | jq ."),
+                 ("Bash", "curl -X GET localhost:5151/budget_caps"), ("Bash", "wget -qO- localhost:5151/permission/settings"),
+                 ("PowerShell", "Invoke-RestMethod http://localhost:5151/orch/settings"),
+                 ("PowerShell", "irm -Method Get http://localhost:5151/danger_guard")]:
+    c.check(f"reading an AOC setting is not flipping it: {cmd[:50]}", ids(cmd, sh_) == [])
+for sh_, cmd in [("Bash", "curl -d '{}' localhost:5151/orch/settings"), ("Bash", "curl -XPOST localhost:5151/danger_guard"),
+                 ("Bash", "curl -sX POST localhost:5151/danger_guard"), ("Bash", "curl --data-raw x localhost:5151/budget_caps"),
+                 ("Bash", "curl --request=PUT localhost:5151/orch/settings"), ("Bash", "curl -K cfg localhost:5151/orch/settings"),
+                 ("Bash", "wget --post-data x localhost:5151/danger_guard"), ("Bash", "curl -s localhost:5151/users"),
+                 ("Bash", "python -c \"import urllib.request as u; u.urlopen('http://localhost:5151/orch/settings', b'x')\""),
+                 ("PowerShell", "irm -Method:Post http://localhost:5151/danger_guard"),
+                 ("PowerShell", "Invoke-WebRequest http://localhost:5151/orch/settings -Body $b"),
+                 ("Bash", "curl localhost:5151/orch/settings localhost:5151/auth/info")]:
+    c.check(f"writing an AOC setting (or reading a secret) still held: {cmd[:50]}", ids(cmd, sh_) == ["aoc_self"])
+c.check("another AOC (a preview on its own port) is not this one", ids("curl -X POST localhost:5297/danger_guard -d x") == [])
+c.check("listing AOC's token file is not reading it", ids("ls -la aoc_token.txt") == [] and ids("stat aoc_token.txt") == []
+        and ids(r"Test-Path .\aoc_token.txt", "PowerShell") == [] and ids(r"Get-Content .\aoc_token.txt", "PowerShell") == ["aoc_self"] and ids("head -c 4 aoc_token.txt") == ["aoc_self"])
+c.check("aoc_self can be switched off like any rule",
+        ids("curl localhost:5151/auth/info", cfg=san({"off_rules": ["aoc_self"]})) == [])
+for sh_, cmd in [("Bash", "find . -name '*.pyc' -delete"), ("Bash", "find . -type d -name node_modules -exec rm -rf {} +"),
+                 ("Bash", "find ~ -name '*.tmp'"), ("Bash", "python -c \"import shutil; shutil.rmtree('build')\""),
+                 ("Bash", "python -c \"import shutil, os; shutil.rmtree(os.path.join(os.path.expanduser('~'), 'p', 'x'))\""),
+                 ("Bash", "node -e \"require('fs').rmSync('dist',{recursive:true})\""), ("Bash", "bash -c 'npm test && npm run lint'"),
+                 ("Bash", 'powershell -Command "Get-ChildItem C:\\Users"'),
+                 ("Bash", "powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_all.ps1"), ("Bash", "cmd /c dir C:\\"),
+                 ("Bash", "env NODE_ENV=production npm run build"), ("Bash", "time npm test"), ("Bash", "ls *.log | xargs rm -f"),
+                 ("Bash", "git ls-files | xargs grep TODO"), ("Bash", 'rm -rf "$(git rev-parse --show-toplevel)/build"'),
+                 ("Bash", "curl -s http://127.0.0.1:5151/status"), ("Bash", "grep -rn aoc_token.txt hooks/"),
+                 ("Bash", "git add danger_guard.json"), ("Bash", "gh pr list && gh api repos/o/r/pulls"),
+                 ("Bash", "vercel deploy --prod"), ("Bash", "aws s3 cp x s3://b/x"), ("Bash", "terraform plan"),
+                 ("Bash", "echo hello | psql -c 'select 1'"),
+                 ("PowerShell", "Get-ChildItem -Filter *.log | Remove-Item -Recurse"),
+                 ("PowerShell", "Get-ChildItem .\\dist | Remove-Item -Recurse"),
+                 ("PowerShell", "Start-Process notepad -ArgumentList 'a.txt'"), ("PowerShell", "Invoke-Expression 'npm test'")]:
+    c.check(f"still harmless: {cmd[:50]}", ids(cmd, sh_) == [])
 
 # ── the hold ──
 reqs = ns["_perm_requests"]

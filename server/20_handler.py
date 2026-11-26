@@ -23,13 +23,18 @@ class Handler(BaseHTTPRequestHandler):
         the tunnel would grant unauthenticated internet access (incl. the terminal)."""
         tunnel_exposed = _tunnel_status[0] in ("starting", "ready")
         self._user, self._req_token = None, ""
+        self._agent = ""
         # _is_direct_loopback too: a tunnel AOC doesn't know about (its own one
         # failed to stop, or ngrok / VS Code port forwarding) adds forwarding headers
         if self._is_direct_loopback() and not tunnel_exposed and _tokenless_owner_ok(
                 self.headers.get("Host"), self.headers.get("Origin"), self.headers.get("Sec-Fetch-Site"),
                 self.headers.get("Sec-Fetch-Mode"), self.command, self.path.split("?")[0], PORT):
-            self._user = _owner_user()
-            return True
+            # a program under Claude Code is an agent, not the owner (server/18_users.py)
+            self._agent = ("any caller (AOC_AGENT_GUARD=all)" if _agent_guard_all() else
+                           _agent_caller(self.client_address[1]) if _agent_guard_on() else "")
+            if not self._agent:
+                self._user = _owner_user()
+                return True
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
         # the main token = the owner; a person's own token (People) = that
@@ -39,6 +44,9 @@ class Handler(BaseHTTPRequestHandler):
             if u:
                 self._user, self._req_token = u, tok
                 return True
+        if self._agent:
+            self._user = dict(_AGENT_USER)
+            return True
         return False
 
     def _authorize(self, method, path) -> bool:
@@ -47,8 +55,18 @@ class Handler(BaseHTTPRequestHandler):
         user = getattr(self, "_user", None) or _owner_user()
         _req_ctx.user = user
         _user_seen(user)
-        if _user_allowed(user["role"], method, path):
+        if (_agent_allowed(method, path) if user.get("id") == "agent" else _user_allowed(user["role"], method, path)):
             return True
+        if user.get("id") == "agent":
+            try:
+                _agent_refused_log(method, path, getattr(self, "_agent", ""))
+            except Exception as e:
+                _log_bg_error("agent refused log", e)
+            self._serve(403, "application/json", json.dumps(
+                {"ok": False, "error": "AOC: a Claude Code agent can only read AOC. Changing it (its guard, prompts, "
+                                       "merges, settings) or reading its token is up to the user -- ask them to do "
+                                       "it in the dashboard."}).encode())
+            return False
         self._serve(403, "application/json", json.dumps(
             {"ok": False, "error": f"your role ({user['role']}) can't do that -- ask the owner"}).encode())
         return False
@@ -362,7 +380,11 @@ class Handler(BaseHTTPRequestHandler):
             self._serve(200, "text/html; charset=utf-8", _join_page(code).encode("utf-8"), no_cache=True)
             return
         if not self._check_auth():
-            self._serve(401, "text/plain", b"Unauthorized - token required")
+            if self.path.split("?")[0] in ("/", "/index.html"):
+                # the page refreshed without ?token= (it left the address bar): back with the stored one
+                self._serve(401, "text/html; charset=utf-8", _relogin_page().encode("utf-8"), no_cache=True)
+            else:
+                self._serve(401, "text/plain", b"Unauthorized - token required")
             return
         path_no_qs = self.path.split("?")[0]
         if not self._authorize("GET", path_no_qs):
@@ -1626,8 +1648,14 @@ class Handler(BaseHTTPRequestHandler):
                         _log_bg_error("permission log", e)
                     reply = _perm_open(data, _load_remote_approve(), time.time())
                 elif path_no_qs == "/permission/decide":
-                    ok = _perm_decide(str(data.get("id") or ""), data.get("decision"), data.get("message"))
-                    reply = {"ok": ok} if ok else {"ok": False, "error": "no longer waiting"}
+                    me = _current_user()
+                    err = _perm_decide_refusal(str(data.get("id") or ""), me)
+                    if err:
+                        reply = {"ok": False, "error": err}
+                    else:
+                        ok = _perm_decide(str(data.get("id") or ""), data.get("decision"), data.get("message"),
+                                          by=f"{me.get('name') or ''} ({me.get('role') or ''})")
+                        reply = {"ok": ok} if ok else {"ok": False, "error": "no longer waiting"}
                 else:
                     reply = _save_remote_approve(data)
                 self._serve(200, "application/json", json.dumps(reply).encode())
@@ -1873,6 +1901,8 @@ class Handler(BaseHTTPRequestHandler):
             ct = "application/json; charset=utf-8"
         self.send_header("Content-Type", ct)
         self.send_header("Access-Control-Allow-Origin", "*")
+        # a ?token= page URL never travels on as a Referer (audit FIND-005)
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Length", len(body))
         if no_cache:
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")

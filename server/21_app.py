@@ -84,6 +84,14 @@ def _start_server():
     """Start the HTTP server in the current thread (blocking)."""
     class _Server(ThreadingHTTPServer):
         allow_reuse_address = True
+
+        def verify_request(self, request, client_address):
+            # another device, while there is no token / person: closed unread (server/18_users.py)
+            try:
+                return _connection_allowed(client_address[0])
+            except Exception as e:
+                _log_bg_error("connection check", e)
+                return True    # as before: the token check still guards every request
     _Server(("0.0.0.0", PORT), Handler).serve_forever()
 
 

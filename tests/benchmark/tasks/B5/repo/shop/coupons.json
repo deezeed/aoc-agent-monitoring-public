@@ -1,0 +1,5 @@
+{
+  "SAVE10": {"type": "percent", "value": 10},
+  "WINTER25": {"type": "percent", "value": 25},
+  "FIVE": {"type": "amount", "value": 5.0}
+}

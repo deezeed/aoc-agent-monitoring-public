@@ -1,0 +1,9 @@
+{
+  "id": "B2",
+  "category": "Debugging",
+  "title": "Fix the bug a failing test describes",
+  "goal": "tests/test_billing.py fails. Find and fix the bug in billing.py -- do not change the tests. How billing works: a stay is counted inclusively (the first and the last day both count), and an end date before the start date is an error (ValueError).",
+  "verify": "python -m unittest discover -s tests -t .",
+  "protected": ["tests/test_billing.py"],
+  "budget_usd": 1.5
+}

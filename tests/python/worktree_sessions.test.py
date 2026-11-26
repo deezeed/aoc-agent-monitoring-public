@@ -17,7 +17,7 @@ exe = [os.path.join(tmp, "claude.exe")]
 ns = exec_functions(["_LAUNCH_MODELS", "_LAUNCH_MIN_GAP_S", "_launch_last", "_launch_validate", "_launch_argv",
                      "_folder_trusted", "_load_json_file", "_parse_porcelain_z",
                      "WORKTREES_FILE", "_WT_MAX_PARALLEL", "_WT_MAX", "_WT_STATUS_CACHE_S", "_wt_lock", "_wt_status_cache",
-                     "_wt_git", "_wt_err", "_wt_load", "_wt_save", "_wt_validate", "_wt_names", "_wt_repo", "_wt_remove",
+                     "_WT_IDENTITY", "_wt_needs_identity", "_wt_git", "_wt_err", "_wt_load", "_wt_save", "_wt_validate", "_wt_names", "_wt_repo", "_wt_remove",
                      "_wt_create", "_wt_launch", "_wt_shortstat", "_wt_status", "_wt_sessions_in", "_wt_list", "_wt_find",
                      "_wt_conflicts", "_wt_merge", "_wt_discard", "_wt_diff"],
                     {"os": os, "re": re, "time": time, "json": json, "subprocess": subprocess, "threading": threading,

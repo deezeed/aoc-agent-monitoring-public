@@ -1,0 +1,8 @@
+date,region,amount
+2026-11-01,  centre,"2,50"
+2026-11-01,CENTRE,2.50
+2026-11-01,Centre,2.50
+2026-11-02,coast,€ 10
+2026-11-02,coast,-
+2026-11-03,Coast,"0,01"
+2026-11-03,hills,abc

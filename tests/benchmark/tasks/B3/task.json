@@ -1,0 +1,9 @@
+{
+  "id": "B3",
+  "category": "Research and analysis",
+  "title": "Summarise three vendor notes into a report with given sections",
+  "goal": "We need off-site backup storage. Hard requirements: the data must stay in the EU, and the provider must guarantee at least 99.9 % monthly uptime (SLA). Among the providers that meet both, the cheapest per TB wins. Read the three vendor notes in docs/ and write report.md with exactly these sections: '## Summary' (3-5 sentences), '## Comparison' (a Markdown table: provider, price per TB per month, EU data residency, SLA), '## Recommendation' (start with the name of the provider you recommend, then why, and why each other provider was not chosen). Write only report.md; do not change docs/ or check_report.py.",
+  "verify": "python check_report.py",
+  "protected": ["docs/alder_storage.md", "docs/birchvault.md", "docs/cedar_cloud.md", "check_report.py"],
+  "budget_usd": 1.5
+}

@@ -240,8 +240,29 @@ def _find_cloudflared() -> str:
             return c
     return ""
 
-def _download_cloudflared_worker():
-    """Download cloudflared.exe to AOC dir in a background thread."""
+def _cf_signature_ok(status, subject) -> bool:
+    """Pure: Get-AuthenticodeSignature's Status + signer Subject -> is this
+    a cloudflared Cloudflare signed (audit FIND-021: it was run unchecked)?"""
+    return str(status or "").strip() == "Valid" and \
+        re.search(r'(^|,\s*)O="?Cloudflare, Inc\."?(,|$)', str(subject or "")) is not None
+
+
+def _cf_signature(path, run=None):
+    """(status, signer subject) of a file's Authenticode signature."""
+    import subprocess as _sp
+    env = dict(os.environ, AOC_SIG_PATH=path)   # the path as data, never part of the script
+    r = (run or _sp.run)(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                          "$s = Get-AuthenticodeSignature -LiteralPath $env:AOC_SIG_PATH; "
+                          "\"$($s.Status)`n$($s.SignerCertificate.Subject)\""],
+                         capture_output=True, text=True, timeout=60, env=env,
+                         creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    out = (r.stdout or "").strip().splitlines()
+    return (out[0] if out else ""), (out[1] if len(out) > 1 else "")
+
+
+def _download_cloudflared_worker(retrieve=None, signature=None):
+    """Download cloudflared.exe to AOC dir in a background thread -- kept
+    only if Cloudflare signed it."""
     import urllib.request as _ur
     _tunnel_status[0] = "downloading"
     _tunnel_dl_pct[0] = 0
@@ -250,17 +271,50 @@ def _download_cloudflared_worker():
         def _progress(count, block_size, total):
             if total > 0:
                 _tunnel_dl_pct[0] = min(99, int(count * block_size / total * 100))
-        _ur.urlretrieve(_CF_DL_URL, tmp, _progress)
+        (retrieve or _ur.urlretrieve)(_CF_DL_URL, tmp, _progress)
+        status, subject = (signature or _cf_signature)(tmp)
+        if not _cf_signature_ok(status, subject):
+            raise RuntimeError(f"the downloaded cloudflared isn't signed by Cloudflare ({status or 'no signature'})")
         os.replace(tmp, _CF_EXE)
         _tunnel_dl_pct[0] = 100
         _tunnel_status[0] = "off"
         _start_tunnel_worker_thread()
     except Exception as exc:
         _tunnel_status[0] = "error"
+        _tunnel_error_detail[0] = f"cloudflared download: {exc}"[:200]
         try:
             if os.path.exists(_CF_EXE + ".part"): os.remove(_CF_EXE + ".part")
         except Exception:
             pass
+
+def _tunnel_drain(stream, recent, on_line=None, keep=20):
+    """Read a tunnel program's output until it exits, keeping its last
+    `keep` lines (the reason shown if it fails) and handing each line to
+    on_line (the URL search)."""
+    try:
+        for line in stream:
+            s = line.rstrip()
+            if s:
+                recent.append(s[:300])
+                del recent[:-keep]
+            if on_line:
+                on_line(line)
+    except Exception:
+        pass   # a decode error / closed pipe: the caller still waits and kills
+
+
+def _tunnel_end_state(name, found_url, rc, stopped, recent):
+    """Pure: the tunnel program exited -> (status, detail) to show, or None
+    = just off. Stopped by you -> off. Never got a URL -> error with its last
+    line. Dropped on its own after it was up -> error too: Remote / phone
+    stopped answering, and nothing said why (FIND-020)."""
+    if stopped:
+        return None
+    last = recent[-1][:160] if recent else f"{name} exited with code {rc}"
+    if not found_url:
+        return ("error", last[:200]) if rc != 0 else None
+    return "error", f"the tunnel stopped by itself: {last}"[:200]
+
 
 def _start_tunnel_worker():
     """Background thread: launch cloudflared and watch for the public URL."""
@@ -289,27 +343,21 @@ def _start_tunnel_worker():
         _tunnel_proc[0] = proc
         _write_tunnel_pid(proc.pid)
         url_re = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
-        found_url = False
-        try:
-            for line in proc.stdout:
-                stripped = line.rstrip()
-                if stripped:
-                    recent_lines.append(stripped)
-                    if len(recent_lines) > 20:
-                        recent_lines.pop(0)
-                m = url_re.search(line)
-                if m:
-                    _tunnel_url[0] = m.group(0)
-                    _tunnel_status[0] = "ready"
-                    found_url = True
-                    break
-        except Exception:
-            pass  # still fall through to termination in finally below
+        found = []
+
+        def _url(line):
+            m = None if found else url_re.search(line)
+            if m:
+                found.append(m.group(0))
+                _tunnel_url[0] = m.group(0)
+                _tunnel_status[0] = "ready"
+        # read to the end, not just to the URL (audit FIND-020): nobody reading
+        # its output, the pipe fills and cloudflared stalls on its next log line
+        _tunnel_drain(proc.stdout, recent_lines, _url)
         rc = proc.wait()
-        if not found_url and rc != 0:
-            _tunnel_status[0] = "error"
-            _tunnel_error_detail[0] = (recent_lines[-1][:200] if recent_lines
-                                        else f"cloudflared exited with code {rc}")
+        state = _tunnel_end_state("cloudflared", bool(found), rc, _tunnel_proc[0] is not proc, recent_lines)
+        if state:
+            _tunnel_status[0], _tunnel_error_detail[0] = state
     except Exception as e:
         _tunnel_status[0] = "error"
         _tunnel_error_detail[0] = str(e)[:200]
@@ -405,6 +453,12 @@ def _start_ngrok_worker():
         )
         _tunnel_proc[0] = proc
         _write_tunnel_pid(proc.pid)
+        # its log (every connection, --log stdout) read from the start, on a
+        # thread: unread, the pipe fills and ngrok stalls (audit FIND-020)
+        recent_lines = []
+        drain = threading.Thread(target=_tunnel_drain, args=(proc.stdout, recent_lines), daemon=True,
+                                 name="ngrok-log")
+        drain.start()
         # Poll ngrok's local inspection API instead of parsing stdout — avoids the
         # decode/parsing failure modes that orphaned the cloudflared process earlier.
         found_url = False
@@ -430,19 +484,17 @@ def _start_ngrok_worker():
             # cloudflared's rc = proc.wait(). Without this, falling straight
             # into `finally` would immediately terminate the process we just
             # got a working public_url for.
-            proc.wait()
+            rc = proc.wait()
         else:
-            _tunnel_status[0] = "error"
-            # stdout was never drained during the polling loop above (only
-            # the local API was polled), so whatever ngrok printed while
-            # failing (auth error, ERR_NGROK_xxx, etc.) is still sitting in
-            # the pipe buffer -- read it now instead of discarding it.
-            try:
-                remaining = proc.stdout.read(4000)
-            except Exception:
-                remaining = ""
-            lines = [l for l in remaining.splitlines() if l.strip()]
-            _tunnel_error_detail[0] = lines[-1][:200] if lines else f"ngrok exited with code {proc.poll()}"
+            # killed first: reading a live ngrok's pipe to its end used to
+            # hang this thread for good (and leave ngrok running)
+            _hard_kill_proc(proc)
+            rc = proc.wait()
+        drain.join(5)
+        state = _tunnel_end_state("ngrok", found_url, rc if found_url else (rc or 1), _tunnel_proc[0] is not proc,
+                                  recent_lines)
+        if state:
+            _tunnel_status[0], _tunnel_error_detail[0] = state
     except Exception as e:
         _tunnel_status[0] = "error"
         _tunnel_error_detail[0] = str(e)[:200]
@@ -457,8 +509,9 @@ def _start_ngrok_worker_thread():
     threading.Thread(target=_start_ngrok_worker, daemon=True).start()
 
 def _stop_tunnel():
-    _hard_kill_proc(_tunnel_proc[0])
-    _tunnel_proc[0] = None
+    # handle cleared first: the worker sees it was you, not a dropped tunnel
+    proc, _tunnel_proc[0] = _tunnel_proc[0], None
+    _hard_kill_proc(proc)
     _tunnel_url[0] = None
     _tunnel_status[0] = "off"
     _tunnel_provider[0] = None

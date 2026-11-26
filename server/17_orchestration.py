@@ -1717,7 +1717,9 @@ def _orch_commit_leftovers(run, task, path, git):
         git(["add", "--", *new[i:i + 100]], path)
     rc, staged, _ = git(["diff", "--cached", "--name-only"], path)
     if rc == 0 and staged.strip():
-        git(["commit", "-q", "-m", f"{task['title']}\n\nAOC orchestration {run['id']}, task {task['id']}"], path)
+        rc, _, er = git(["commit", "-q", "-m", f"{task['title']}\n\nAOC orchestration {run['id']}, task {task['id']}"], path)
+        if rc != 0:   # the agent's work is lost with the folder: say why somewhere
+            _log_bg_error("orchestration: commit of a task's work", RuntimeError(_wt_err(er, "git commit failed")))
 
 
 def _orch_finish_worktree(run, task, tasks, git=None):
@@ -1985,6 +1987,10 @@ def _orch_start_manager(conn, run, task, tasks, exe, now, spawn=None, git=None):
     _orch_event(conn, cid, "created", f"team for workstream '{task['id']}' of run {run['id']}", now=now)
     child, _ = _orch_load(conn, cid)
     listing, notes = _orch_repo_context(path, git)
+    # running (with its child) before the planner starts: _orch_start_llm
+    # commits, and a restart then follows that child instead of making it again
+    _orch_set_task(conn, run["id"], task["id"], state="running", attempt=attempt, branch=branch, path=path, pid=None,
+                   job_base="", child_id=cid, started=now, finished=None, error="", output="", commits=0)
     try:
         agents = _orch_team(child, _orch_library(conn))
         _orch_start_llm(conn, child, "plan", _orch_plan_prompt(goal, run["repo"], branch, listing, notes, mode="team",
@@ -1999,8 +2005,6 @@ def _orch_start_manager(conn, run, task, tasks, exe, now, spawn=None, git=None):
                        finished=now, child_id=cid)
         _orch_event(conn, run["id"], "task_failed", f"could not start claude: {e}", task["id"], now=now)
         return
-    _orch_set_task(conn, run["id"], task["id"], state="running", attempt=attempt, branch=branch, path=path, pid=None,
-                   job_base="", child_id=cid, started=now, finished=None, error="", output="", commits=0)
     _orch_event(conn, run["id"], "task_started",
                 f"Manager ({task['model']}, ${task['budget_usd']:.2f} for its team) is planning, attempt {attempt}",
                 task["id"], now=now)
@@ -2221,8 +2225,16 @@ def _orch_start_verify(conn, run, tasks, now, git=None, spawn=None):
                                 + _wt_err(er, "git merge failed"))
             return False
     base = os.path.join(ORCH_DIR, run["id"], f"verify-{int(now)}")
-    pid = (spawn or _orch_verify_spawn)(run["verify"], path, base)
-    _orch_set_run(conn, run["id"], now=now, state="supervising", job_kind="verify", job_pid=pid, job_base=base, job_started=now)
+    _orch_set_run(conn, run["id"], now=now, state="supervising")
+    _orch_job_saved(conn, run["id"], "verify", base, now)
+    try:
+        pid = (spawn or _orch_verify_spawn)(run["verify"], path, base)
+    except OSError as e:
+        _orch_set_run(conn, run["id"], now=now, state="running", job_kind="", job_pid=None, job_base="", job_started=None)
+        _orch_verify_cleanup(run, git)
+        _orch_verify_record(conn, run, now, "error", f"could not start the check: {e}")
+        return False
+    _orch_set_run(conn, run["id"], now=now, job_pid=pid)
     _orch_event(conn, run["id"], "verify_started", f"`{run['verify']}` on {len(ids)} task(s)' work merged", now=now)
     return True
 
@@ -2276,10 +2288,61 @@ def _orch_start_llm(conn, run, kind, prompt, schema, exe, now, spawn=None, read_
     if kind in ("plan", "supervise"):
         prompt += _orch_rules_text(_orch_settings()["rules"], kind)
     budget = budget or _orch_llm_budget(run, _orch_spent(conn, run["id"]))
-    pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, schema, run["model"], budget, read_tools, deny, stream=True),
-                                 cwd or run["repo"], prompt, base, **kw)
-    _orch_set_run(conn, run["id"], now=now, job_kind=kind, job_pid=pid, job_base=base, job_started=now)
+    # saved BEFORE the process exists, like a task's start (_orch_start_task):
+    # a monitor killed in between finds <base>.pid next step (_orch_resume_job)
+    # instead of starting a second planner / reviewer
+    _orch_job_saved(conn, run["id"], kind, base, now)
+    try:
+        pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, schema, run["model"], budget, read_tools, deny, stream=True),
+                                     cwd or run["repo"], prompt, base, **kw)
+    except OSError:
+        _orch_set_run(conn, run["id"], now=now, job_kind="", job_pid=None, job_base="", job_started=None)
+        raise
+    _orch_set_run(conn, run["id"], now=now, job_pid=pid)
     return True
+
+
+def _orch_job_saved(conn, run_id, kind, base, now):
+    """A run's planner / reviewer / check is about to start: noted (no pid
+    yet) and committed, its stale <base>.pid gone."""
+    try:
+        os.remove(base + ".pid")
+    except OSError:
+        pass
+    _orch_set_run(conn, run_id, now=now, job_kind=kind, job_pid=None, job_base=base, job_started=now)
+    conn.commit()
+
+
+def _orch_resume_job(conn, run, now, exe=None, spawn=None, git=None):
+    """A run's job noted without a pid at the top of a step: the monitor that
+    started it died between saving it and saving the pid. <base>.pid exists
+    -> the process runs (or ran): followed again, its answer read as usual.
+    No pid file -> it never started: started again (a top-level planner),
+    or the step that starts it comes again (review, check); a team's planner
+    can't be rebuilt here -> its run fails and its manager retries it."""
+    what = {"plan": "planner", "supervise": "review", "verify": "check"}.get(run["job_kind"], run["job_kind"])
+    pid = _orch_pid_file(run.get("job_base"))
+    if pid:
+        _orch_set_run(conn, run["id"], now=now, job_pid=pid)
+        _orch_event(conn, run["id"], "job_recovered", f"AOC restarted while the {what} was starting -- its process "
+                    f"(pid {pid}) is followed again, not started twice", now=now)
+        return
+    if run["job_kind"] == "plan" and not run.get("parent_id"):
+        exe = exe or _find_claude_exe()
+        if not exe or not _orch_proc_env()[2]:
+            return   # can't start it yet: next tick
+        _orch_set_run(conn, run["id"], now=now, job_kind="", job_pid=None, job_base="", job_started=None)
+        _orch_event(conn, run["id"], "job_recovered", f"AOC restarted before the {what} started -- it starts again", now=now)
+        _orch_plan_start(conn, run["id"], exe, now, spawn, git)
+        return
+    if run["job_kind"] == "plan":
+        why = "AOC restarted before this team's planner started"
+        _orch_set_run(conn, run["id"], now=now, state="failed", error=why, finished=now, job_kind="", job_pid=None,
+                      job_base="", job_started=None)
+        _orch_event(conn, run["id"], "failed", why, now=now)
+        return
+    _orch_set_run(conn, run["id"], now=now, state="running", job_kind="", job_pid=None, job_base="", job_started=None)
+    _orch_event(conn, run["id"], "job_recovered", f"AOC restarted before the {what} started -- it starts again", now=now)
 
 
 def _orch_poll_llm(conn, run, tasks, now, alive=None, read=None, kill=None):
@@ -2380,6 +2443,10 @@ def _orch_step(conn, run_id, now=None, exe=None, spawn=None, alive=None, read=No
     now = now or time.time()
     run, tasks = _orch_load(conn, run_id)
     if not run or run["state"] not in _ORCH_ACTIVE:
+        return
+    if run["job_kind"] and not run["job_pid"]:
+        _orch_resume_job(conn, run, now, exe, spawn, git)
+        conn.commit()
         return
     if run["job_kind"] == "verify":
         _orch_poll_verify(conn, run, now, alive, kill, git)
@@ -3220,6 +3287,19 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
             _orch_entity_event(conn, eid, "remembered", f"{run['goal'][:200]} -> {mem[-1]['outcome']}", run_id=r["id"], now=now)
         _orch_entity_set(conn, eid, now=now, memory=json.dumps(mem[-_ORCH_ENTITY_MEMORY:], ensure_ascii=False))
         ent["memory"] = mem[-_ORCH_ENTITY_MEMORY:]
+    # its scout was being started when the monitor died: its process if it exists, else it was never started
+    if ent.get("job_base") and not ent.get("job_pid"):
+        pid = _orch_pid_file(ent["job_base"])
+        if pid:
+            _orch_entity_set(conn, eid, now=now, job_pid=pid)
+            _orch_entity_event(conn, eid, "scout_recovered", f"AOC restarted while its scout was starting -- its process "
+                               f"(pid {pid}) is followed again, not started twice", now=now)
+            ent = dict(ent, job_pid=pid)
+        else:
+            _orch_entity_set(conn, eid, now=now, state="idle", job_base="", job_started=None, note="")
+            _orch_entity_event(conn, eid, "scout_recovered", "AOC restarted before its scout started -- it looks again",
+                               now=now)
+            return
     # its scout is thinking
     if ent.get("job_pid") or ent.get("job_base"):
         if alive(ent["job_pid"]) and _orch_ours(ent["job_pid"], ent.get("job_started")) \
@@ -3308,12 +3388,24 @@ def _orch_entity_tick(conn, eid, now=None, exe=None, spawn=None, alive=None, rea
     kw, deny, ready = _orch_proc_env(tag=("entity-" + eid, "scout"))
     if not ready:
         return
-    pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, _ORCH_SCOUT_SCHEMA, cfg["model"], _ORCH_ENTITY_SCOUT_BUDGET, True, deny,
-                                                                stream=True),
-                                 folder, _orch_scout_prompt(cfg, ent["memory"], recent, listing, notes, spend, now,
-                                                            _orch_team(cfg, _orch_library(conn))), base, **kw)
+    # saved before the process exists (like a run's planner): a restart finds <base>.pid instead of scouting twice
+    try:
+        os.remove(base + ".pid")
+    except OSError:
+        pass
     _orch_entity_event(conn, eid, "scout", why, now=now)
-    _orch_entity_set(conn, eid, now=now, state="scouting", job_pid=pid, job_base=base, job_started=now, run_now=0, note="")
+    _orch_entity_set(conn, eid, now=now, state="scouting", job_pid=None, job_base=base, job_started=now, note="")
+    conn.commit()
+    try:
+        pid = (spawn or _orch_spawn)(_orch_llm_argv(exe, _ORCH_SCOUT_SCHEMA, cfg["model"], _ORCH_ENTITY_SCOUT_BUDGET, True,
+                                                    deny, stream=True),
+                                     folder, _orch_scout_prompt(cfg, ent["memory"], recent, listing, notes, spend, now,
+                                                                _orch_team(cfg, _orch_library(conn))), base, **kw)
+    except OSError as e:
+        _orch_entity_set(conn, eid, now=now, state="idle", job_pid=None, job_base="", job_started=None, run_now=0,
+                         last_scout=now, note=f"could not start claude: {e}"[:300])
+        return
+    _orch_entity_set(conn, eid, now=now, job_pid=pid, run_now=0)
 
 
 def _orch_entity_view(ent, cfg, runs, events, costs, now=None):
@@ -3513,8 +3605,9 @@ def _orch_cleanup(run, tasks, git=None, keep_merged=False):
     pids = {t["id"]: t.get("pid") or (_orch_pid_file(t.get("job_base")) if t["state"] == "starting" else None)
             for t in tasks}
     started = {t["id"]: t.get("started") for t in tasks}
+    job = run.get("job_pid") or (_orch_pid_file(run.get("job_base")) if run.get("job_kind") else None)
     killed = {"tasks": {tid for tid, pid in pids.items() if pid and _orch_stop(pid, started[tid])},
-              "job": bool(run.get("job_pid")) and _orch_stop(run["job_pid"], run.get("job_started"))}
+              "job": bool(job) and _orch_stop(job, run.get("job_started"))}
     for t in tasks:
         if t.get("path") and os.path.isdir(t["path"]):
             git(["worktree", "remove", "--force", t["path"]], run["repo"], timeout=60)
@@ -4106,7 +4199,7 @@ def _orch_entity_action(action, data, now=None):
                 fields = {"paused": 1 if on else 0, "state": "paused" if on else "idle"}
                 if on and (ent.get("job_pid") or ent.get("job_base")):
                     # found live: a scout still thinking when you paused went on to start (and approve) a run
-                    killed = _orch_stop(ent.get("job_pid"), ent.get("job_started"))
+                    killed = _orch_stop(ent.get("job_pid") or _orch_pid_file(ent.get("job_base")), ent.get("job_started"))
                     cost, note = _orch_killed_cost(_ORCH_ENTITY_SCOUT_BUDGET, ent.get("job_base")) if killed else \
                         ((_orch_parse(_orch_read_out(ent["job_base"]))["cost"] if ent.get("job_base") else 0.0), "")
                     _orch_entity_event(conn, eid, "scout_stopped", "paused while its scout was thinking -- no run is started"
@@ -4122,7 +4215,7 @@ def _orch_entity_action(action, data, now=None):
                 if conn.execute("SELECT 1 FROM runs WHERE entity_id=? AND state IN ('planning','plan_ready','running',"
                                 "'supervising','review')", (eid,)).fetchone():
                     return {"ok": False, "error": "finish or cancel its run first"}
-                _orch_stop(ent.get("job_pid"), ent.get("job_started"))
+                _orch_stop(ent.get("job_pid") or _orch_pid_file(ent.get("job_base")), ent.get("job_started"))
                 conn.execute("DELETE FROM entities WHERE id=?", (eid,))
                 conn.execute("DELETE FROM entity_events WHERE entity_id=?", (eid,))
             else:

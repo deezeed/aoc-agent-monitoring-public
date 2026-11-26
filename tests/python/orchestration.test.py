@@ -26,7 +26,7 @@ base_g = {"os": os, "json": json, "re": re, "time": time, "sqlite3": sqlite3, "s
           "_is_claude_pid_alive": lambda pid: False, "_snapshot_processes": lambda: [], "_find_claude_exe": lambda: "claude.exe",
           "_load_json_file": lambda path, default=None: default, "DB_FILE": os.path.join(data_dir, "history.db"),
           "PORT": 5199}
-wt = exec_functions(["_wt_git", "_wt_err", "_wt_remove", "_wt_repo", "_wt_conflicts", "_parse_porcelain_z"],
+wt = exec_functions(["_WT_IDENTITY", "_wt_needs_identity", "_wt_git", "_wt_err", "_wt_remove", "_wt_repo", "_wt_conflicts", "_parse_porcelain_z"],
                     dict(base_g))
 src_names = [n for n in names if n != "_orch_lock"]
 o = exec_functions(src_names, dict(base_g, **wt))
@@ -1945,6 +1945,160 @@ open(pf + ".pid", "w").write("x")
 c.check("pid file: not a number -> None", O["_orch_pid_file"](pf) is None)
 open(pf + ".pid", "w").write("123\n")
 c.check("pid file: read", O["_orch_pid_file"](pf) == 123)
+
+# ── a monitor killed while it starts the planner / review / check / a scout ──
+# Before: the job and its pid were saved only at the step's end. Killed in
+# between, a restart started a second planner / reviewer (the first one kept
+# running and billing) or failed the run "the planner never started". Now
+# the job is committed before the spawn and the pid sits in <base>.pid.
+lcalls, lmode = [], {}
+
+
+def lspawn(argv, cwd, stdin_text, base, env=None):
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    kind = os.path.basename(base).rsplit("-", 1)[0]
+    mode = lmode.pop(kind, "")
+    if mode == "kill-before-spawn":
+        raise Killed()
+    lcalls.append(kind)
+    if kind == "plan":
+        answer(base, plan_of({"id": "dev", "role": "developer", "title": "Dev"}))
+    elif kind == "supervise":
+        answer(base, finish("all done"))
+    else:
+        write(kind + ".txt", kind + "\n")(cwd)
+        answer(base, done(result="wrote " + kind), cost=0.4)
+    pid = 5000 + len(lcalls)
+    open(base + ".pid", "w").write(str(pid))
+    if mode == "kill-after-spawn":
+        raise Killed()
+    return pid
+
+
+lrepo = tempfile.mkdtemp()
+git("init", "-q", "-b", "main", cwd=lrepo)
+git("config", "user.email", "t@t", cwd=lrepo); git("config", "user.name", "t", cwd=lrepo)
+open(os.path.join(lrepo, "a.txt"), "w").write("a\n")
+git("add", "-A", cwd=lrepo); git("commit", "-qm", "init", cwd=lrepo)
+lkw = dict(exe="claude.exe", spawn=lspawn, alive=lambda pid: False, kill=lambda pid: None)
+
+
+def lcreate(goal):
+    try:
+        return O["_orch_create"]({"goal": goal, "cwd": lrepo, "max_parallel": 1, "budget_usd": 10}, exe="claude.exe",
+                                 spawn=lspawn)["id"]
+    except Killed:
+        conn = O["_orch_connect"]()
+        try:
+            # by goal: earlier tests' runs carry made-up (later) creation times
+            return conn.execute("SELECT id FROM runs WHERE goal=?", (goal,)).fetchone()[0]
+        finally:
+            conn.close()
+
+
+def lstep(rid):
+    conn = O["_orch_connect"]()
+    try:
+        O["_orch_step"](conn, rid, **lkw)
+    except Killed:
+        pass
+    finally:
+        conn.close()
+    return lget(rid)
+
+
+def lget(rid):
+    """The run as stored (job fields included) and its tasks."""
+    conn = O["_orch_connect"]()
+    try:
+        run_, tasks_ = O["_orch_load"](conn, rid)
+        return {"run": run_, "tasks": tasks_}
+    finally:
+        conn.close()
+
+
+def lrecovered(rid):
+    return [e["message"] for e in O["_orch_get"](rid)["events"] if e["kind"] == "job_recovered"]
+
+
+lmode["plan"] = "kill-after-spawn"
+lrid = lcreate("Planner killed after its spawn")
+lv = lget(lrid)["run"]
+c.check("planner killed after the spawn: the job is saved (kind + base, no pid yet)",
+        lv["state"] == "planning" and lv["job_kind"] == "plan" and lv["job_base"] and lv["job_pid"] is None)
+lv = lstep(lrid)
+c.check("restart: the planner is found through <base>.pid and followed -- not started twice",
+        lcalls == ["plan"] and lv["run"]["job_pid"] == 5001 and "pid 5001" in " ".join(lrecovered(lrid)))
+lv = lstep(lrid)
+c.check("its plan is read as usual", lv["run"]["state"] == "plan_ready" and [t["id"] for t in lv["tasks"]] == ["dev"])
+O["_orch_action"]("cancel", {"id": lrid})
+
+lcalls.clear()
+lmode["plan"] = "kill-before-spawn"
+lrid = lcreate("Planner killed before its spawn")
+lv = lget(lrid)["run"]
+c.check("planner killed before the spawn: job saved, no pid file",
+        lv["job_kind"] == "plan" and not os.path.exists(lv["job_base"] + ".pid") and lcalls == [])
+lv = lstep(lrid)
+c.check("restart: never started -> started now, once (not 'the planner never started')",
+        lcalls == ["plan"] and lv["run"]["state"] == "planning" and lv["run"]["job_pid"] == 5001
+        and "starts again" in " ".join(lrecovered(lrid)))
+lv = lstep(lrid)
+c.check("and its plan arrives", lv["run"]["state"] == "plan_ready")
+O["_orch_action"]("approve", {"id": lrid})
+lv = lstep(lrid)   # dev starts
+lmode["supervise"] = "kill-after-spawn"
+lv = lstep(lrid)   # dev done -> review starts, monitor killed
+c.check("review killed after the spawn: saved as supervising with the job, no pid",
+        lv["run"]["state"] == "supervising" and lv["run"]["job_kind"] == "supervise" and lv["run"]["job_pid"] is None)
+lv = lstep(lrid)
+c.check("restart: the reviewer is followed, not started twice",
+        lcalls.count("supervise") == 1 and lv["run"]["job_pid"] and "review" in lrecovered(lrid)[-1])
+lv = lstep(lrid)
+c.check("its decision is read: review", lv["run"]["state"] == "review" and lcalls.count("supervise") == 1)
+O["_orch_action"]("cancel", {"id": lrid})
+
+lcalls.clear()
+lrid = lcreate("Review killed before its spawn")
+lstep(lrid)
+O["_orch_action"]("approve", {"id": lrid})
+lstep(lrid)
+lmode["supervise"] = "kill-before-spawn"
+lv = lstep(lrid)
+c.check("review killed before the spawn: saved, no process", lv["run"]["job_kind"] == "supervise" and lcalls.count("supervise") == 0)
+lv = lstep(lrid)
+c.check("restart: back to running, the review comes again", lv["run"]["state"] == "running" and not lv["run"]["job_kind"]
+        and "starts again" in lrecovered(lrid)[-1])
+lv = lstep(lrid)
+lv = lstep(lrid)
+c.check("then one review and the run is ready", lv["run"]["state"] == "review" and lcalls.count("supervise") == 1)
+O["_orch_action"]("cancel", {"id": lrid})
+
+# a team's planner (a child run) without a pid file can't be rebuilt: it fails, its manager retries
+cd_ = tempfile.mkdtemp()
+cdb = O["_orch_connect"](os.path.join(cd_, "c.db"))
+cdb.execute("INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model, max_parallel, budget_usd, "
+            "parent_id, job_kind, job_base, job_started) VALUES ('ch', 0, 0, 'g', ?, 'main', 'x', 'planning', 'opus', 2, 10, "
+            "'top', 'plan', ?, 1)", (cd_, os.path.join(cd_, "plan-1")))
+O["_orch_step"](cdb, "ch", **lkw)
+crun, _ = O["_orch_load"](cdb, "ch")
+c.check("a team's planner never started -> its run fails (the manager's retry takes over)",
+        crun["state"] == "failed" and "restarted" in crun["error"] and not crun["job_kind"])
+# cancel kills a job known only by its pid file
+cdb.execute("INSERT INTO runs (id, created, updated, goal, repo, base, base_sha, state, model, max_parallel, budget_usd, "
+            "job_kind, job_base, job_started) VALUES ('cj', 0, 0, 'g', ?, 'main', 'x', 'supervising', 'opus', 2, 10, "
+            "'supervise', ?, 1)", (cd_, os.path.join(cd_, "supervise-1")))
+open(os.path.join(cd_, "supervise-1.pid"), "w").write("888")
+cjrun, cjtasks = O["_orch_load"](cdb, "cj")
+stopped = []
+g["_orch_stop"] = lambda pid, since=None, alive=None, kill=None: stopped.append(pid) or True
+try:
+    kres = O["_orch_cleanup"](cjrun, cjtasks, git=lambda args, cwd, timeout=None: (0, "", ""))
+finally:
+    g["_orch_stop"] = real_stop
+c.check("cancel: a job known only by <base>.pid is killed", stopped == [888] and kres["job"] is True)
+cdb.close()
+shutil.rmtree(cd_, ignore_errors=True)
 
 # ── verify: AOC runs your check on the done work before the review (audit FIND-008) ──
 vv = O["_orch_validate_verify"]

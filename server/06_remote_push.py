@@ -18,6 +18,7 @@ _PERM_POLL_STALE_S = 15   # no poll for this long = the hook is gone (Esc, sessi
 _PERM_BACK_IDLE_S = 5     # input this recent while held in "away" mode = you're back
 _perm_lock = threading.Lock()
 _perm_requests = {}       # id -> request dict (see _perm_open)
+_perm_decided_by = {}     # id of a held dangerous command -> who answered it (its log line)
 
 
 def _sanitize_remote_approve(data) -> dict:
@@ -127,7 +128,7 @@ def _perm_poll(rid, idle_s, cfg, now) -> dict:
         return {"state": req["state"], "message": req["message"]}
 
 
-def _perm_decide(rid, decision, message="") -> bool:
+def _perm_decide(rid, decision, message="", by="") -> bool:
     """POST /permission/decide from the dashboard: allow | deny | terminal."""
     state = {"allow": "allow", "deny": "deny", "terminal": "release"}.get(decision)
     with _perm_lock:
@@ -136,7 +137,20 @@ def _perm_decide(rid, decision, message="") -> bool:
             return False
         req["state"] = state
         req["message"] = str(message or "")[:500]
+        if req.get("danger"):
+            _perm_decided_by[rid] = str(by or "")[:80]
         return True
+
+
+def _perm_decide_refusal(rid, user) -> str:
+    """Why this person may not answer this prompt ('' = they may). A held
+    dangerous command runs on the owner's PC: only the owner answers it
+    (audit FIND-018 -- a member could allow `rm -rf ~` there)."""
+    with _perm_lock:
+        req = _perm_requests.get(rid)
+    if req and req.get("danger") and (user or {}).get("role") != "owner":
+        return "only the owner can answer a dangerous command"
+    return ""
 
 
 def _perm_pending_by_session(now) -> dict:

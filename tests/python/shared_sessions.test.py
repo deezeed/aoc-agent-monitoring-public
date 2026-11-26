@@ -6,7 +6,7 @@ import json, os, queue, re, struct, sys, tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from lib.extract import exec_functions
-from lib.check import Checker
+from lib.check import Checker, wait_until
 
 c = Checker()
 killed = []
@@ -71,7 +71,9 @@ e["clients"][a] = owner
 e["clients"][b] = {"id": "marco", "name": "Marco", "role": "member"}
 e["clients"][gone] = {"id": "eva", "name": "Eva", "role": "viewer"}
 pty.out.append("hello\r\n")
-time.sleep(0.3)
+# the reader thread's broadcast, waited for -- a fixed sleep(0.3) failed on a loaded CI runner (run 45434243667)
+wait_until(lambda: gone not in e["clients"] and any(p == b"hello\r\n" for _, p in frames_text(a))
+           and any(p == b"hello\r\n" for _, p in frames_text(b)))
 c.check("output: to everyone, as binary frames, kept for newcomers", any(op == 0x82 and p == b"hello\r\n" for op, p in frames_text(a))
         and any(p == b"hello\r\n" for _, p in frames_text(b)) and e["buf"].endswith(b"hello\r\n"))
 c.check("a dead client is dropped", gone not in e["clients"])

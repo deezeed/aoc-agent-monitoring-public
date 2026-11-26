@@ -1025,12 +1025,42 @@ _DANGER_RULES = (
     ("force_push", "Force push", "git push --force / -f / +branch: rewrites history others may have"),
     ("git_discard", "Discard uncommitted work", "git reset --hard, git clean -f, git checkout -- . / git restore ., git stash clear"),
     ("remote_branch_delete", "Delete a remote branch", "git push --delete / git push origin :branch"),
-    ("rm_broad", "Recursive delete of a broad path", "rm -r, Remove-Item -Recurse, rd /s on /, ~, a drive, a folder near the root or home, ., .., * or $VARIABLE/"),
+    ("rm_broad", "Recursive delete of a broad path", "rm -r, Remove-Item -Recurse, rd /s, find -delete, shutil.rmtree on /, ~, a drive, a folder near the root or home, ., .., * or $VARIABLE/ -- also behind bash -c, powershell -Command, cmd /c, env, xargs"),
     ("sql_destroy", "Destroy database data", "DROP TABLE/DATABASE/SCHEMA, TRUNCATE, DELETE FROM without WHERE (also inside python -c, psql, sqlite3 ...)"),
     ("db_reset", "Reset a dev database", "prisma migrate reset, prisma db push --force-reset, dropdb, supabase db reset, docker compose down -v, docker volume rm/prune"),
     ("disk_wipe", "Format or overwrite a disk", "format X:, diskpart, mkfs, dd of=/dev/..., Clear-Disk, Format-Volume"),
+    ("remote_delete", "Delete a cloud resource or rewrite history",
+     "gh repo delete, gh api -X DELETE, vercel remove, aws s3 rm --recursive, terraform destroy, git filter-branch / filter-repo"),
+    ("aoc_self", "Touch AOC's own safety switches",
+     "calls AOC's API to change the guard, answer a prompt, merge or read the token; reads aoc_token.txt / danger_guard.json"),
 )
 _DANGER_RULE_IDS = tuple(r[0] for r in _DANGER_RULES)
+# Wrappers judged by what they run (found in the audit: `powershell -Command
+# "Remove-Item -Recurse ~"`, `bash -c`, `env rm -rf ~` all went through)
+_DANGER_PREFIXES = {"env", "command", "nohup", "time", "nice", "exec", "builtin", "sudo", "doas", "stdbuf", "timeout"}
+_DANGER_SH = {"bash", "sh", "zsh", "dash", "ksh"}
+_DANGER_PS = {"powershell", "pwsh"}
+_DANGER_SQL_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3", "sqlcmd", "duckdb", "clickhouse-client", "cockroach"}
+_DANGER_LISTERS = {"get-childitem", "gci", "ls", "dir", "get-item", "gi"}
+# find tests that pick files (a `-name '*.pyc' -delete` is cleanup, not a wipe)
+_DANGER_FIND_PICK = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-newer",
+                     "-mtime", "-mmin", "-atime", "-amin", "-size", "-empty", "-user", "-group", "-perm", "-lname"}
+# recursive deletes inside python -c / node -e / PowerShell .NET calls
+_DANGER_CODE_RM = re.compile(r"(\bshutil\.rmtree|\brmSync|\brmdirSync|\bfs\.promises\.rm|\bremove_tree"
+                             r"|\[(?:system\.)?io\.directory\]::delete)\s*\(", re.I)
+_DANGER_HOME_EXPR = re.compile(r"^(os\.path\.expanduser\(\s*['\"]~/?['\"]\s*\)|(pathlib\.)?path\.home\(\)|os\.homedir\(\)"
+                               r"|require\(['\"]os['\"]\)\.homedir\(\)|process\.env\.(home|userprofile)"
+                               r"|os\.environ\[\s*['\"](home|userprofile)['\"]\s*\]"
+                               r"|os\.(environ\.get|getenv)\(\s*['\"](home|userprofile)['\"]\s*\)"
+                               r"|\[environment\]::getfolderpath\(\s*['\"]?userprofile['\"]?\s*\))$", re.I)
+# AOC's API routes that switch off or answer its safety checks, or hand out the token
+_DANGER_AOC_ROUTES = re.compile(r"(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(\d+)/(danger_guard|auth/|permission/decide"
+                                r"|permission/settings|reply/send|orch/(gate|merge|approve|settings)|users|budget_caps"
+                                r"|restart\b|restore_backup)", re.I)
+# routes whose GET only shows a setting (no token, no invite links) -- reading them is fine
+_DANGER_AOC_READ_OK = {"danger_guard", "permission/settings", "orch/settings", "budget_caps"}
+_DANGER_AOC_FILES = re.compile(r"(^|[\\/'\"])(aoc_token\.txt|danger_guard\.json|users\.json)['\"]?$", re.I)
+_DANGER_READ_MAX = 1 << 20
 # heads whose arguments are only text -- a commit message about "DROP TABLE" is fine
 _DANGER_TEXT_HEADS = {"git", "echo", "printf", "write-host", "write-output", "grep", "rg", "findstr",
                       "select-string", "gh", "cat", "type", "less", "head", "tail", "sls"}
@@ -1116,6 +1146,8 @@ def _danger_broad_path(p) -> bool:
         return False
     if re.match(r"^\$(\{\w+\}|\w+|env:\w+)/\*?$", p, re.I):
         return True
+    if re.match(r"^(\$\(.*\)|`.*`)/?\*?$", p, re.S):      # $(pwd), `xargs` input: AOC can't see where it points
+        return True
     p = re.sub(r"/\*$", "", p.rstrip("/")) or "/"
     if p.lower() in ("/", "*", ".", "..", "~", "$home", "${home}", "$env:userprofile"):
         return True
@@ -1136,11 +1168,18 @@ def _danger_broad_path(p) -> bool:
 
 def _danger_rm_hit(words) -> bool:
     """Pure: a simple command that recursively deletes a broad path."""
+    rm = _danger_rm_parse(words)
+    return bool(rm) and rm[0] and any(_danger_broad_path(t) for t in rm[1])
+
+
+def _danger_rm_parse(words):
+    """Pure: a delete command -> (recursive, its targets); None for anything
+    else. No targets = it deletes what a pipe feeds it."""
     head = _perm_head(words[0])
     if head == "sudo" and len(words) > 1:
-        return _danger_rm_hit(words[1:])
+        return _danger_rm_parse(words[1:])
     if head not in _DANGER_RM_HEADS:
-        return False
+        return None
     cmdish = head in ("rd", "rmdir", "del", "erase")
     recursive, targets, skip = False, [], False
     for w in words[1:]:
@@ -1163,8 +1202,10 @@ def _danger_rm_hit(words) -> bool:
             elif lw in ("-filter", "-include", "-exclude"):
                 skip = True
             continue
+        if u in ("&", "&&"):
+            continue
         targets.append(u)
-    return recursive and any(_danger_broad_path(t) for t in targets)
+    return recursive, targets
 
 
 def _danger_git_hits(words) -> list:
@@ -1226,11 +1267,274 @@ def _danger_disk_hit(words) -> bool:
     return head == "dd" and any(a.startswith("of=/dev/") for a in w[1:])
 
 
-def _danger_check(command, shell, cfg) -> list:
-    """Pure: a shell command -> [{"id", "label", "why", "part"}] of the rules
-    it trips (empty = harmless). Quote-aware: each simple command of a chain
-    is judged on its own, and text arguments (commit messages, echo, grep)
-    never count as SQL."""
+def _danger_remote_hit(words) -> bool:
+    """Pure: deletes a repository / cloud resource, or rewrites git history."""
+    w = [_danger_unquote(x).lower() for x in words]
+    head, j = _perm_head(w[0]), " ".join(w[1:])
+    if head in ("npx", "pnpm", "yarn", "bunx", "pnpx") and len(w) > 1:
+        head, j = _perm_head(w[1]), " ".join(w[2:])
+    if head == "gh":
+        return bool(re.search(r"^repo\s+(delete|archive)\b", j) or
+                    (j.startswith("api") and re.search(r"(-x|--method)[\s=]+delete\b", j)))
+    if head == "git":
+        return bool(re.search(r"(^|\s)(filter-branch|filter-repo)\b", j))
+    if head == "vercel":
+        return bool(re.search(r"^(remove|rm)\b", j))
+    if head == "aws":
+        return bool(re.search(r"^s3\s+rm\b.*--recursive", j) or re.search(r"^s3\s+rb\b.*--force", j))
+    if head == "terraform":
+        return bool(re.search(r"^destroy\b", j) or re.search(r"^apply\b.*-destroy\b", j))
+    if head == "railway":
+        return bool(re.search(r"^(down|delete)\b", j))
+    if head in ("fly", "flyctl"):
+        return bool(re.search(r"^(apps\s+destroy|destroy)\b", j))
+    if head == "heroku":
+        return bool(re.search(r"^apps:destroy\b", j))
+    if head == "supabase":
+        return bool(re.search(r"^projects\s+delete\b", j))
+    return False
+
+
+def _danger_find_hit(words) -> bool:
+    """Pure: find on a broad path that deletes what it finds, without a test
+    that picks files (`-name '*'` picks nothing)."""
+    if _perm_head(words[0]) != "find":
+        return False
+    args = [_danger_unquote(x) for x in words[1:]]
+    i = 0
+    while i < len(args) and not args[i].startswith(("-", "(", "!")):
+        i += 1
+    paths, expr = args[:i] or ["."], [a.lower() for a in args[i:]]
+    deletes = "-delete" in expr or any(a in ("-exec", "-execdir", "-ok", "-okdir") and k + 1 < len(expr)
+                                       and _perm_head(expr[k + 1]) in _DANGER_RM_HEADS for k, a in enumerate(expr))
+    picks = any(a in _DANGER_FIND_PICK and (k + 1 >= len(expr) or expr[k + 1] not in ("*", "*.*"))
+                for k, a in enumerate(expr))
+    return deletes and not picks and any(_danger_broad_path(p) for p in paths)
+
+
+def _danger_first_arg(text, start) -> str:
+    """Pure: the first argument of a call whose '(' is at text[start-1]."""
+    depth, q, i = 0, "", start
+    while i < len(text):
+        ch = text[i]
+        if q:
+            if ch == q:
+                q = ""
+        elif ch in "'\"`":
+            q = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            break
+        i += 1
+    return text[start:i].strip()
+
+
+def _danger_code_hit(text) -> bool:
+    """Pure: shutil.rmtree / fs.rmSync(.., recursive) / [IO.Directory]::Delete(.., $true)
+    on a broad path or the home folder, in code passed on the command line."""
+    for m in _DANGER_CODE_RM.finditer(text or ""):
+        arg = _danger_first_arg(text, m.end())
+        call = text[m.start():m.end() + 400].lower()
+        fn = m.group(1).lower()
+        if ("rmsync" in fn or "promises.rm" in fn or "rmdirsync" in fn) and "recursive" not in call:
+            continue
+        if fn.startswith("[") and not re.search(r",\s*\$true", call):
+            continue
+        a = arg.strip()
+        if re.match(r"^r?(['\"]).*\1$", a, re.S):
+            a = a.lstrip("r")
+        if _DANGER_HOME_EXPR.match(a) or (len(a) >= 2 and a[0] in "'\"" and _danger_broad_path(a)) \
+                or re.match(r"^\$(env:)?\w+$", a, re.I) and _danger_broad_path(a):
+            return True
+    return False
+
+
+def _danger_http_read(words) -> bool:
+    """Pure: an HTTP client call that only reads (curl / wget / Invoke-WebRequest /
+    Invoke-RestMethod with no method other than GET/HEAD, no body, no upload,
+    no config file). Anything else -- or any other program -- is not a read."""
+    head = _perm_head(words[0]) if words else ""
+    args = [_danger_unquote(w) for w in words[1:]]
+    if head == "curl":
+        for i, a in enumerate(args):
+            nxt = args[i + 1].upper() if i + 1 < len(args) else ""
+            if a in ("-X", "--request"):
+                if nxt not in ("GET", "HEAD"):
+                    return False
+            elif a.startswith("-X") and len(a) > 2 and a[2:].upper() not in ("GET", "HEAD"):
+                return False
+            elif a.startswith("--request=") and a.split("=", 1)[1].upper() not in ("GET", "HEAD"):
+                return False
+            elif re.match(r"^(-[dFTK]|--(data|form|json|upload-file|config)\b)", a):
+                return False
+            elif re.match(r"^-[a-zA-Z]{2,}$", a) and re.search(r"[dFTKX]", a[1:]):   # -sd, -sX POST
+                return False
+        return True
+    if head == "wget":
+        return not any(re.match(r"^--(post|body|method)", a) for a in args)
+    if head in ("invoke-webrequest", "iwr", "invoke-restmethod", "irm"):
+        for i, a in enumerate(args):
+            name, _, val = a.partition(":")
+            nm = name.lower()
+            if nm.startswith("-me"):
+                v = (val or (args[i + 1] if i + 1 < len(args) else "")).lower()
+                if v not in ("get", "head"):
+                    return False
+            elif nm.startswith(("-b", "-inf", "-form")):
+                return False
+        return True
+    return False
+
+
+def _danger_aoc_hit(words, text) -> bool:
+    """Pure: the command talks to AOC's own safety switches (its API routes
+    that turn the guard off, answer prompts, merge, or hand out the token) or
+    reads its token / guard settings. Text-only commands (grep, git) don't
+    count, nor another AOC's port (testing a preview on 52xx is fine)."""
+    port = str(globals().get("PORT") or 5151)
+    routes = [m.group(3).lower() for m in _DANGER_AOC_ROUTES.finditer(text or "") if m.group(2) == port]
+    # found live: a plain GET of /orch/settings was held -- reading a setting isn't flipping it
+    if routes and not (all(r in _DANGER_AOC_READ_OK for r in routes) and _danger_http_read(words)):
+        return True
+    head = _perm_head(words[0])
+    if head in _DANGER_TEXT_HEADS - {"cat", "type", "less", "head", "tail"}:
+        return False
+    # found live: `ls -la aoc_token.txt` was held -- listing a file doesn't read it
+    if head in ("ls", "dir", "stat", "test", "[", "file", "test-path", "get-item", "gi", "get-childitem", "gci"):
+        return False
+    return any(_DANGER_AOC_FILES.search(_danger_unquote(w)) for w in words[1:])
+
+
+def _danger_expand(words, shell, depth=0) -> list:
+    """Pure: a simple command -> [(words, shell)] of what really runs: itself,
+    or behind a prefix (env, nohup, time, sudo ...) / xargs, or the command a
+    shell wrapper runs (bash -c, eval, cmd /c, powershell -Command / -EncodedCommand,
+    Invoke-Expression, Start-Process -ArgumentList)."""
+    if not words or depth > 4:
+        return [(words, shell)] if words else []
+    head = _perm_head(words[0])
+    rest = list(words[1:])
+
+    def inner(text, sh):
+        out = []
+        for w in _perm_simple_commands(text, sh)[0]:
+            out += _danger_expand(w, sh, depth + 1)
+        return out
+    if re.match(r"^\w+=", words[0]) and not words[0].startswith(("-", "/")):     # VAR=x cmd
+        return _danger_expand(rest, shell, depth + 1) if rest else []
+    if head in _DANGER_PREFIXES:
+        while rest and (rest[0].startswith("-") or re.match(r"^\w+=", rest[0])
+                        or (head in ("nice", "timeout") and re.match(r"^\d+[smhd]?$", rest[0]))):
+            opt = rest.pop(0)
+            if head in ("sudo", "doas") and opt in ("-u", "-g") and rest:
+                rest.pop(0)
+            elif head == "nice" and opt == "-n" and rest:
+                rest.pop(0)
+        return _danger_expand(rest, shell, depth + 1) if rest else [(words, shell)]
+    if head == "xargs":
+        while rest and rest[0].startswith("-"):
+            opt = rest.pop(0)
+            if opt in ("-I", "-n", "-P", "-L", "-d", "-E", "-s") and rest:
+                rest.pop(0)
+        # what it deletes comes down the pipe: unknown, so as broad as $(...)
+        return [(rest + ["$(xargs)"], shell)] if rest else []
+    if head in _DANGER_SH:
+        for k, a in enumerate(rest):
+            if a == "-c" or (re.match(r"^-[a-z]*c[a-z]*$", a) and not a.startswith("--")):
+                return [(words, shell)] + (inner(_danger_unquote(rest[k + 1]), "Bash") if k + 1 < len(rest) else [])
+        return [(words, shell)]
+    if head == "eval":
+        return inner(" ".join(_danger_unquote(a) for a in rest), shell)
+    if head == "cmd":
+        for k, a in enumerate(rest):
+            if a.lower() in ("/c", "/k", "/r"):
+                return inner(" ".join(_danger_unquote(x) for x in rest[k + 1:]), "PowerShell")
+        return [(words, shell)]
+    if head in _DANGER_PS:
+        k = 0
+        while k < len(rest):
+            a = rest[k].lower()
+            if a in ("-encodedcommand", "-enc", "-e", "-ec") and k + 1 < len(rest):
+                try:
+                    import base64 as _b64
+                    code = _b64.b64decode(_danger_unquote(rest[k + 1])).decode("utf-16-le", "replace")
+                except Exception:
+                    code = ""
+                return [(words, shell)] + inner(code, "PowerShell")
+            if a in ("-command", "-c"):
+                return [(words, shell)] + inner(" ".join(_danger_unquote(x) for x in rest[k + 1:]), "PowerShell")
+            if a in ("-file", "-f"):
+                return [(words, shell)]
+            if a.startswith("-"):
+                k += 2 if a in ("-executionpolicy", "-ep", "-windowstyle", "-w", "-workingdirectory", "-wd",
+                                "-configurationname", "-outputformat", "-inputformat", "-version", "-v") else 1
+                continue
+            return [(words, shell)] + inner(" ".join(_danger_unquote(x) for x in rest[k:]), "PowerShell")
+        return [(words, shell)]
+    if head in ("invoke-expression", "iex"):
+        args = [a for a in rest if a.lower() != "-command"]
+        return inner(" ".join(_danger_unquote(a) for a in args), "PowerShell")
+    if head in ("start-process", "saps", "start"):
+        prog, argl, k = None, [], 0
+        while k < len(rest):
+            a, al = rest[k], rest[k].lower()
+            if al in ("-filepath",) and k + 1 < len(rest):
+                prog, k = _danger_unquote(rest[k + 1]), k + 2
+            elif al in ("-argumentlist", "-args") and k + 1 < len(rest):
+                argl, k = [x for x in re.split(r"\s*,\s*", rest[k + 1]) if x], k + 2
+            elif al.startswith("-"):
+                k += 2 if al in ("-workingdirectory", "-verb", "-windowstyle", "-redirectstandardoutput",
+                                 "-redirectstandarderror", "-redirectstandardinput", "-credential") else 1
+            elif prog is None:
+                prog, k = _danger_unquote(a), k + 1
+            else:
+                argl.append(a)
+                k += 1
+        if not prog:
+            return [(words, shell)]
+        return [(words, shell)] + _danger_expand([prog] + [_danger_unquote(x) for x in argl], shell, depth + 1)
+    return [(words, shell)]
+
+
+def _danger_sql_inputs(words, cwd, read) -> list:
+    """SQL a database client reads from a file (`psql < x.sql`, `-f x.sql`,
+    sqlite3's `.read x.sql`) -> its text, read from the session's folder."""
+    w = [_danger_unquote(x) for x in words]
+    files = []
+    for k, a in enumerate(w):
+        if a == "<" and k + 1 < len(w):
+            files.append(w[k + 1])
+        elif a.startswith("<") and len(a) > 1:
+            files.append(a[1:])
+        elif a in ("-f", "--file", "-i", "--input") and k + 1 < len(w):
+            files.append(w[k + 1])
+        elif a.lower().startswith(".read "):
+            files.append(a[6:].strip())
+    out = []
+    for f in files:
+        try:
+            out.append(read(f if os.path.isabs(f) or not cwd else os.path.join(cwd, f)))
+        except Exception:
+            continue
+    return out
+
+
+def _danger_read_file(path) -> str:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read(_DANGER_READ_MAX)
+
+
+def _danger_check(command, shell, cfg, cwd=None, read=None) -> list:
+    """A shell command -> [{"id", "label", "why", "part"}] of the rules it
+    trips (empty = harmless). Quote-aware: each simple command of a chain is
+    judged on its own, wrappers (bash -c, powershell -Command, env, xargs ...)
+    by what they run, and text arguments (commit messages, echo, grep) never
+    count as SQL. Reads only a .sql file a database client is fed (`cwd`)."""
     command = str(command or "")
     if cfg.get("mode") == "off" or not command.strip():
         return []
@@ -1243,21 +1547,49 @@ def _danger_check(command, shell, cfg) -> list:
             r = next(x for x in _DANGER_RULES if x[0] == rid)
             found[rid] = {"id": rid, "label": r[1], "why": r[2], "part": part[:300]}
 
-    texts = []
-    for words in simple:
-        if not words:
-            continue
-        part = " ".join(words)
-        for rid in _danger_git_hits(words):
-            add(rid, part)
-        if _danger_rm_hit(words):
-            add("rm_broad", part)
-        if _danger_db_hit(words):
-            add("db_reset", part)
-        if _danger_disk_hit(words):
-            add("disk_wipe", part)
-        if _perm_head(words[0]) not in _DANGER_TEXT_HEADS:
-            texts.append(part)
+    texts, echoed, sql_client = [], [], False
+    for top in simple:
+        for words, _sh in _danger_expand(top, shell) if top else []:
+            if not words:
+                continue
+            part = " ".join(words)
+            head = _perm_head(words[0])
+            for rid in _danger_git_hits(words):
+                add(rid, part)
+            rm = _danger_rm_parse(words)
+            if rm and rm[0] and any(_danger_broad_path(t) for t in rm[1]):
+                add("rm_broad", part)
+            if _danger_find_hit(words):
+                add("rm_broad", part)
+            if _danger_db_hit(words):
+                add("db_reset", part)
+            if _danger_disk_hit(words):
+                add("disk_wipe", part)
+            if _danger_remote_hit(words):
+                add("remote_delete", part)
+            if _danger_aoc_hit(words, part):
+                add("aoc_self", part)
+            if head in _DANGER_SQL_CLIENTS:
+                sql_client = True
+                texts += _danger_sql_inputs(words, cwd, read or _danger_read_file)
+            if head not in _DANGER_TEXT_HEADS:
+                texts.append(part)
+                if _danger_code_hit(part):
+                    add("rm_broad", part)
+            elif head in ("echo", "printf", "write-output"):
+                echoed.append(part)
+    # Get-ChildItem C:\ | Remove-Item -Recurse: the delete's targets come down the pipe
+    for a, b in zip(simple, simple[1:]):
+        rm = _danger_rm_parse(b) if b else None
+        if rm and rm[0] and not rm[1] and a and _perm_head(a[0]) in _DANGER_LISTERS:
+            src = [_danger_unquote(x) for x in a[1:]]
+            if not any(x.lower() in ("-filter", "-include", "-exclude", "-name") for x in src):
+                paths = [x for k, x in enumerate(src) if not x.startswith("-")] or ["."]
+                if any(_danger_broad_path(p) for p in paths):
+                    add("rm_broad", " ".join(a) + " | " + " ".join(b))
+    # echo 'DROP TABLE x' | psql: the echoed text is the SQL
+    if sql_client:
+        texts += echoed
     # heredoc bodies were dropped by the splitter -- SQL piped into psql /
     # sqlite3 / python lives there
     for m in re.finditer(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\s*\2\s*(?=\n|$)", command, re.S):
@@ -1366,14 +1698,16 @@ def _danger_hook(hook, cfg=None, wait=_danger_wait, now=None, gone_fn=lambda: Fa
         return {}
     cfg = cfg or _load_danger_guard()
     ti = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
-    hits = _danger_check(ti.get("command"), tool, cfg)
+    hits = _danger_check(ti.get("command"), tool, cfg, cwd=str(hook.get("cwd") or "") or None)
     if not hits:
         return {}
     t0 = now or time.time()
     rid = _danger_open(hook, hits, t0)
     state, message = wait(rid, cfg["hold_min"] * 60, gone_fn=gone_fn)
+    with _perm_lock:
+        by = _perm_decided_by.pop(rid, "")
     try:
-        _danger_log_append(_danger_log_entry(hook, hits, state, t0, time.time() - t0))
+        _danger_log_append(dict(_danger_log_entry(hook, hits, state, t0, time.time() - t0), by=by))
     except Exception as e:
         _log_bg_error("danger log", e)
     return _danger_decision(state, message, hits, cfg["hold_min"])
@@ -1409,6 +1743,29 @@ def _danger_log_append(entry, path=None) -> None:
         if len(lines) > 2 * _DANGER_LOG_KEEP:
             with open(path, "w", encoding="utf-8") as f:
                 f.writelines(lines[-_DANGER_LOG_KEEP:])
+
+
+def _danger_log_refused_entry(method, path, agent, now=None) -> dict:
+    """Pure: the log line for a Claude Code agent's call AOC refused (it tried
+    to change AOC or read its token without the token)."""
+    return {"t": round(now or time.time(), 1), "sid": "", "cwd": "", "tool": "AOC API",
+            "cmd": f"{method} {path}"[:300], "rules": ["Touch AOC's own safety switches"],
+            "outcome": "agent refused", "held_s": 0.0, "by": str(agent or "")[:80]}
+
+
+_agent_refused_last = {}
+
+
+def _agent_refused_log(method, path, agent, now=None, append=None):
+    """Log a refused agent call -- once a minute per route (a retry loop
+    must not flood the 'Recently held' list)."""
+    now = now or time.time()
+    key = (method, path)
+    if now - _agent_refused_last.get(key, 0) < 60:
+        return False
+    _agent_refused_last[key] = now
+    (append or _danger_log_append)(_danger_log_refused_entry(method, path, agent, now))
+    return True
 
 
 def _danger_log_read(limit=30, path=None) -> list:

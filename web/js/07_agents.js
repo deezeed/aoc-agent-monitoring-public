@@ -344,7 +344,7 @@ function _dgTestHtml(d){
 /* Pure: the recently held commands (GET /danger_guard -> log, newest first). */
 function _dgLogHtml(log){
   if(!log||!log.length) return '';
-  const col={allowed:'var(--g)',denied:'var(--r)','no answer, denied':'var(--r)'};
+  const col={allowed:'var(--g)',denied:'var(--r)','no answer, denied':'var(--r)','agent refused':'var(--r)'};
   const rows=log.slice(0,10).map(e=>{
     const when=new Date(e.t*1000);
     const w=when.toDateString()===new Date().toDateString()?when.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):when.toLocaleDateString([], {day:'numeric',month:'short'});

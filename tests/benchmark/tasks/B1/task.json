@@ -1,0 +1,10 @@
+{
+  "id": "B1",
+  "category": "Programming",
+  "title": "Add slugify() with its edge cases to a small library",
+  "goal": "Add a function slugify(text, max_len=None) to textkit.py. Rules: the result is lowercase ASCII; letters with diacritics become their base letter (\"Žltý kôň\" -> \"zlty-kon\"); every run of characters that are not a-z or 0-9 becomes a single hyphen; the result never starts or ends with a hyphen; with max_len the result is at most max_len characters long and still never ends with a hyphen; text with no letters or digits gives an empty string. tests/test_slugify.py already describes the basics -- make it pass, and add your own tests for the edge cases in a new file tests/test_slugify_edges.py. Do not change the existing test files.",
+  "verify": "python -m unittest discover -s tests -t .",
+  "regression": "python -m unittest tests.test_textkit",
+  "protected": ["tests/test_textkit.py", "tests/test_slugify.py"],
+  "budget_usd": 2.0
+}

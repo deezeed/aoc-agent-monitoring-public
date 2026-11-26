@@ -1,0 +1,17 @@
+{
+  "id": "B8",
+  "category": "Strategy comparison",
+  "title": "B5 as a team and as one agent",
+  "goal": "Add discount coupons to the shop package. 1) In shop/coupons.py write apply_coupon(total, code) -> the new total as a float rounded to 2 decimals. The coupons are in shop/coupons.json (read it from there, don't copy it into code): a 'percent' coupon takes that percentage off, an 'amount' coupon takes that many euros off; the total never goes below 0; codes are case-insensitive and surrounding spaces are ignored; an unknown code raises KeyError. 2) Write tests for it in tests/test_coupons.py (at least 3 test methods, covering the cases above). 3) Add a '## Coupons' section to README.md that lists every code and what it does. Do not change shop/coupons.json, shop/cart.py, tests/test_cart.py or check_deliverables.py. Suggested split: a developer writes the code, then a QA agent writes the tests and the README section.",
+  "verify": "python -m unittest discover -s tests -t . && python check_deliverables.py",
+  "regression": "python -m unittest tests.test_cart",
+  "protected": [
+    "shop/coupons.json",
+    "shop/cart.py",
+    "tests/test_cart.py",
+    "check_deliverables.py"
+  ],
+  "budget_usd": 3.0,
+  "assets": "B5",
+  "strategy": "team+solo"
+}

@@ -493,11 +493,38 @@ _wt_lock = threading.Lock()
 _wt_status_cache = {}
 
 
+_WT_IDENTITY = ["-c", "user.name=AOC", "-c", "user.email=aoc@localhost"]
+
+
+def _wt_needs_identity(args):
+    """Pure: does this git call write a commit (commit, or a merge that may
+    make one) without naming an author itself?"""
+    args = list(args)
+    i = 0
+    while i + 1 < len(args) and args[i] == "-c":
+        if str(args[i + 1]).startswith(("user.name=", "user.email=")):
+            return False
+        i += 2
+    return i < len(args) and args[i] in ("commit", "merge")
+
+
 def _wt_git(args, cwd, timeout=30):
     """(returncode, stdout, stderr) of a git call, decoded as UTF-8;
-    (-1, "", error) when git can't run at all."""
+    (-1, "", error) when git can't run at all. A commit or merge on a PC with
+    no git identity is made as "AOC" -- found by the benchmark: a fresh PC
+    without `git config --global user.email` lost every agent's work (the
+    commit failed silently); a configured identity is always kept."""
+    args = list(args)
+    if _wt_needs_identity(args):
+        try:
+            ident = [subprocess.run(["git", "config", key], cwd=cwd, capture_output=True, timeout=10,
+                                    creationflags=_NO_WINDOW).stdout.strip() for key in ("user.name", "user.email")]
+        except Exception:
+            ident = ["?", "?"]   # can't tell: leave it to git
+        if not all(ident):
+            args = _WT_IDENTITY + args
     try:
-        r = subprocess.run(["git", "-c", "core.quotepath=off"] + list(args), cwd=cwd, capture_output=True,
+        r = subprocess.run(["git", "-c", "core.quotepath=off"] + args, cwd=cwd, capture_output=True,
                            timeout=timeout, creationflags=_NO_WINDOW)
     except Exception as e:
         return -1, "", str(e)
