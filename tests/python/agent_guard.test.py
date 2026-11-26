@@ -132,8 +132,8 @@ proc = subprocess.Popen([sys.executable, MONITOR_PATH, "--headless"], env=env, c
 
 
 def call(method, path, body=None):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method,
-                                 data=None if body is None else json.dumps(body).encode(),
+    raw = body if isinstance(body, bytes) else None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, data=raw,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -162,6 +162,8 @@ try:
     c.check("agent: can't answer a prompt", call("POST", "/permission/decide", {"id": "x", "decision": "allow"})[0] == 403)
     c.check("agent: AOC's hooks still post their status",
             call("POST", "/update", {"session_id": "agent-test", "cwd": "C:/x", "agents": []})[0] != 403)
+    c.check("a malformed /update body is the caller's fault: 400, not 500",
+            call("POST", "/update", b"{not json")[0] == 400 and call("POST", "/update", b"[1, 2]")[0] == 400)
     log = os.path.join(data, "danger_log.jsonl")
     lines = [json.loads(x) for x in open(log, encoding="utf-8")] if os.path.exists(log) else []
     c.check("the refusal is in the danger log ('Recently held')",

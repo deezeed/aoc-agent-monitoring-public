@@ -23,7 +23,7 @@ ns = exec_functions(
     ["_load_json_file", "REMOTE_APPROVE_FILE", "_PERM_MODES", "_REPLY_MODES", "_PERM_POLL_STALE_S", "_PERM_BACK_IDLE_S",
      "_sanitize_remote_approve", "_load_remote_approve", "_save_remote_approve",
      "_REPLY_MAX_STREAK", "_reply_lock", "_reply_requests", "_reply_streak", "_reply_should_hold", "_reply_expire",
-     "_reply_open", "_reply_poll", "_reply_send", "_reply_pending_by_session"],
+     "_reply_open", "_reply_poll", "_reply_send", "_reply_send_refusal", "_reply_pending_by_session"],
     {"os": os, "json": json, "threading": threading, "_secrets": secrets, "AOC_DATA_DIR": os.path.join(data_dir, "AOC"),
      "_push_notify": lambda title, body, tag="aoc", urgent=False, **k: pushes.append((title, body, urgent)) or 1,
      "_notify_gate": lambda kind, channel, project="": (True, ""),
@@ -215,6 +215,13 @@ env = dict(os.environ, CLAUDE_CODE_ENTRYPOINT="cli")
 p = subprocess.run([sys.executable, script], input=json.dumps({**HOOK, "cwd": "C:/Počítač"}, ensure_ascii=False).encode("utf-8"),
                    capture_output=True, timeout=30, env=env)
 c.check("script: Stop, no monitor -> exit 0, no output", p.returncode == 0 and p.stdout == b"")
+
+# a reply is typed into the owner's own session as the owner (audit FIND-023)
+ref = ns["_reply_send_refusal"]
+c.check("refusal: the owner may reply", ref("reply", {"role": "owner"}) == "")
+c.check("refusal: a member or viewer may not reply", "owner" in ref("reply", {"role": "member"}) and ref("reply", {"role": "viewer"}))
+c.check("refusal: anyone may let the turn end", ref("done", {"role": "member"}) == "" and ref("done", None) == "")
+c.check("refusal: nobody known -> no reply", ref("reply", None) != "")
 
 shutil.rmtree(work, ignore_errors=True)
 shutil.rmtree(data_dir, ignore_errors=True)

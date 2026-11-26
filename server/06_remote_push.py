@@ -276,6 +276,16 @@ def _reply_send(rid, action, text="", kind="") -> tuple:
     return True, ""
 
 
+def _reply_send_refusal(action, user) -> str:
+    """Why this person may not send this ('' = they may). A reply is typed
+    into the owner's own session -- Claude takes it as the owner's word and
+    acts with all of the owner's tools (audit FIND-023), so only the owner
+    replies. Letting the turn end ("done") is anyone's call."""
+    if action == "reply" and (user or {}).get("role") != "owner":
+        return "Only the owner can reply into a session -- it runs on their PC as them."
+    return ""
+
+
 def _reply_pending_by_session(now) -> dict:
     """{session_id: {id, message, age_s}} for turns held for a reply."""
     out = {}

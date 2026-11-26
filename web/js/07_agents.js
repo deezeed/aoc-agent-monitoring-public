@@ -433,6 +433,12 @@ async function _raSave(){
     document.getElementById('st-ra-idle').value=d.idle_min;
   }catch(e){ showToast('warning','Not saved','Could not reach AOC.'); }
 }
+/* Only the owner types into a session (it runs on their PC as them, audit
+   FIND-023); a member may still let the turn end. Unknown yet -> shown. */
+function _replyAllowed(){
+  const me=(typeof _peState!=='undefined'&&_peState&&_peState.me)||null;
+  return !me||me.role==='owner';
+}
 /* Pure: a finished turn AOC is holding so you can answer it from here
    (reply from the dashboard: s.reply_request, see _reply_open). '' if none. */
 function _replyAskHtml(s){
@@ -444,7 +450,7 @@ function _replyAskHtml(s){
     <div class="perm-head"><span class="woy-lbl">💬 ${info&&info.asked?'Claude asks':'Turn finished'} · reply from here</span></div>
     ${info?`<div class="perm-sum reply-sum">${escHtml(info.text)}</div>`:''}
     <div class="perm-btns">
-      <button class="perm-btn allow" onclick="_replyOpen(${m},${jsq(s.id)})">Reply…</button>
+      ${_replyAllowed()?`<button class="perm-btn allow" onclick="_replyOpen(${m},${jsq(s.id)})">Reply…</button>`:''}
       <button class="perm-btn term" onclick="_replySend(${m},${jsq(r.id)},'done')" title="Let the turn end: the session waits in its terminal as usual">Done for now</button>
     </div></div>`;
 }

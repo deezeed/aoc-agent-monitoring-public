@@ -6,7 +6,7 @@ const { readMonitorSource, extractFunction } = require('./lib/extract');
 const { Checker } = require('./lib/check');
 
 const src = readMonitorSource();
-for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_lastMessageInfo', '_waitLabel', '_permAskHtml', '_replyAskHtml', '_woyQuoteHtml'])
+for (const f of ['escHtml', 'jsq', '_fmtDurationDHM', '_lastMessageInfo', '_waitLabel', '_permAskHtml', '_replyAllowed', '_replyAskHtml', '_woyQuoteHtml'])
   eval(extractFunction(src, f));
 
 const c = new Checker();
@@ -23,6 +23,15 @@ c.check('last paragraph shown, escaped', h.includes('Shall I push &lt;now&gt;?')
 c.check('Reply… opens the form for this machine + session', h.includes(`_replyOpen(${Q}laptop${Q},${Q}s1${Q})`) && h.includes('>Reply…<'));
 c.check('Done for now releases this request', h.includes(`_replySend(${Q}laptop${Q},${Q}r1${Q},'done')`) && h.includes('>Done for now<'));
 c.check('clicks do not open the card', h.includes('onclick="event.stopPropagation()"'));
+
+// only the owner types into a session (audit FIND-023); a member still gets Done for now
+var _peState = { me: { role: 'member' } };
+h = _replyAskHtml(S({ reply_request: R('Shall I push?') }));
+c.check('member: no Reply…, Done for now stays', !h.includes('>Reply…<') && h.includes('>Done for now<'));
+_peState = { me: { role: 'owner' } };
+c.check('owner: Reply… shown', _replyAskHtml(S({ reply_request: R('Shall I push?') })).includes('>Reply…<'));
+_peState = { me: null };
+c.check('who am I not loaded yet -> Reply… shown (the server still refuses a member)', _replyAskHtml(S({ reply_request: R('x') })).includes('>Reply…<'));
 
 h = _replyAskHtml(S({ reply_request: R('Pushed to master.') }));
 c.check('statement -> "Turn finished"', h.includes('Turn finished · reply from here'));

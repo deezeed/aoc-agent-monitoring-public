@@ -45,6 +45,11 @@ def _orch_worker(env=None):
 ORCH_WORKER, _ORCH_PORT = _orch_worker()
 if ORCH_WORKER and _ORCH_PORT:
     AOC_URL = f"http://127.0.0.1:{_ORCH_PORT}"
+# aoc_token.txt is the token of the AOC next to MONITOR_SCRIPT, on the default
+# port. A port named only by the environment never gets it: any program can
+# set AOC_ORCH_PORT and listen there (audit FIND-022), and an Orchestrate
+# worker's hook routes don't need it.
+SEND_TOKEN = AOC_URL == "http://127.0.0.1:5151"
 
 # Derived from this file's own location (wherever it actually got deployed
 # to, e.g. ~/.claude/hooks/) rather than hardcoded, so the same deployed
@@ -366,7 +371,7 @@ def post_aoc(path: str, data: dict) -> bool:
     try:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json; charset=utf-8"}
-        token = _read_aoc_token()
+        token = _read_aoc_token() if SEND_TOKEN else None
         if token:
             headers["X-AOC-Token"] = token
         req = urllib.request.Request(

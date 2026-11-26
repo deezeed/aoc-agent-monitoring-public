@@ -167,7 +167,8 @@ if os.name == "nt":
                 "print(json.dumps({'result': ('- got ' + str(len(data)) + ' chars') if ok else 'bad args ' + repr(args),"
                 " 'total_cost_usd': 0.0042, 'is_error': not ok}))\n")
     fake_cmd = os.path.join(tdir, "claude.cmd")
-    with open(fake_cmd, "w", encoding="utf-8") as f:
+    # cmd.exe reads a .cmd in the OEM code page: a utf-8 "Počítač" in python's path broke it
+    with open(fake_cmd, "w", encoding="oem") as f:
         f.write(f'@"{sys.executable}" "{fake_py}" %*\n')
     pids = set()
     rh = exec_functions(["_run_haiku"], {"os": os, "json": json, "subprocess": subprocess, "AOC_DATA_DIR": data,

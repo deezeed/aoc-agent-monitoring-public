@@ -409,10 +409,36 @@ def _load_settings() -> dict:
     return {}
 
 
-def _save_settings(settings: dict) -> None:
-    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
+SETTINGS_BACKUPS_KEPT = 5
+
+
+def _save_settings(settings: dict, path: str = None, stamp: str = None) -> None:
+    """Back up, then atomically replace settings.json (audit FIND-024): it holds
+    all of the user's Claude Code config, and an install, upgrade, repair or
+    uninstall that died halfway through a plain open("w") left it cut short.
+    Keeps the file's own line endings and final newline, and the last
+    SETTINGS_BACKUPS_KEPT copies (settings.json.bak-aoc-setup-<time>)."""
+    import glob
+    import shutil
+    import time
+    path = path or SETTINGS_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    eol, final = "\n", False
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        eol = "\r\n" if b"\r\n" in raw else "\n"
+        final = raw.endswith(b"\n")
+        shutil.copy2(path, f"{path}.bak-aoc-setup-{stamp or time.strftime('%Y%m%d-%H%M%S')}")
+        for old in sorted(glob.glob(glob.escape(path) + ".bak-aoc-setup-*"))[:-SETTINGS_BACKUPS_KEPT]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    tmp = path + ".aoc-setup-tmp"
+    with open(tmp, "w", encoding="utf-8", newline=eol) as f:
+        f.write(json.dumps(settings, indent=2) + ("\n" if final else ""))
+    os.replace(tmp, path)
 
 
 def health_checks(settings: dict, pythonw: str, scripts: dict, deployed: dict, tasks: dict) -> list:
@@ -735,16 +761,22 @@ def uninstall() -> None:
     """Reverses main(): hooks first (so a running Claude Code session can't
     respawn monitor.py through ensure_monitor), then the scheduled tasks
     (so sentinel can't revive watchdog), then the processes. Leaves the
-    user's data (%LOCALAPPDATA%\\AOC: history.db, logs, backups) alone."""
-    settings = _load_settings()
-    removed = _remove_hook_entries(settings)
+    user's data (%LOCALAPPDATA%\\AOC: history.db, logs, backups) alone.
+    An unreadable settings.json is reported and left alone -- the scripts,
+    tasks and processes below still go (audit FIND-025)."""
+    try:
+        settings = _load_settings()
+    except (OSError, ValueError) as e:
+        print(f"[skip] could not read {SETTINGS_FILE} ({e}); remove AOC's hook entries from it by hand")
+        settings = None
+    removed = _remove_hook_entries(settings) if settings is not None else 0
     chain = None
     try:
         with open(STATUSLINE_CHAIN_FILE, encoding="utf-8") as f:
             chain = json.load(f).get("statusLine")
     except Exception:
         pass
-    sl_changed = _remove_statusline(settings, chain)
+    sl_changed = _remove_statusline(settings, chain) if settings is not None else False
     if removed or sl_changed:
         _save_settings(settings)
     print(f"[ok] removed {removed} AOC hook entr{'y' if removed == 1 else 'ies'} from {SETTINGS_FILE}")

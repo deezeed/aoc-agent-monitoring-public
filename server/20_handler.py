@@ -865,8 +865,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _post_update(self, body):
+        # a malformed hook body is the caller's fault: 400, not a 500 with a traceback text
         try:
             update = json.loads(body)
+        except ValueError:
+            self._serve(400, "application/json", b'{"ok":false,"error":"bad JSON"}'); return
+        if not isinstance(update, dict):
+            self._serve(400, "application/json", b'{"ok":false,"error":"expected an object"}'); return
+        try:
             with _status_lock:
                 status = _load_status()
                 now = _now_ts()
@@ -1671,7 +1677,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path_no_qs == "/reply/request":
                     reply = _reply_open(data, _load_remote_approve(), time.time())
                 else:
-                    ok, err = _reply_send(str(data.get("id") or ""), data.get("action"), data.get("text"))
+                    err = _reply_send_refusal(data.get("action"), _current_user())
+                    ok, err = (False, err) if err else _reply_send(str(data.get("id") or ""), data.get("action"), data.get("text"))
                     reply = {"ok": True} if ok else {"ok": False, "error": err}
                 self._serve(200, "application/json", json.dumps(reply).encode())
             except Exception as e:
